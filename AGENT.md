@@ -41,6 +41,8 @@ A cross-platform (macOS + Linux) desktop app that syncs Proton Drive into a loca
 - `openpgp/lightweight` has no Node export → patched via `patch-package` (see `sidecar/patches/`), applied by `postinstall`.
 - SDK deep imports need the `dist/` prefix: `@protontech/drive-sdk/dist/cache`.
 - Never run the spike repeatedly with wrong credentials — `/auth/*` is the most rate-limited/CAPTCHA-prone path in the API.
+- **Password-SRP `POST /auth/v4` is rejected for `external-drive-*` clients** (422 code 2028 "This version of the app is no longer supported", observed 2026-10-23). The browser session-fork flow (`src/fork.ts`, same as Proton's own CLI and pdcli) is the primary auth path: no password handling, no CAPTCHA risk, key password arrives in the fork payload. SRP code in `src/auth.ts` is kept for reference behind `PDS_AUTH=srp`.
+- Fork sign-in URL format: `https://account.proton.me/desktop/login?app=drive&pv=3#payload=0:{UserCode}:{base64-AES-key}:external-drive`; poll `GET /auth/v4/sessions/forks/{selector}` (422 = not ready).
 
 ## Repo layout (planned)
 

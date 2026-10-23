@@ -6,21 +6,27 @@
  *   list root → upload a test file → download it back + verify bytes →
  *   trash it → read the event-stream cursor (FastForward).
  *
- * Usage:
- *   PROTON_USERNAME=you@proton.me PROTON_PASSWORD=... [PROTON_TOTP=123456] \
- *     npm run spike
+ * Usage (browser sign-in — the working path for third-party clients):
+ *   npm run spike          # prints + opens an account.proton.me sign-in URL
+ *
+ * Usage (password-SRP — currently rejected server-side for external-drive-*
+ * clients with 422 code 2028; kept for reference):
+ *   PDS_AUTH=srp PROTON_USERNAME=you@proton.me PROTON_PASSWORD=... \
+ *     [PROTON_TOTP=123456] npm run spike
  *
  * The spike trashes only the file it creates. It never hard-deletes.
  */
 import "./polyfill"; // MUST stay first — installs Uint8Array base64/hex polyfills
 
+import { exec } from "node:child_process";
 import { createHash } from "node:crypto";
 import { CryptoProxy } from "@protontech/crypto";
 import { Api as CryptoApi } from "@protontech/crypto/proxy/endpoint/api.ts";
 import { getSrp, getRandomSrpVerifier, computeKeyPassword, generateKeySalt } from "@protontech/crypto/srp";
 import { ProtonDriveClient, OpenPGPCryptoWithCryptoProxy, NodeType } from "@protontech/drive-sdk";
 import { MemoryCache } from "@protontech/drive-sdk/dist/cache";
-import { login } from "./auth";
+import { login, type Session } from "./auth";
+import { forkLogin } from "./fork";
 import { DriveAccount } from "./account";
 import { DriveHttpClient } from "./httpClient";
 
@@ -46,10 +52,24 @@ async function main(): Promise<void> {
   CryptoProxy.setEndpoint(new CryptoApi(), (endpoint) => endpoint.clearKeyStore());
   console.log("[0] crypto endpoint initialized");
 
-  // 1. Login (SRP + optional TOTP + key password derivation)
-  const username = env("PROTON_USERNAME")!;
-  const session = await login(username, env("PROTON_PASSWORD")!, {}, env("PROTON_TOTP", false));
-  console.log(`[1] logged in as ${username} — scopes: ${session.scopes.join(" ")}`);
+  // 1. Login — browser session-fork by default (SRP kept behind PDS_AUTH=srp)
+  const session: Session =
+    process.env.PDS_AUTH === "srp"
+      ? await (async () => {
+          const username = env("PROTON_USERNAME")!;
+          const s = await login(username, env("PROTON_PASSWORD")!, {}, env("PROTON_TOTP", false));
+          console.log(`[1] logged in as ${username} (SRP)`);
+          return s;
+        })()
+      : await forkLogin(async (url, userCode) => {
+          console.log("[1] authorize this session in your browser:");
+          console.log(`    ${url}`);
+          console.log(`    (user code: ${userCode})`);
+          const opener =
+            process.platform === "darwin" ? "open" : process.platform === "win32" ? "start" : "xdg-open";
+          exec(`${opener} "${url}"`, () => {}); // best-effort
+        });
+  console.log("[1] session authorized ✔");
 
   // 2. SDK bootstrap
   const account = new DriveAccount(session);
@@ -61,12 +81,20 @@ async function main(): Promise<void> {
     account,
     openPGPCryptoModule: new OpenPGPCryptoWithCryptoProxy(CryptoProxy),
     srpModule: {
-      getSrp: async (_v: number, modulus: string, serverEphemeral: string, salt: string, password: string) =>
-        getSrp(
+      // Used by the SDK only for password-protected public links — not
+      // exercised by this spike. Username is unknown in the fork flow, so it
+      // is resolved lazily from the account's primary address if ever needed.
+      getSrp: async (_v: number, modulus: string, serverEphemeral: string, salt: string, password: string) => {
+        const username = (await account.getOwnPrimaryAddress()).email;
+        return getSrp(
           { Version: 4, Modulus: modulus, ServerEphemeral: serverEphemeral, Salt: salt, Username: username },
           { username, password },
-        ),
-      getSrpVerifier: (password: string) => getRandomSrpVerifier({ Modulus: "" }, { username, password }),
+        );
+      },
+      getSrpVerifier: async (password: string) => {
+        const username = (await account.getOwnPrimaryAddress()).email;
+        return getRandomSrpVerifier({ Modulus: "" }, { username, password });
+      },
       computeKeyPassword,
       generateKeySalt,
     } as any,
