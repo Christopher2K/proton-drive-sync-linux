@@ -22,8 +22,8 @@ A cross-platform (macOS + Linux) desktop app that syncs Proton Drive into a loca
 ## Current status
 
 - [x] Product specification written (`SPEC.md`)
-- [ ] M0 — Spike: Node sidecar auth (SRP/2FA) + SDK list/upload/download/trash + event stream ← **code complete, awaiting live run with real credentials**
-- [ ] M1 — Headless sync engine (CLI)
+- [x] M0 — Spike: **PASSED 2026-10-23** against a real account — fork auth, key unlock, SDK bootstrap, list, upload, verified download, trash, event cursor (FastForward). Go decision confirmed.
+- [ ] M1 — Headless sync engine (CLI) ← **next up**
 - [ ] M2 — GPUI shell
 - [ ] M3 — Linux FUSE VFS
 - [ ] M4 — macOS File Provider
