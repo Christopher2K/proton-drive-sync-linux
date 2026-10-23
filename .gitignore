@@ -1,0 +1,16 @@
+# Rust
+/target
+**/*.rs.bk
+
+# Node / sidecar
+node_modules/
+sidecar/dist/
+
+# OS
+.DS_Store
+
+# Secrets / local state
+.env
+*.sqlite
+*.sqlite3
+/tmp-proton
