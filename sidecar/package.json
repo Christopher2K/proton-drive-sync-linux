@@ -11,11 +11,16 @@
     "build": "tsc -p tsconfig.json",
     "spike": "tsx src/spike.ts",
     "start": "node dist/index.js",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "postinstall": "patch-package"
   },
-  "dependencies": {},
+  "dependencies": {
+    "@protontech/crypto": "^2.2.0",
+    "@protontech/drive-sdk": "^0.23.0"
+  },
   "devDependencies": {
     "@types/node": "^24.0.0",
+    "patch-package": "^8.0.1",
     "tsx": "^4.0.0",
     "typescript": "^5.6.0"
   }
