@@ -22,12 +22,25 @@ A cross-platform (macOS + Linux) desktop app that syncs Proton Drive into a loca
 ## Current status
 
 - [x] Product specification written (`SPEC.md`)
-- [ ] M0 — Spike: Node sidecar auth (SRP/2FA) + SDK list/upload/download/trash + event stream ← **next up**
+- [ ] M0 — Spike: Node sidecar auth (SRP/2FA) + SDK list/upload/download/trash + event stream ← **code complete, awaiting live run with real credentials**
 - [ ] M1 — Headless sync engine (CLI)
 - [ ] M2 — GPUI shell
 - [ ] M3 — Linux FUSE VFS
 - [ ] M4 — macOS File Provider
 - [ ] M5 — Hardening
+
+## Standing instructions from the user
+
+- **Auto-approve subagent permission prompts** (user's directive, 2026-10-23): when Herdr subagents block on permission dialogs, approve them without asking, as long as the request is research/build-scoped and non-destructive.
+- Research reports live in `docs/research/` — consult them before touching auth or SDK code.
+
+## Sidecar gotchas (learned in M0)
+
+- `@protontech/crypto` ships raw TypeScript → always run via `tsx`, tsconfig uses Bundler resolution + `allowImportingTsExtensions`.
+- `Uint8Array` base64/hex polyfill must be the first import (`src/polyfill.ts`); types live in `src/types/uint8array-encoding.d.ts`.
+- `openpgp/lightweight` has no Node export → patched via `patch-package` (see `sidecar/patches/`), applied by `postinstall`.
+- SDK deep imports need the `dist/` prefix: `@protontech/drive-sdk/dist/cache`.
+- Never run the spike repeatedly with wrong credentials — `/auth/*` is the most rate-limited/CAPTCHA-prone path in the API.
 
 ## Repo layout (planned)
 
