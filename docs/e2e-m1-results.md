@@ -45,3 +45,20 @@ fresh) left it pointing at the dead one. **Fix:** per-root control resolution
 ## Minor
 
 - `pds sync <folder>` requires the folder to exist; should create it.
+
+## Re-validation addendum (2026-10-24) — all bugs closed
+
+- **Bug #1 (F7 race):** fixed in three iterations, validated live each time.
+  1. sha1 precondition → exposed that buffered-event application makes it a no-op;
+  2. server 409 (`Current revision is no longer up to date`) identified as the real
+     safety net → inline retry hit the SDK cache and 409'd again;
+  3. final design: 409 parks the node as remote-conflicted, the (proven) event-path
+     keep-both resolves with genuinely fresh content, self-heals without restart.
+  Final live run: remote head landed in `small.txt`, local dirty preserved as a
+  conflict copy — zero content loss, zero silent overwrites.
+- **Bug #2 (guard cascade):** one explicit resume now drains the whole batch. ✅
+- **Bug #3 (CLI marker):** `--root` + live-socket discovery. ✅
+- **Bug #4 (found during re-validation):** sidecar never re-polled the event stream
+  (`iterateEvents` drains once). Fixed: 30s+jitter cursor polling with backoff;
+  verified live (poll count grows steadily, parked node healed).
+- Final state: 54/54 Rust tests, sidecar smoke 9/9, event-loop tests 16/16.
