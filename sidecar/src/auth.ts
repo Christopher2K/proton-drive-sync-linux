@@ -166,8 +166,13 @@ export async function login(
 /**
  * Refresh a session. Refresh tokens rotate — callers must persist the result.
  * ApiError status 400/401/422 means the session is dead: force re-login.
+ * Fork sessions may have no refresh token at all (see fork.ts); those throw
+ * immediately with status 401 rather than making a doomed refresh call.
  */
 export async function refresh(s: Session): Promise<Session> {
+  if (!s.refreshToken) {
+    throw new ApiError("Session has no refresh token — re-login required", 401);
+  }
   const r = await api("auth/v4/refresh", {
     method: "POST",
     body: {

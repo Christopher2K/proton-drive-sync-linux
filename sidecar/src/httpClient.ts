@@ -10,6 +10,14 @@
 import { APP_VERSION } from "./config";
 import { ApiError, refresh, type Session } from "./auth";
 
+/** Refresh failed fatally (400/401/422) or the session has no refresh token. */
+export class SessionExpiredError extends Error {
+  constructor(message: string, options?: { cause?: unknown }) {
+    super(message, options);
+    this.name = "SessionExpiredError";
+  }
+}
+
 interface HttpRequest {
   url: string;
   method: string;
@@ -71,7 +79,7 @@ export class DriveHttpClient {
     } catch (e) {
       // 400/401/422 from /refresh means the session is dead — surface it.
       if (e instanceof ApiError && [400, 401, 422].includes(e.status)) {
-        throw new Error("Session expired — re-login required", { cause: e });
+        throw new SessionExpiredError("Session expired — re-login required", { cause: e });
       }
       return false; // transient refresh failure: do not retry the original call now
     }

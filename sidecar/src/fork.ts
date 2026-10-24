@@ -58,6 +58,10 @@ export async function forkLogin(
       const status = await api(`auth/v4/sessions/forks/${encodeURIComponent(selector)}`);
       // Authorized — decrypt the payload carrying the derived key password
       const userKeyPassword = parseUserKeyPassword(encryptionKey, status.Payload);
+      // NOTE: RefreshToken is OPTIONAL in the fork status response (verified
+      // against incubating/account/js/src/accountApi.ts: `RefreshToken?: string`).
+      // A fork session may be non-refreshable; refresh() then fails fast with
+      // 401 and the user must re-run auth.loginFork (see sessionStore.ts).
       return {
         uid: status.UID,
         accessToken: status.AccessToken,
