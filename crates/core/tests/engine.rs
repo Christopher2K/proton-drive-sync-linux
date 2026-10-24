@@ -653,51 +653,122 @@ async fn remote_create_over_untracked_local_keeps_both() {
 // F2 — upload retry policy + 409 keep-both safety net (bug #1 follow-up)
 // ---------------------------------------------------------------------------
 
-// (a) Revision upload rejected with the 409 "no longer up to date" class →
-// keep-both (remote head downloaded as a conflict copy), ONE retry atop the
-// fresh head succeeds, no loop. Here the remote sha1 still matches our DB
-// head, so the getNode precondition passes — the 409 handler is the net
-// (server-side staleness is about the base REVISION, not just the digest).
+// (a)+(b) Revision upload rejected with the 409 "no longer up to date"
+// class → the node is parked as remote-conflicted with NO inline retry and
+// NO conflict copy (an immediate getNode would serve the SDK's stale cache).
+// When the remote event with the genuinely fresh head arrives, the proven
+// event-application keep-both path runs: fresh content lands at the original
+// path, the local edit survives as a conflict copy, and the node heals
+// without an engine restart.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
-async fn revision_upload_409_keeps_both_and_retries_once() {
+async fn revision_conflict_409_heals_via_remote_event() {
     let fx = start().await;
-    fx.mock.inject_upload_failures(
-        "node-hello",
-        &[(
-            1099,
-            "POST /drive/v2/volumes/x/links/y/revisions 409 'Current revision is no longer up to date'",
-            false,
-        )],
-    );
+    // Several scripted 409s: an inline-retry regression would burn attempts.
+    let failures: Vec<(i64, &str, bool)> = (0..5)
+        .map(|_| {
+            (
+                1099,
+                "POST /drive/v2/volumes/x/links/y/revisions 409 'Current revision is no longer up to date'",
+                false,
+            )
+        })
+        .collect();
+    fx.mock.inject_upload_failures("node-hello", &failures);
 
     std::fs::write(fx.root.join("hello.txt"), b"local edit").unwrap();
 
-    // Remote head ("hello drive") survives as a conflict copy…
+    // (b) Exactly ONE rejected attempt, then parked: no retry, no conflict
+    // copy yet, engine keeps running.
+    wait_for(|| fx.db.is_remote_conflicted("hello.txt").unwrap()).await;
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert_eq!(fx.mock.upload_attempts("hello.txt"), 1);
+    assert!(conflict_entry(&fx.root, "hello").is_none());
+    assert_eq!(
+        fx.handle.status().await.unwrap().state,
+        EngineState::Running
+    );
+    let st = fx.handle.status().await.unwrap();
+    assert_eq!(st.conflicted_nodes, 1);
+    assert_eq!(st.errored_nodes, 0);
+
+    // (a) The remote event carrying the fresh head arrives; the event path
+    // reconciles with GENUINELY fresh content.
+    fx.mock.remote_update_file("node-hello", b"remote fresh");
     wait_for(|| {
-        conflict_entry(&fx.root, "hello")
-            .map(|e| std::fs::read(e.path()).unwrap() == b"hello drive")
-            .unwrap_or(false)
+        std::fs::read(fx.root.join("hello.txt")).unwrap_or_default() == b"remote fresh"
+            && conflict_entry(&fx.root, "hello")
+                .map(|e| std::fs::read(e.path()).unwrap() == b"local edit")
+                .unwrap_or(false)
     })
     .await;
-    // …the retry lands the local edit as the new revision of the original node…
-    wait_for(|| fx.mock.file_content("node-hello").as_deref() == Some(b"local edit")).await;
-    // …and the conflict copy syncs up as a NEW node.
+
+    // The conflict copy (local edit) syncs up as a NEW node…
     let conflict_uid = wait_for_mock(&fx.mock, "hello (conflict ").await;
     assert_eq!(
         fx.mock.file_content(&conflict_uid).as_deref(),
-        Some(b"hello drive".as_slice())
+        Some(b"local edit".as_slice())
     );
-
-    // Exactly two attempts (fail + one retry), no loop, nothing errored.
-    tokio::time::sleep(Duration::from_millis(1500)).await;
-    assert_eq!(fx.mock.upload_attempts("hello.txt"), 2);
-    assert_eq!(fx.handle.status().await.unwrap().errored_nodes, 0);
+    // …the original node holds the fresh remote content…
     assert_eq!(
-        std::fs::read(fx.root.join("hello.txt")).unwrap(),
-        b"local edit"
+        fx.mock.file_content("node-hello").as_deref(),
+        Some(b"remote fresh".as_slice())
     );
+    // …and the node healed without a restart: flag cleared, row synced, no
+    // further upload attempts on the original path.
+    wait_for(|| !fx.db.is_remote_conflicted("hello.txt").unwrap()).await;
+    let st = fx.handle.status().await.unwrap();
+    assert_eq!(st.conflicted_nodes, 0);
+    assert_eq!(st.errored_nodes, 0);
+    assert_eq!(fx.mock.upload_attempts("hello.txt"), 1);
     assert!(fx.mock.trashed_uids().is_empty());
+    fx.shutdown().await;
+}
+
+// (c) A terminally errored node also self-heals on the next matching remote
+// event: the event-application keep-both clears the error state.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn errored_node_recovers_on_next_remote_event() {
+    let fx = start().await;
+    let failures: Vec<(i64, &str, bool)> = (0..30)
+        .map(|_| (1099, "integrity check failed", false))
+        .collect();
+    fx.mock.inject_upload_failures("node-hello", &failures);
+
+    std::fs::write(fx.root.join("hello.txt"), b"broken local edit").unwrap();
+    wait_for(|| {
+        futures::executor::block_on(fx.handle.status())
+            .map(|s| s.errored_nodes == 1)
+            .unwrap_or(false)
+    })
+    .await;
+    assert_eq!(fx.mock.upload_attempts("hello.txt"), 1);
+
+    // The remote side moves on; its event reconciles the errored node.
+    fx.mock.remote_update_file("node-hello", b"remote fix");
+    wait_for(|| {
+        std::fs::read(fx.root.join("hello.txt")).unwrap_or_default() == b"remote fix"
+            && conflict_entry(&fx.root, "hello")
+                .map(|e| std::fs::read(e.path()).unwrap() == b"broken local edit")
+                .unwrap_or(false)
+    })
+    .await;
+
+    // Healed: error cleared, no restart, both versions preserved remotely.
+    wait_for(|| {
+        futures::executor::block_on(fx.handle.status())
+            .map(|s| s.errored_nodes == 0)
+            .unwrap_or(false)
+    })
+    .await;
+    let conflict_uid = wait_for_mock(&fx.mock, "hello (conflict ").await;
+    assert_eq!(
+        fx.mock.file_content(&conflict_uid).as_deref(),
+        Some(b"broken local edit".as_slice())
+    );
+    // Still no further upload attempts on the errored path itself.
+    assert_eq!(fx.mock.upload_attempts("hello.txt"), 1);
     fx.shutdown().await;
 }
 

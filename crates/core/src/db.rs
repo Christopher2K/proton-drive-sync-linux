@@ -98,7 +98,8 @@ CREATE TABLE IF NOT EXISTS nodes (
     pinned     INTEGER NOT NULL DEFAULT 0,
     synced_sha1 TEXT,
     retry_count INTEGER NOT NULL DEFAULT 0,
-    last_error TEXT
+    last_error TEXT,
+    remote_conflicted INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS tombstones (
     local_path TEXT PRIMARY KEY,
@@ -166,6 +167,10 @@ impl Db {
                 "ALTER TABLE nodes ADD COLUMN retry_count INTEGER NOT NULL DEFAULT 0",
             ),
             ("last_error", "ALTER TABLE nodes ADD COLUMN last_error TEXT"),
+            (
+                "remote_conflicted",
+                "ALTER TABLE nodes ADD COLUMN remote_conflicted INTEGER NOT NULL DEFAULT 0",
+            ),
         ] {
             if !cols.iter().any(|c| c == name) {
                 conn.execute_batch(ddl)?;
@@ -351,6 +356,51 @@ impl Db {
             params![local_path],
         )?;
         Ok(())
+    }
+
+    // ---- remote-conflict parking (F7) ----
+    // Set when a revision upload was rejected 409 (stale base): the remote
+    // head moved but our only view of it may be the SDK's stale cache, so
+    // reconciliation is deferred to the next matching remote event, which
+    // runs the standard event-application keep-both and clears the flag.
+
+    pub fn set_remote_conflicted(&self, local_path: &str, on: bool) -> rusqlite::Result<()> {
+        self.lock().execute(
+            "UPDATE nodes SET remote_conflicted=?2 WHERE local_path=?1",
+            params![local_path, on as i64],
+        )?;
+        Ok(())
+    }
+
+    pub fn is_remote_conflicted(&self, local_path: &str) -> rusqlite::Result<bool> {
+        Ok(self
+            .lock()
+            .query_row(
+                "SELECT remote_conflicted FROM nodes WHERE local_path=?1",
+                params![local_path],
+                |r| r.get::<_, i64>(0),
+            )
+            .optional()?
+            .unwrap_or(0)
+            != 0)
+    }
+
+    pub fn remote_conflicted_paths(&self) -> rusqlite::Result<Vec<String>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare("SELECT local_path FROM nodes WHERE remote_conflicted != 0")?;
+        let rows = stmt
+            .query_map([], |r| r.get(0))?
+            .collect::<rusqlite::Result<Vec<String>>>()?;
+        Ok(rows)
+    }
+
+    pub fn count_remote_conflicted(&self) -> rusqlite::Result<usize> {
+        let n: i64 = self.lock().query_row(
+            "SELECT COUNT(*) FROM nodes WHERE remote_conflicted != 0",
+            [],
+            |r| r.get(0),
+        )?;
+        Ok(n as usize)
     }
 
     /// Direct children rows of a node uid (remote tree walk).

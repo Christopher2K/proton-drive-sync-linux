@@ -74,6 +74,9 @@ pub struct EngineStatus {
     /// Nodes whose upload failed terminally (non-retryable, or retries
     /// exhausted). Surfaced so the UI/CLI can show them (F2/F7).
     pub errored_nodes: usize,
+    /// Dirty nodes parked after a 409 stale-base rejection; they heal via
+    /// the next matching remote event (F7).
+    pub conflicted_nodes: usize,
 }
 
 /// Control commands (CLI socket / UI).
@@ -404,6 +407,10 @@ impl<S: SidecarApi + 'static> Engine<S> {
             pinned: false,
             synced_sha1: node.sha1.clone(),
         })?;
+        if state == SyncState::Synced {
+            // Reconciled against remote state: any upload parking is stale.
+            self.clear_upload_blocks(rel)?;
+        }
         Ok(())
     }
 
@@ -481,8 +488,8 @@ impl<S: SidecarApi + 'static> Engine<S> {
                 continue; // debounce coalescing within the batch
             }
             let abs = to_abs(&self.root, &rel);
-            if rel.ends_with(".pds-part") {
-                continue; // our own temp download files
+            if is_temp_file(&rel) {
+                continue; // our own / the sidecar's transient transfer files
             }
             if abs.is_dir() {
                 self.ensure_remote_folder_async(&rel).await?;
@@ -596,9 +603,9 @@ impl<S: SidecarApi + 'static> Engine<S> {
         if row.sync_state != SyncState::Dirty || !row.is_file() {
             return Ok(());
         }
-        // Terminally errored or waiting out a retry backoff: leave it alone
-        // (F2 retry policy — no hot loop).
-        if self.db.upload_error(rel)?.is_some() {
+        // Terminally errored, parked as remote-conflicted, or waiting out a
+        // retry backoff: leave it alone (F2/F7 — no hot loop).
+        if self.db.upload_error(rel)?.is_some() || self.db.is_remote_conflicted(rel)? {
             return Ok(());
         }
         if self.retry_at.get(rel).is_some_and(|t| *t > Instant::now()) {
@@ -717,35 +724,28 @@ impl<S: SidecarApi + 'static> Engine<S> {
         Ok(conflict_rel)
     }
 
-    /// Pick a conflict path next to `rel` that is free locally, in the DB,
-    /// and (best effort) remotely.
+    /// Pick a conflict path next to `rel`: deduped against disk + DB
+    /// locally, then (best effort) against remote sibling names.
     async fn fresh_conflict_rel(&self, rel: &str, row: &NodeRow) -> Result<String> {
-        let name = rel.rsplit('/').next().unwrap_or(rel);
-        let stamped = conflict_name(name, chrono::Local::now());
-        let with_name = |n: &str| match rel.rsplit_once('/') {
-            Some((dir, _)) => format!("{dir}/{n}"),
-            None => n.to_string(),
-        };
-        // Local/DB collision (same-minute double conflict): disambiguate.
-        let mut candidate = stamped;
-        for i in 2.. {
-            let abs = to_abs(&self.root, &with_name(&candidate));
-            if !abs.exists() && self.db.node_by_path(&with_name(&candidate))?.is_none() {
-                break;
-            }
-            candidate = conflict_name(&format!("{name} ({i})"), chrono::Local::now());
-        }
+        let local = local_free_conflict_rel(&self.db, &self.root, rel)?;
         // Remote collision: ask the Drive side for an available name.
         if let Some(parent) = row.parent_uid.clone() {
-            let available = self.sidecar.get_available_name(&parent, &candidate).await;
-            if let Ok(available) = available {
-                let abs = to_abs(&self.root, &with_name(&available));
-                if !abs.exists() && self.db.node_by_path(&with_name(&available))?.is_none() {
-                    candidate = available;
+            let name = local.rsplit('/').next().unwrap_or(&local);
+            if let Ok(available) = self.sidecar.get_available_name(&parent, name).await
+                && available != name
+            {
+                let remote_rel = match rel.rsplit_once('/') {
+                    Some((dir, _)) => format!("{dir}/{available}"),
+                    None => available,
+                };
+                if !to_abs(&self.root, &remote_rel).exists()
+                    && self.db.node_by_path(&remote_rel)?.is_none()
+                {
+                    return Ok(remote_rel);
                 }
             }
         }
-        Ok(with_name(&candidate))
+        Ok(local)
     }
 
     /// Perform the actual upload transfer for a dirty row.
@@ -778,16 +778,19 @@ impl<S: SidecarApi + 'static> Engine<S> {
         row.sync_state = SyncState::Synced;
         row.synced_sha1 = row.sha1.clone();
         self.db.upsert_node(&row)?;
-        self.db.clear_upload_failures(rel)?;
+        self.clear_upload_blocks(rel)?;
         self.retry_at.remove(rel);
         info!(path = %rel, "uploaded");
         Ok(())
     }
 
-    /// F2/F7 upload failure policy (e2e-m1 bug #1 follow-up):
-    /// - 409 "revision no longer up to date" class → keep-both (download the
-    ///   fresh remote head as a conflict copy) and retry ONCE atop it; a
-    ///   second failure marks the node errored instead of looping;
+    /// F2/F7 upload failure policy (e2e-m1 bug #1 follow-ups):
+    /// - 409 "revision no longer up to date" class → park the node as
+    ///   remote-conflicted; NO inline retry and NO conflict copy yet (the
+    ///   sidecar's drive.getNode serves the SDK MemoryCache, which lags the
+    ///   real head — a "fresh head" fetched now can be stale). The next
+    ///   matching remote event runs the proven event-application keep-both
+    ///   path with genuinely fresh content and clears the flag;
     /// - other non-retryable errors → mark errored immediately (never
     ///   blind-requeued);
     /// - retryable errors → exponential backoff (base·2ⁿ, capped), and after
@@ -822,31 +825,12 @@ impl<S: SidecarApi + 'static> Engine<S> {
         // precondition saw a false "match" — the precondition covers only
         // the no-event-received window; THIS is the safety net).
         if is_revision_conflict(code, &message) && !row.node_uid.starts_with("pending:") {
-            warn!(path = %rel, error = %message, "revision upload rejected (stale base); keeping both");
-            match self.sidecar.get_node(&row.node_uid).await {
-                Ok(node) => {
-                    let conflict_rel = self
-                        .download_remote_head_as_conflict(rel, row, &node)
-                        .await?;
-                    if let Some(mut r) = self.db.node_by_path(rel)? {
-                        // Record the fresh head so later preconditions see it.
-                        r.synced_sha1 = node.sha1.clone();
-                        self.db.upsert_node(&r)?;
-                    }
-                    info!(path = %rel, conflict = %conflict_rel, "retrying upload atop fresh remote head");
-                }
-                Err(e) => {
-                    // Node gone remotely: re-upload as a NEW file rather than
-                    // reviving a trashed node — local content survives.
-                    warn!(path = %rel, error = %e, "remote node vanished; re-uploading as new file");
-                    if let Some(mut r) = self.db.node_by_path(rel)? {
-                        r.node_uid = format!("pending:{rel}");
-                        r.sync_state = SyncState::Dirty;
-                        self.db.upsert_node(&r)?;
-                    }
-                }
-            }
-            return self.retry_upload_once(rel).await;
+            self.db.set_remote_conflicted(rel, true)?;
+            warn!(
+                path = %rel, error = %message,
+                "revision upload rejected (stale base); parked as remote-conflicted, awaiting remote event"
+            );
+            return Ok(());
         }
 
         if !retryable {
@@ -869,46 +853,14 @@ impl<S: SidecarApi + 'static> Engine<S> {
         Ok(())
     }
 
-    /// The single retry granted after a keep-both conflict resolution. Any
-    /// second failure marks the node errored — never loops.
-    async fn retry_upload_once(&mut self, rel: &str) -> Result<()> {
-        let Some(row) = self.db.node_by_path(rel)? else {
-            return Ok(());
-        };
-        if row.sync_state != SyncState::Dirty {
-            return Ok(());
-        }
-        let abs = to_abs(&self.root, rel);
-        if !abs.is_file() {
-            return Ok(());
-        }
-        let params = upload_params(&row, &abs);
-        self.db.set_sync_state(rel, SyncState::Uploading)?;
-        let sidecar = Arc::clone(&self.sidecar);
-        let outcome = self
-            .run_transfer("upload", Some(rel), sidecar.upload(&params))
-            .await;
-        match outcome {
-            Ok(done) => self.finish_upload_success(rel, &row, done),
-            Err(TransferFailure::Aborted(e)) => {
-                if self.db.node_by_path(rel)?.is_some() {
-                    self.db.set_sync_state(rel, SyncState::Dirty)?;
-                }
-                Err(e)
-            }
-            Err(TransferFailure::Remote {
-                code,
-                message,
-                retryable,
-            }) => {
-                warn!(path = %rel, code, retryable, error = %message, "second upload attempt failed; node marked errored");
-                if self.db.node_by_path(rel)?.is_some() {
-                    self.db.set_sync_state(rel, SyncState::Dirty)?;
-                    self.db.mark_upload_errored(rel, &message)?;
-                }
-                Ok(())
-            }
-        }
+    /// Clear everything that parks a node's upload queue (retry bookkeeping
+    /// plus the remote-conflicted flag). Called when the node is healed: a
+    /// successful upload, or the event-application path reconciling it
+    /// against genuinely fresh remote state.
+    fn clear_upload_blocks(&self, rel: &str) -> Result<()> {
+        self.db.clear_upload_failures(rel)?;
+        self.db.set_remote_conflicted(rel, false)?;
+        Ok(())
     }
 
     /// Ensure every component of `rel` (a folder path) exists remotely;
@@ -1170,7 +1122,9 @@ impl<S: SidecarApi + 'static> Engine<S> {
         let abs = to_abs(&self.root, &row.local_path);
         if row.sync_state != SyncState::Synced {
             // Local unsynced changes → keep both (F7); the dirty row will
-            // re-upload under an available name.
+            // re-upload under an available name. Unpark it so the upload
+            // path can re-key it (the remote uid is gone).
+            self.clear_upload_blocks(&row.local_path)?;
             info!(path = %row.local_path, "remote delete of dirty local node: keeping local copy");
             return Ok(());
         }
@@ -1212,6 +1166,7 @@ impl<S: SidecarApi + 'static> Engine<S> {
             pinned: false,
             synced_sha1: node.as_ref().and_then(|n| n.sha1.clone()),
         })?;
+        self.clear_upload_blocks(rel)?;
         info!(path = %rel, "downloaded");
         Ok(())
     }
@@ -1356,6 +1311,7 @@ impl<S: SidecarApi + 'static> Engine<S> {
                         .unwrap_or(0),
                     queued_tombstones: self.db.tombstones().map(|v| v.len()).unwrap_or(0),
                     errored_nodes: self.db.count_errored().unwrap_or(0),
+                    conflicted_nodes: self.db.count_remote_conflicted().unwrap_or(0),
                 });
             }
             Command::Shutdown => {}
@@ -1379,9 +1335,10 @@ impl<S: SidecarApi + 'static> Engine<S> {
             self.apply_event(ev).await?;
             return Ok(true);
         }
-        // Uploads: skip terminally errored nodes and rows waiting out a
-        // retry backoff (F2 — no hot loop).
+        // Uploads: skip terminally errored / remote-conflicted nodes and
+        // rows waiting out a retry backoff (F2/F7 — no hot loop).
         let errored: HashSet<String> = self.db.errored_paths()?.into_iter().collect();
+        let conflicted: HashSet<String> = self.db.remote_conflicted_paths()?.into_iter().collect();
         let now = Instant::now();
         if let Some(row) = self
             .db
@@ -1389,6 +1346,7 @@ impl<S: SidecarApi + 'static> Engine<S> {
             .into_iter()
             .find(|r| {
                 !errored.contains(&r.local_path)
+                    && !conflicted.contains(&r.local_path)
                     && self.retry_at.get(&r.local_path).is_none_or(|t| *t <= now)
             })
         {
@@ -1486,20 +1444,62 @@ fn local_content_diverged(row: &NodeRow, abs: &Path) -> bool {
     }
 }
 
-/// Rename the local file at `rel` to its F7 conflict name; returns the new
-/// relative path. Any tracked row is re-keyed to the new path as dirty
-/// (pending upload) so the renamed copy uploads under its conflict name.
+/// Transient transfer temp files: ours are `*.pds-part`, and the sidecar
+/// downloads via `{path}.pdstmp-{transferId}` + rename — so its temps match
+/// neither a `.pds-part` suffix check nor our names exactly. Ignore both on
+/// create AND delete events (they are rename artifacts, never user content).
+fn is_temp_file(rel: &str) -> bool {
+    let name = rel.rsplit('/').next().unwrap_or(rel);
+    name.contains(".pds-part") || name.contains(".pdstmp-")
+}
+
+/// Insert `suffix` before the extension: `a.txt` + ` (2)` → `a (2).txt`.
+/// Dotfiles / extension-less names get the suffix appended whole (same
+/// convention as `conflict_name`).
+fn with_suffix_before_ext(name: &str, suffix: &str) -> String {
+    match name.rsplit_once('.') {
+        Some((stem, ext)) if !stem.is_empty() => format!("{stem}{suffix}.{ext}"),
+        _ => format!("{name}{suffix}"),
+    }
+}
+
+/// The F7 conflict path next to `rel`, deduped against the local disk and
+/// the DB: `name (conflict YYYY-MM-DD HHmm).ext`, then `… (2).ext`, etc.
+/// Never overwrites an existing file or tracked row.
+fn local_free_conflict_rel(db: &Db, root: &Path, rel: &str) -> Result<String> {
+    local_free_conflict_rel_at(db, root, rel, chrono::Local::now())
+}
+
+fn local_free_conflict_rel_at(
+    db: &Db,
+    root: &Path,
+    rel: &str,
+    at: chrono::DateTime<chrono::Local>,
+) -> Result<String> {
+    let name = rel.rsplit('/').next().unwrap_or(rel);
+    let stamped = conflict_name(name, at);
+    let with_name = |n: &str| match rel.rsplit_once('/') {
+        Some((dir, _)) => format!("{dir}/{n}"),
+        None => n.to_string(),
+    };
+    let mut candidate = stamped.clone();
+    for i in 2.. {
+        let rel_candidate = with_name(&candidate);
+        if !to_abs(root, &rel_candidate).exists() && db.node_by_path(&rel_candidate)?.is_none() {
+            return Ok(rel_candidate);
+        }
+        candidate = with_suffix_before_ext(&stamped, &format!(" ({i})"));
+    }
+    unreachable!("unbounded dedupe loop")
+}
+
+/// Rename the local file at `rel` to its F7 conflict name (deduped — an
+/// existing conflict copy is never overwritten); returns the new relative
+/// path. Any tracked row is re-keyed to the new path as dirty (pending
+/// upload) so the renamed copy uploads under its conflict name.
 fn rename_for_conflict(db: &Db, root: &Path, rel: &str) -> Result<String> {
     let abs = to_abs(root, rel);
-    let name = abs
-        .file_name()
-        .and_then(|n| n.to_str())
-        .ok_or_else(|| anyhow!("bad file name for {rel}"))?;
-    let new_name = conflict_name(name, chrono::Local::now());
-    let new_rel = match rel.rsplit_once('/') {
-        Some((dir, _)) => format!("{dir}/{new_name}"),
-        None => new_name,
-    };
+    let new_rel = local_free_conflict_rel(db, root, rel)?;
     std::fs::rename(&abs, to_abs(root, &new_rel))?;
     if let Some(mut row) = db.node_by_path(rel)? {
         // Free the old path for the incoming remote node, then track the
@@ -1594,5 +1594,38 @@ mod tests {
         assert!(new_rel.starts_with("b (conflict "));
         assert!(db.node_by_path("b.bin").unwrap().is_none());
         assert!(db.node_by_path(&new_rel).unwrap().is_none());
+    }
+
+    #[test]
+    fn conflict_path_dedupes_existing_copies() {
+        use chrono::TimeZone;
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open_memory().unwrap();
+        let at = chrono::Local
+            .with_ymd_and_hms(2026, 10, 24, 9, 30, 0)
+            .unwrap();
+        let stamped = conflict_name("a.txt", at);
+        // A same-minute conflict copy already exists on disk…
+        std::fs::write(dir.path().join(&stamped), b"older conflict").unwrap();
+        // …and a doubly-conflicted one is tracked in the DB.
+        let taken2 = with_suffix_before_ext(&stamped, " (2)");
+        db.upsert_node(&tracked_row(&taken2, None)).unwrap();
+
+        let rel = local_free_conflict_rel_at(&db, dir.path(), "a.txt", at).unwrap();
+        assert_eq!(rel, with_suffix_before_ext(&stamped, " (3)"));
+        // The existing copies are untouched.
+        assert_eq!(
+            std::fs::read(dir.path().join(&stamped)).unwrap(),
+            b"older conflict"
+        );
+    }
+
+    #[test]
+    fn temp_file_detection_covers_sidecar_temps() {
+        assert!(is_temp_file("docs/x.txt.pds-part"));
+        assert!(is_temp_file("x.txt.pds-part.pdstmp-abc123"));
+        assert!(is_temp_file("x.txt.pdstmp-abc123"));
+        assert!(!is_temp_file("x.txt"));
+        assert!(!is_temp_file("docs/report.pds.txt"));
     }
 }
