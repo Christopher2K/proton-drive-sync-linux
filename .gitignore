@@ -9,6 +9,9 @@ sidecar/dist/
 # OS
 .DS_Store
 
+# Packaging output
+/dist/
+
 # Secrets / local state
 .env
 *.sqlite
