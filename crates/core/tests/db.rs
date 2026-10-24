@@ -19,6 +19,7 @@ fn row(rel: &str, uid: &str, state: SyncState) -> NodeRow {
         mtime: Some(1_700_000_000),
         sync_state: state,
         pinned: false,
+        synced_sha1: Some("deadbeef".into()),
     }
 }
 

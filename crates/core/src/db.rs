@@ -59,6 +59,10 @@ pub struct NodeRow {
     pub mtime: Option<i64>,
     pub sync_state: SyncState,
     pub pinned: bool,
+    /// Remote head SHA-1 as of the last completed sync in either direction.
+    /// Stays put while `sha1` tracks local content on dirty rows, so revision
+    /// uploads can precondition on the remote head (F7, e2e-m1 bug #1).
+    pub synced_sha1: Option<String>,
 }
 
 impl NodeRow {
@@ -91,7 +95,8 @@ CREATE TABLE IF NOT EXISTS nodes (
     sha1       TEXT,
     mtime      INTEGER,
     sync_state TEXT NOT NULL CHECK (sync_state IN ('synced','dirty','uploading','downloading')),
-    pinned     INTEGER NOT NULL DEFAULT 0
+    pinned     INTEGER NOT NULL DEFAULT 0,
+    synced_sha1 TEXT
 );
 CREATE TABLE IF NOT EXISTS tombstones (
     local_path TEXT PRIMARY KEY,
@@ -127,6 +132,7 @@ impl Db {
         let conn = Connection::open(path)?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.execute_batch(SCHEMA)?;
+        Self::migrate(&conn)?;
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
         })
@@ -136,9 +142,22 @@ impl Db {
     pub fn open_memory() -> rusqlite::Result<Self> {
         let conn = Connection::open_in_memory()?;
         conn.execute_batch(SCHEMA)?;
+        Self::migrate(&conn)?;
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
         })
+    }
+
+    /// Additive migrations for DBs created by older builds.
+    fn migrate(conn: &Connection) -> rusqlite::Result<()> {
+        let mut stmt = conn.prepare("PRAGMA table_info(nodes)")?;
+        let cols: Vec<String> = stmt
+            .query_map([], |r| r.get(1))?
+            .collect::<rusqlite::Result<_>>()?;
+        if !cols.iter().any(|c| c == "synced_sha1") {
+            conn.execute_batch("ALTER TABLE nodes ADD COLUMN synced_sha1 TEXT")?;
+        }
+        Ok(())
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Connection> {
@@ -149,12 +168,12 @@ impl Db {
 
     pub fn upsert_node(&self, row: &NodeRow) -> rusqlite::Result<()> {
         self.lock().execute(
-            "INSERT INTO nodes (local_path, node_uid, parent_uid, name, kind, size, sha1, mtime, sync_state, pinned)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)
+            "INSERT INTO nodes (local_path, node_uid, parent_uid, name, kind, size, sha1, mtime, sync_state, pinned, synced_sha1)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)
              ON CONFLICT(local_path) DO UPDATE SET
                node_uid=excluded.node_uid, parent_uid=excluded.parent_uid, name=excluded.name,
                kind=excluded.kind, size=excluded.size, sha1=excluded.sha1, mtime=excluded.mtime,
-               sync_state=excluded.sync_state, pinned=excluded.pinned",
+               sync_state=excluded.sync_state, pinned=excluded.pinned, synced_sha1=excluded.synced_sha1",
             params![
                 row.local_path,
                 row.node_uid,
@@ -166,6 +185,7 @@ impl Db {
                 row.mtime,
                 row.sync_state.as_str(),
                 row.pinned as i64,
+                row.synced_sha1,
             ],
         )?;
         Ok(())
@@ -189,13 +209,14 @@ impl Db {
             mtime: r.get(7)?,
             sync_state: SyncState::from_str(&state)?,
             pinned: r.get::<_, i64>(9)? != 0,
+            synced_sha1: r.get(10)?,
         })
     }
 
     pub fn node_by_path(&self, local_path: &str) -> rusqlite::Result<Option<NodeRow>> {
         self.lock()
             .query_row(
-                "SELECT local_path,node_uid,parent_uid,name,kind,size,sha1,mtime,sync_state,pinned
+                "SELECT local_path,node_uid,parent_uid,name,kind,size,sha1,mtime,sync_state,pinned,synced_sha1
                  FROM nodes WHERE local_path=?1",
                 params![local_path],
                 Self::row_from,
@@ -206,7 +227,7 @@ impl Db {
     pub fn node_by_uid(&self, node_uid: &str) -> rusqlite::Result<Option<NodeRow>> {
         self.lock()
             .query_row(
-                "SELECT local_path,node_uid,parent_uid,name,kind,size,sha1,mtime,sync_state,pinned
+                "SELECT local_path,node_uid,parent_uid,name,kind,size,sha1,mtime,sync_state,pinned,synced_sha1
                  FROM nodes WHERE node_uid=?1",
                 params![node_uid],
                 Self::row_from,
@@ -231,7 +252,7 @@ impl Db {
     pub fn nodes_with_state(&self, state: SyncState) -> rusqlite::Result<Vec<NodeRow>> {
         let conn = self.lock();
         let mut stmt = conn.prepare(
-            "SELECT local_path,node_uid,parent_uid,name,kind,size,sha1,mtime,sync_state,pinned
+            "SELECT local_path,node_uid,parent_uid,name,kind,size,sha1,mtime,sync_state,pinned,synced_sha1
              FROM nodes WHERE sync_state=?1 ORDER BY local_path",
         )?;
         let rows = stmt
@@ -253,7 +274,7 @@ impl Db {
     pub fn children_of_uid(&self, node_uid: &str) -> rusqlite::Result<Vec<NodeRow>> {
         let conn = self.lock();
         let mut stmt = conn.prepare(
-            "SELECT local_path,node_uid,parent_uid,name,kind,size,sha1,mtime,sync_state,pinned
+            "SELECT local_path,node_uid,parent_uid,name,kind,size,sha1,mtime,sync_state,pinned,synced_sha1
              FROM nodes WHERE parent_uid=?1 ORDER BY local_path",
         )?;
         let rows = stmt
@@ -266,7 +287,7 @@ impl Db {
     pub fn nodes_under(&self, like_pattern: &str) -> rusqlite::Result<Vec<NodeRow>> {
         let conn = self.lock();
         let mut stmt = conn.prepare(
-            "SELECT local_path,node_uid,parent_uid,name,kind,size,sha1,mtime,sync_state,pinned
+            "SELECT local_path,node_uid,parent_uid,name,kind,size,sha1,mtime,sync_state,pinned,synced_sha1
              FROM nodes WHERE local_path LIKE ?1 ORDER BY local_path",
         )?;
         let rows = stmt

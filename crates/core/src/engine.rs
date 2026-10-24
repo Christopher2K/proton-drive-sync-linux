@@ -123,6 +123,12 @@ pub struct Engine<S: SidecarApi> {
     /// Remote events received while paused (F4: cursor kept, applied later).
     buffered_events: VecDeque<DriveEvent>,
     scope_id: Option<String>,
+    /// Tombstone paths (`local_path`) the user approved with an explicit
+    /// resume after a guard pause (e2e-m1 bug #2). The guard's count/ratio
+    /// limbs ignore these; only *new* deletes beyond the approved set can
+    /// re-trip it. In-memory only — reset on engine restart is acceptable
+    /// because the tombstones themselves are durable.
+    approved_tombstones: HashSet<String>,
     /// In-flight transfer currently being awaited (for pause/resume).
     active_transfer: Option<String>,
     /// Set when Shutdown arrived mid-transfer; the main loop exits ASAP.
@@ -150,6 +156,7 @@ impl<S: SidecarApi + 'static> Engine<S> {
             state: EngineState::Running,
             guard: DeleteGuard::default(),
             buffered_events: VecDeque::new(),
+            approved_tombstones: HashSet::new(),
             scope_id: None,
             active_transfer: None,
             shutting_down: false,
@@ -320,6 +327,7 @@ impl<S: SidecarApi + 'static> Engine<S> {
             mtime: node.mtime,
             sync_state: state,
             pinned: false,
+            synced_sha1: node.sha1.clone(),
         })?;
         Ok(())
     }
@@ -428,15 +436,19 @@ impl<S: SidecarApi + 'static> Engine<S> {
             .map(|d| d.as_secs() as i64);
         let name = rel.rsplit('/').next().unwrap_or(rel).to_string();
 
-        let (parent_uid, node_uid) = match self.db.node_by_path(rel)? {
+        let (parent_uid, node_uid, synced_sha1) = match self.db.node_by_path(rel)? {
             Some(row) => {
                 if row.sync_state == SyncState::Synced && row.sha1.as_deref() == Some(&sha1) {
                     return Ok(()); // content unchanged
                 }
                 if row.node_uid.starts_with("pending:") {
-                    (row.parent_uid.clone(), None)
+                    (row.parent_uid.clone(), None, row.synced_sha1.clone())
                 } else {
-                    (row.parent_uid.clone(), Some(row.node_uid.clone()))
+                    (
+                        row.parent_uid.clone(),
+                        Some(row.node_uid.clone()),
+                        row.synced_sha1.clone(),
+                    )
                 }
             }
             None => {
@@ -458,7 +470,7 @@ impl<S: SidecarApi + 'static> Engine<S> {
                     std::fs::rename(&abs, to_abs(&self.root, &new_rel))?;
                     return Box::pin(self.upsert_local_file(&new_rel)).await;
                 }
-                (parent_uid, None)
+                (parent_uid, None, None)
             }
         };
 
@@ -473,6 +485,9 @@ impl<S: SidecarApi + 'static> Engine<S> {
             mtime,
             sync_state: SyncState::Dirty,
             pinned: false,
+            // The dirty rewrite above tracks LOCAL content in `sha1`; keep
+            // the last-synced remote head intact for the F7 precondition.
+            synced_sha1,
         })?;
 
         if self.state != EngineState::Running {
@@ -494,6 +509,149 @@ impl<S: SidecarApi + 'static> Engine<S> {
         if !abs.is_file() {
             return Ok(()); // vanished before upload; delete path owns it
         }
+        // F7 precondition (e2e-m1 bug #1): before uploading a new revision of
+        // a previously-synced node, verify the remote head is still what we
+        // last synced. The event stream lags (~30 s poll), so the remote edit
+        // may not have reached us — ordering alone cannot prevent silently
+        // superseding it.
+        if !row.node_uid.starts_with("pending:") {
+            self.check_remote_head(rel, &row).await?;
+            // The check may have re-keyed the row (vanished node) or left it
+            // untouched (fast path / conflict downloaded); re-read it.
+            let Some(row) = self.db.node_by_path(rel)? else {
+                return Ok(());
+            };
+            if row.sync_state != SyncState::Dirty {
+                return Ok(());
+            }
+            return self.upload_row(rel, &row).await;
+        }
+        self.upload_row(rel, &row).await
+    }
+
+    /// Precondition for revision uploads: compare the remote head SHA-1
+    /// (`drive.getNode`) against the last-synced head in the DB. On mismatch
+    /// keep BOTH versions (F7): download the remote head as a conflict copy
+    /// (it syncs back up as a new node), then let the caller upload the
+    /// local dirty content as the new revision of the original node. Never
+    /// silently overwrite in either direction.
+    async fn check_remote_head(&mut self, rel: &str, row: &NodeRow) -> Result<()> {
+        let node = match self.sidecar.get_node(&row.node_uid).await {
+            Ok(n) => n,
+            Err(e) => {
+                // Node gone remotely (trashed by another client; the event
+                // hasn't reached us). Re-upload as a NEW file rather than
+                // reviving a trashed node or erroring against the old uid —
+                // the local content survives either way.
+                warn!(path = %rel, error = %e, "remote node vanished before upload; re-uploading as new file");
+                if let Some(mut r) = self.db.node_by_path(rel)? {
+                    r.node_uid = format!("pending:{rel}");
+                    r.sync_state = SyncState::Dirty;
+                    self.db.upsert_node(&r)?;
+                }
+                return Ok(());
+            }
+        };
+        let head_matches = match (&row.synced_sha1, &node.sha1) {
+            (Some(known), Some(remote)) => known == remote,
+            // No recorded head (pre-migration row) or the remote doesn't
+            // claim one: nothing reliable to compare against — proceed.
+            _ => true,
+        };
+        if head_matches {
+            return Ok(());
+        }
+        let conflict_rel = self
+            .download_remote_head_as_conflict(rel, row, &node)
+            .await?;
+        warn!(
+            path = %rel,
+            conflict = %conflict_rel,
+            "remote head changed while local copy dirty: keeping both"
+        );
+        Ok(())
+    }
+
+    /// Download the current remote head of `node` to
+    /// `name (conflict YYYY-MM-DD HHmm).ext` and track it as a new dirty
+    /// (pending) node so the copy uploads under its own uid — durable across
+    /// restarts, unlike relying on the watcher alone.
+    async fn download_remote_head_as_conflict(
+        &mut self,
+        rel: &str,
+        row: &NodeRow,
+        node: &Node,
+    ) -> Result<String> {
+        let conflict_rel = self.fresh_conflict_rel(rel, row).await?;
+        let abs = to_abs(&self.root, &conflict_rel);
+        if let Some(dir) = abs.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        let tmp_rel = format!("{conflict_rel}.pds-part");
+        let tmp = to_abs(&self.root, &tmp_rel);
+        let sidecar = Arc::clone(&self.sidecar);
+        self.run_transfer(
+            "download",
+            Some(&conflict_rel),
+            sidecar.download(&node.uid, &tmp),
+        )
+        .await?;
+        std::fs::rename(&tmp, &abs)?;
+        let (sha1, size) = sha1_file(&abs)?;
+        self.db.upsert_node(&NodeRow {
+            local_path: conflict_rel.clone(),
+            node_uid: format!("pending:{conflict_rel}"),
+            parent_uid: row.parent_uid.clone().or_else(|| node.parent_uid.clone()),
+            name: conflict_rel
+                .rsplit('/')
+                .next()
+                .unwrap_or(&conflict_rel)
+                .to_string(),
+            kind: NodeKind::File,
+            size: Some(size as i64),
+            sha1: Some(sha1),
+            mtime: node.mtime,
+            sync_state: SyncState::Dirty,
+            pinned: false,
+            synced_sha1: None,
+        })?;
+        Ok(conflict_rel)
+    }
+
+    /// Pick a conflict path next to `rel` that is free locally, in the DB,
+    /// and (best effort) remotely.
+    async fn fresh_conflict_rel(&self, rel: &str, row: &NodeRow) -> Result<String> {
+        let name = rel.rsplit('/').next().unwrap_or(rel);
+        let stamped = conflict_name(name, chrono::Local::now());
+        let with_name = |n: &str| match rel.rsplit_once('/') {
+            Some((dir, _)) => format!("{dir}/{n}"),
+            None => n.to_string(),
+        };
+        // Local/DB collision (same-minute double conflict): disambiguate.
+        let mut candidate = stamped;
+        for i in 2.. {
+            let abs = to_abs(&self.root, &with_name(&candidate));
+            if !abs.exists() && self.db.node_by_path(&with_name(&candidate))?.is_none() {
+                break;
+            }
+            candidate = conflict_name(&format!("{name} ({i})"), chrono::Local::now());
+        }
+        // Remote collision: ask the Drive side for an available name.
+        if let Some(parent) = row.parent_uid.clone() {
+            let available = self.sidecar.get_available_name(&parent, &candidate).await;
+            if let Ok(available) = available {
+                let abs = to_abs(&self.root, &with_name(&available));
+                if !abs.exists() && self.db.node_by_path(&with_name(&available))?.is_none() {
+                    candidate = available;
+                }
+            }
+        }
+        Ok(with_name(&candidate))
+    }
+
+    /// Perform the actual upload transfer for a dirty row.
+    async fn upload_row(&mut self, rel: &str, row: &NodeRow) -> Result<()> {
+        let abs = to_abs(&self.root, rel);
         let params = UploadParams {
             parent_uid: if row.node_uid.starts_with("pending:") {
                 row.parent_uid.clone()
@@ -518,11 +676,13 @@ impl<S: SidecarApi + 'static> Engine<S> {
             .await;
         match outcome {
             Ok(done) => {
-                let mut row = self.db.node_by_path(rel)?.unwrap_or(row);
+                let mut row = self.db.node_by_path(rel)?.unwrap_or_else(|| row.clone());
                 if let Some(uid) = done.node_uid {
                     row.node_uid = uid;
                 }
                 row.sync_state = SyncState::Synced;
+                // The uploaded content IS the remote head now.
+                row.synced_sha1 = row.sha1.clone();
                 self.db.upsert_node(&row)?;
                 info!(path = %rel, "uploaded");
             }
@@ -610,14 +770,21 @@ impl<S: SidecarApi + 'static> Engine<S> {
         let Some(t) = self.db.tombstones()?.into_iter().next() else {
             return Ok(true);
         };
-        let synced_total = self.db.count_synced()?;
-        if self.guard.record_and_check(Instant::now(), synced_total) {
-            self.state = EngineState::GuardPaused;
-            warn!(
-                deletes = self.guard.window_len(),
-                synced_total, "mass-deletion guard tripped: auto-paused, explicit resume required"
-            );
-            return Ok(false);
+        // Bug #2: tombstones approved by an explicit resume drain without
+        // touching the guard's window; only deletes beyond the approved set
+        // count toward the count/percentage limbs.
+        let approved = self.approved_tombstones.contains(&t.local_path);
+        if !approved {
+            let synced_total = self.db.count_synced()?;
+            if self.guard.record_and_check(Instant::now(), synced_total) {
+                self.state = EngineState::GuardPaused;
+                warn!(
+                    deletes = self.guard.window_len(),
+                    synced_total,
+                    "mass-deletion guard tripped: auto-paused, explicit resume required"
+                );
+                return Ok(false);
+            }
         }
         let results = self
             .sidecar
@@ -627,6 +794,7 @@ impl<S: SidecarApi + 'static> Engine<S> {
             info!(path = %t.local_path, uid = %t.node_uid, "trashed remotely");
             self.remove_node_recursive(&t.local_path)?;
             self.db.remove_tombstone(&t.local_path)?;
+            self.approved_tombstones.remove(&t.local_path);
         } else {
             warn!(path = %t.local_path, "trash failed remotely; keeping tombstone");
             return Ok(false);
@@ -829,6 +997,7 @@ impl<S: SidecarApi + 'static> Engine<S> {
             mtime: node.as_ref().and_then(|n| n.mtime),
             sync_state: SyncState::Synced,
             pinned: false,
+            synced_sha1: node.as_ref().and_then(|n| n.sha1.clone()),
         })?;
         info!(path = %rel, "downloaded");
         Ok(())
@@ -929,7 +1098,15 @@ impl<S: SidecarApi + 'static> Engine<S> {
                         info!("resumed");
                     }
                     EngineState::GuardPaused => {
-                        // Explicit resume IS the user confirmation (F3.3).
+                        // Explicit resume IS the user confirmation (F3.3) —
+                        // and it approves the tombstones pending *right now*
+                        // (bug #2): they drain without re-tripping the guard
+                        // as the synced base shrinks. Only deletes beyond
+                        // this approved set can trip it again.
+                        if let Ok(pending) = self.db.tombstones() {
+                            self.approved_tombstones
+                                .extend(pending.into_iter().map(|t| t.local_path));
+                        }
                         self.guard.reset();
                         self.state = EngineState::Running;
                         info!("resumed after mass-delete guard");
@@ -960,12 +1137,20 @@ impl<S: SidecarApi + 'static> Engine<S> {
         Ok(())
     }
 
-    /// Drain queued work in SPEC F4 order: tombstones (guarded) → uploads →
-    /// buffered remote events. Returns true if any work was done.
+    /// Drain queued work: tombstones (guarded) → buffered remote events →
+    /// uploads. Buffered events are applied BEFORE the upload queue (bug #1):
+    /// it narrows the window in which a not-yet-arrived remote edit would be
+    /// superseded by a local revision upload. (Deviation from the SPEC F4
+    /// drain order "uploads then events", accepted for F7 safety.)
+    /// Returns true if any work was done.
     async fn pump_work(&mut self) -> Result<bool> {
         if !self.db.tombstones()?.is_empty() {
             // Guard may auto-pause; false means "stop pumping".
             self.drain_one_tombstone().await?;
+            return Ok(true);
+        }
+        if let Some(ev) = self.buffered_events.pop_front() {
+            self.apply_event(ev).await?;
             return Ok(true);
         }
         if let Some(row) = self
@@ -975,10 +1160,6 @@ impl<S: SidecarApi + 'static> Engine<S> {
             .next()
         {
             self.upload_one(&row.local_path).await?;
-            return Ok(true);
-        }
-        if let Some(ev) = self.buffered_events.pop_front() {
-            self.apply_event(ev).await?;
             return Ok(true);
         }
         Ok(false)
@@ -1095,10 +1276,11 @@ mod tests {
             name: rel.rsplit('/').next().unwrap_or(rel).to_string(),
             kind: NodeKind::File,
             size: None,
-            sha1,
+            sha1: sha1.clone(),
             mtime: None,
             sync_state: SyncState::Synced,
             pinned: false,
+            synced_sha1: sha1,
         }
     }
 

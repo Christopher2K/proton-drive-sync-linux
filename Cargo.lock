@@ -618,6 +618,7 @@ dependencies = [
  "pds-core",
  "pds-sidecar-client",
  "serde_json",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",

@@ -42,16 +42,29 @@ enum Cmd {
     /// Log out and wipe the persisted session.
     Logout,
     /// Show auth + engine status.
-    Status,
-    /// Sync a local folder with Proton Drive (long-running).
+    Status {
+        /// Sync root to query (default: auto-detect when exactly one engine runs).
+        #[arg(long)]
+        root: Option<PathBuf>,
+    },
+    /// Sync a local folder with Proton Drive (long-running). The folder is
+    /// created if it does not exist.
     Sync {
         /// Local sync root folder.
         folder: PathBuf,
     },
     /// Pause the running sync (queues frozen, changes buffered).
-    Pause,
+    Pause {
+        /// Sync root to pause (default: auto-detect when exactly one engine runs).
+        #[arg(long)]
+        root: Option<PathBuf>,
+    },
     /// Resume a paused (or guard-paused) sync.
-    Resume,
+    Resume {
+        /// Sync root to resume (default: auto-detect when exactly one engine runs).
+        #[arg(long)]
+        root: Option<PathBuf>,
+    },
 }
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
@@ -68,10 +81,10 @@ async fn main() -> Result<()> {
     match cli.cmd {
         Cmd::Login => login(cli.sidecar_cmd.as_deref()).await,
         Cmd::Logout => logout(cli.sidecar_cmd.as_deref()).await,
-        Cmd::Status => status(cli.sidecar_cmd.as_deref()).await,
+        Cmd::Status { root } => status(root, cli.sidecar_cmd.as_deref()).await,
         Cmd::Sync { folder } => sync(folder, cli.sidecar_cmd.as_deref()).await,
-        Cmd::Pause => control::send_simple("pause").await,
-        Cmd::Resume => control::send_simple("resume").await,
+        Cmd::Pause { root } => control::send_simple("pause", root.as_deref()).await,
+        Cmd::Resume { root } => control::send_simple("resume", root.as_deref()).await,
     }
 }
 
@@ -112,11 +125,11 @@ async fn logout(sidecar_cmd: Option<&str>) -> Result<()> {
     Ok(())
 }
 
-async fn status(sidecar_cmd: Option<&str>) -> Result<()> {
+async fn status(root: Option<PathBuf>, sidecar_cmd: Option<&str>) -> Result<()> {
     // Engine status first (if a sync is running).
-    match control::query_status().await {
+    match control::query_status(root.as_deref()).await {
         Ok(line) => println!("engine: {line}"),
-        Err(_) => println!("engine: not running"),
+        Err(e) => println!("engine: not running ({e:#})"),
     }
     let (client, _child) = spawn::spawn_sidecar(sidecar_cmd)?;
     let st = client.auth_status().await.context("auth.status")?;
@@ -128,6 +141,11 @@ async fn status(sidecar_cmd: Option<&str>) -> Result<()> {
 }
 
 async fn sync(folder: PathBuf, sidecar_cmd: Option<&str>) -> Result<()> {
+    if !folder.exists() {
+        std::fs::create_dir_all(&folder)
+            .with_context(|| format!("create sync folder {}", folder.display()))?;
+        info!(folder = %folder.display(), "created sync folder");
+    }
     let root = folder.canonicalize().context("sync folder")?;
     if !root.is_dir() {
         bail!("{} is not a directory", root.display());
@@ -152,20 +170,20 @@ async fn sync(folder: PathBuf, sidecar_cmd: Option<&str>) -> Result<()> {
 
     // Control socket for `pds pause|resume|status`.
     let _control = control::serve(&root, handle.clone()).await?;
-    control::register_current_root(&root)?;
+    control::register_root(&root)?;
 
     let engine_task = tokio::spawn(engine.run());
 
     tokio::select! {
         res = engine_task => {
-            control::clear_current_root();
+            control::deregister_root(&root);
             res.context("engine task")?
         }
         sig = tokio::signal::ctrl_c() => {
             sig.context("ctrl-c")?;
             info!("shutting down");
             handle.shutdown().await.ok();
-            control::clear_current_root();
+            control::deregister_root(&root);
             Ok(())
         }
     }

@@ -259,9 +259,9 @@ async fn mass_delete_guard_auto_pauses_and_requires_resume() {
     let fx = start_with_client(dir, root.clone(), client, mock).await;
 
     // Delete 25 of 32 synced nodes: the ratio guard (>25% of synced nodes)
-    // trips long before 20 individual deletes, and keeps re-tripping as the
-    // synced base shrinks. Each explicit resume is the user's confirmation
-    // (SPEC F3.3); draining eventually completes.
+    // trips partway through. ONE explicit resume is the user's confirmation
+    // (SPEC F3.3) and approves the whole pending batch (bug #2): it must
+    // drain completely without re-tripping as the synced base shrinks.
     for i in 0..25 {
         std::fs::remove_file(root.join(format!("f{i:02}.txt"))).unwrap();
     }
@@ -286,9 +286,72 @@ async fn mass_delete_guard_auto_pauses_and_requires_resume() {
         resumes += 1;
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
-    assert!(resumes >= 1, "guard must require explicit confirmation");
+    assert_eq!(
+        resumes, 1,
+        "one explicit resume must approve and drain the whole pending batch"
+    );
     assert_eq!(fx.mock.trashed_uids().len(), 25);
     assert!(fx.db.tombstones().unwrap().is_empty());
+    fx.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn mass_delete_guard_re_trips_on_new_deletes_beyond_approved_set() {
+    // Same seeding as above.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("sync");
+    std::fs::create_dir_all(&root).unwrap();
+    let (client, mock) = MockSidecar::new().connect();
+    for i in 0..30 {
+        mock.remote_create_file("root", &format!("f{i:02}.txt"), b"x");
+    }
+    let fx = start_with_client(dir, root.clone(), client, mock).await;
+
+    // First batch: 25 deletes → guard trips → one resume drains them all.
+    for i in 0..25 {
+        std::fs::remove_file(root.join(format!("f{i:02}.txt"))).unwrap();
+    }
+    wait_for(|| {
+        futures::executor::block_on(fx.handle.status())
+            .map(|s| s.state == EngineState::GuardPaused)
+            .unwrap_or(false)
+    })
+    .await;
+    fx.handle.resume().await.unwrap();
+    wait_for(|| fx.mock.trashed_uids().len() == 25).await;
+    assert!(fx.db.tombstones().unwrap().is_empty());
+
+    // NEW deletes beyond the approved set must re-trip the guard (bug #2:
+    // approval covers only the batch pending at resume time). 7 synced nodes
+    // remain (5 seeds + hello.txt + Documents), so the 2nd new delete breaks
+    // the 25% ratio.
+    for i in 25..30 {
+        std::fs::remove_file(root.join(format!("f{i:02}.txt"))).unwrap();
+    }
+    wait_for(|| {
+        futures::executor::block_on(fx.handle.status())
+            .map(|s| s.state == EngineState::GuardPaused)
+            .unwrap_or(false)
+    })
+    .await;
+    let trashed_at_trip = fx.mock.trashed_uids().len();
+    assert!(
+        trashed_at_trip < 30,
+        "guard must re-trip before the new batch fully drains"
+    );
+    assert!(!fx.db.tombstones().unwrap().is_empty());
+
+    // A second explicit resume approves the new batch and drains it.
+    fx.handle.resume().await.unwrap();
+    wait_for(|| fx.mock.trashed_uids().len() == 30).await;
+    assert!(fx.db.tombstones().unwrap().is_empty());
+    // And nothing more re-trips afterwards.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(
+        fx.handle.status().await.unwrap().state,
+        EngineState::Running
+    );
     fx.shutdown().await;
 }
 
@@ -376,6 +439,105 @@ async fn remote_events_buffered_while_paused() {
 // F7 — conflicts (engine level; naming itself is unit-tested in conflict.rs)
 // ---------------------------------------------------------------------------
 
+/// First directory entry in `root` named `{stem} (conflict …).*`.
+fn conflict_entry(root: &std::path::Path, stem: &str) -> Option<std::fs::DirEntry> {
+    std::fs::read_dir(root)
+        .ok()?
+        .filter_map(|e| e.ok())
+        .find(|e| {
+            e.file_name()
+                .to_string_lossy()
+                .starts_with(&format!("{stem} (conflict "))
+        })
+}
+
+// Bug #1 test (a): remote head differs from the DB's synced head at upload
+// time → keep-both: conflict copy with the REMOTE content created locally +
+// local content uploaded as the new revision + remote head preserved.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn dirty_upload_with_changed_remote_head_keeps_both() {
+    let fx = start().await;
+    // Pause → local edit buffered → remote edit whose event has NOT arrived
+    // yet (event-stream lag, simulated by a silent update) → resume. The
+    // upload precondition (drive.getNode head check) must catch this.
+    fx.handle.pause().await.unwrap();
+    std::fs::write(fx.root.join("hello.txt"), b"local edit").unwrap();
+    tokio::time::sleep(Duration::from_millis(1200)).await; // watcher buffers dirty
+    fx.mock
+        .remote_update_file_silent("node-hello", b"remote edit");
+    fx.handle.resume().await.unwrap();
+
+    // Local content wins the revision race on the ORIGINAL node…
+    wait_for(|| fx.mock.file_content("node-hello").as_deref() == Some(b"local edit")).await;
+    // …and the remote head survives locally as a conflict copy…
+    wait_for(|| {
+        conflict_entry(&fx.root, "hello")
+            .map(|e| std::fs::read(e.path()).unwrap() == b"remote edit")
+            .unwrap_or(false)
+    })
+    .await;
+    // …which then syncs up as a NEW remote node (never trashed/overwritten).
+    let conflict_uid = wait_for_mock(&fx.mock, "hello (conflict ").await;
+    assert_eq!(
+        fx.mock.file_content(&conflict_uid).as_deref(),
+        Some(b"remote edit".as_slice())
+    );
+    // The local original path still holds the local edit, and nothing was
+    // trashed in either direction.
+    assert_eq!(
+        std::fs::read(fx.root.join("hello.txt")).unwrap(),
+        b"local edit"
+    );
+    assert!(fx.mock.trashed_uids().is_empty());
+    fx.shutdown().await;
+}
+
+/// Poll until a node named with `prefix` appears under `root`; return its uid.
+async fn wait_for_mock(mock: &MockHandle, name_prefix: &str) -> String {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while Instant::now() < deadline {
+        if let Some(name) = mock
+            .uploaded_names()
+            .into_iter()
+            .find(|n| n.starts_with(name_prefix))
+            && let Some(uid) = mock.find_uid("root", &name)
+        {
+            return uid;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("no uploaded node named `{name_prefix}*` within 30 s");
+}
+
+// Bug #1 test (b): unchanged remote head → fast path uploads the revision
+// without any conflict copy.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn dirty_upload_with_unchanged_remote_head_uploads_without_conflict() {
+    let fx = start().await;
+    std::fs::write(fx.root.join("hello.txt"), b"v2").unwrap();
+    wait_for(|| fx.mock.file_content("node-hello").as_deref() == Some(b"v2")).await;
+    tokio::time::sleep(Duration::from_millis(1200)).await; // settle
+
+    // Exactly one revision upload, no conflict file anywhere.
+    assert_eq!(
+        fx.mock
+            .uploaded_names()
+            .iter()
+            .filter(|n| *n == "hello.txt")
+            .count(),
+        1
+    );
+    assert!(conflict_entry(&fx.root, "hello").is_none());
+    // DB row is synced and the recorded remote head advanced to v2.
+    let row = fx.db.node_by_path("hello.txt").unwrap().unwrap();
+    assert_eq!(row.sync_state, pds_core::SyncState::Synced);
+    let (expected, _) = pds_core::sha1_file(&fx.root.join("hello.txt")).unwrap();
+    assert_eq!(row.synced_sha1.as_deref(), Some(expected.as_str()));
+    fx.shutdown().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
 async fn remote_update_over_locally_diverged_file_keeps_both() {
@@ -392,33 +554,26 @@ async fn remote_update_over_locally_diverged_file_keeps_both() {
 
     wait_for(|| {
         let local = std::fs::read(fx.root.join("hello.txt")).unwrap_or_default();
-        let conflict_present = std::fs::read_dir(&fx.root)
-            .unwrap()
-            .filter_map(|e| e.ok())
-            .any(|e| {
-                e.file_name()
-                    .to_string_lossy()
-                    .starts_with("hello (conflict ")
-            });
+        let conflict_present = conflict_entry(&fx.root, "hello").is_some();
         local == b"local edit" || (local == b"remote edit" && conflict_present)
     })
     .await;
-    // Settle, then verify nothing was lost or trashed.
+    // Settle, then verify BOTH contents survive and nothing was trashed.
+    // (Buffered events apply before uploads on resume, and the upload
+    // precondition keeps both even when the event hasn't arrived — so this
+    // holds regardless of the race outcome.)
     tokio::time::sleep(Duration::from_millis(1200)).await;
     assert!(fx.mock.trashed_uids().is_empty());
     let local = std::fs::read(fx.root.join("hello.txt")).unwrap_or_default();
-    if local == b"remote edit" {
-        let conflict = std::fs::read_dir(&fx.root)
-            .unwrap()
-            .filter_map(|e| e.ok())
-            .find(|e| {
-                e.file_name()
-                    .to_string_lossy()
-                    .starts_with("hello (conflict ")
-            })
-            .expect("conflict copy must exist");
-        assert_eq!(std::fs::read(conflict.path()).unwrap(), b"local edit");
-    }
+    let conflict = conflict_entry(&fx.root, "hello").expect("conflict copy must exist");
+    let conflict_content = std::fs::read(conflict.path()).unwrap();
+    let mut contents = [local, conflict_content];
+    contents.sort();
+    assert_eq!(
+        contents,
+        [b"local edit".to_vec(), b"remote edit".to_vec()],
+        "both versions must survive (F7 keep-both)"
+    );
     fx.shutdown().await;
 }
 

@@ -188,6 +188,29 @@ impl MockHandle {
         }));
     }
 
+    /// Change a remote file's content WITHOUT emitting an event — simulates
+    /// an edit on another device whose event hasn't reached us yet (event
+    /// stream lag, e2e-m1 bug #1).
+    pub fn remote_update_file_silent(&self, uid: &str, content: &[u8]) {
+        let mut st = self.state.lock().unwrap();
+        if let Some(n) = st.nodes.get_mut(uid) {
+            n.size = Some(content.len() as i64);
+            n.sha1 = Some(hex_sha1(content));
+            n.content = Some(Arc::new(content.to_vec()));
+            n.trashed = false;
+        }
+    }
+
+    /// Current remote content of a file node.
+    pub fn file_content(&self, uid: &str) -> Option<Vec<u8>> {
+        self.state
+            .lock()
+            .unwrap()
+            .nodes
+            .get(uid)
+            .and_then(|n| n.content.as_ref().map(|c| (**c).clone()))
+    }
+
     /// Emit a raw drive event (for custom scenarios).
     pub fn emit_event(&self, event: &DriveEvent) {
         let st = self.state.lock().unwrap();
