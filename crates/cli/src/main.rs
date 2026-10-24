@@ -165,6 +165,7 @@ async fn sync(folder: PathBuf, sidecar_cmd: Option<&str>) -> Result<()> {
         EngineConfig {
             db_path: root.join(STATE_DIR).join("state.db"),
             root: root.clone(),
+            retry_base: pds_core::RETRY_BASE_DEFAULT,
         },
     )?;
 

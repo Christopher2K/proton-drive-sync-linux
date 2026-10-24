@@ -96,7 +96,9 @@ CREATE TABLE IF NOT EXISTS nodes (
     mtime      INTEGER,
     sync_state TEXT NOT NULL CHECK (sync_state IN ('synced','dirty','uploading','downloading')),
     pinned     INTEGER NOT NULL DEFAULT 0,
-    synced_sha1 TEXT
+    synced_sha1 TEXT,
+    retry_count INTEGER NOT NULL DEFAULT 0,
+    last_error TEXT
 );
 CREATE TABLE IF NOT EXISTS tombstones (
     local_path TEXT PRIMARY KEY,
@@ -154,8 +156,20 @@ impl Db {
         let cols: Vec<String> = stmt
             .query_map([], |r| r.get(1))?
             .collect::<rusqlite::Result<_>>()?;
-        if !cols.iter().any(|c| c == "synced_sha1") {
-            conn.execute_batch("ALTER TABLE nodes ADD COLUMN synced_sha1 TEXT")?;
+        for (name, ddl) in [
+            (
+                "synced_sha1",
+                "ALTER TABLE nodes ADD COLUMN synced_sha1 TEXT",
+            ),
+            (
+                "retry_count",
+                "ALTER TABLE nodes ADD COLUMN retry_count INTEGER NOT NULL DEFAULT 0",
+            ),
+            ("last_error", "ALTER TABLE nodes ADD COLUMN last_error TEXT"),
+        ] {
+            if !cols.iter().any(|c| c == name) {
+                conn.execute_batch(ddl)?;
+            }
         }
         Ok(())
     }
@@ -268,6 +282,75 @@ impl Db {
             |r| r.get(0),
         )?;
         Ok(n as usize)
+    }
+
+    // ---- upload failure bookkeeping (F2 retry policy) ----
+    // These columns are deliberately NOT part of NodeRow/upsert_node, so
+    // row rewrites (dirty marks, sync completions) never clobber them;
+    // the engine clears them explicitly on success or fresh local edits.
+
+    /// Increment the consecutive-failure counter; returns the new count.
+    pub fn record_retryable_failure(&self, local_path: &str) -> rusqlite::Result<i64> {
+        let conn = self.lock();
+        conn.execute(
+            "UPDATE nodes SET retry_count = retry_count + 1 WHERE local_path=?1",
+            params![local_path],
+        )?;
+        conn.query_row(
+            "SELECT retry_count FROM nodes WHERE local_path=?1",
+            params![local_path],
+            |r| r.get(0),
+        )
+    }
+
+    /// Mark the node terminally errored (surfaced in status; never
+    /// requeued until a fresh local edit clears it).
+    pub fn mark_upload_errored(&self, local_path: &str, error: &str) -> rusqlite::Result<()> {
+        self.lock().execute(
+            "UPDATE nodes SET last_error=?2 WHERE local_path=?1",
+            params![local_path, error],
+        )?;
+        Ok(())
+    }
+
+    /// The terminal error recorded for a path, if any.
+    pub fn upload_error(&self, local_path: &str) -> rusqlite::Result<Option<String>> {
+        self.lock()
+            .query_row(
+                "SELECT last_error FROM nodes WHERE local_path=?1",
+                params![local_path],
+                |r| r.get(0),
+            )
+            .optional()
+            .map(|o| o.flatten())
+    }
+
+    /// Paths of all terminally errored nodes.
+    pub fn errored_paths(&self) -> rusqlite::Result<Vec<String>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare("SELECT local_path FROM nodes WHERE last_error IS NOT NULL")?;
+        let rows = stmt
+            .query_map([], |r| r.get(0))?
+            .collect::<rusqlite::Result<Vec<String>>>()?;
+        Ok(rows)
+    }
+
+    pub fn count_errored(&self) -> rusqlite::Result<usize> {
+        let n: i64 = self.lock().query_row(
+            "SELECT COUNT(*) FROM nodes WHERE last_error IS NOT NULL",
+            [],
+            |r| r.get(0),
+        )?;
+        Ok(n as usize)
+    }
+
+    /// Reset failure state (successful upload, or a fresh local edit).
+    pub fn clear_upload_failures(&self, local_path: &str) -> rusqlite::Result<()> {
+        self.lock().execute(
+            "UPDATE nodes SET retry_count=0, last_error=NULL WHERE local_path=?1",
+            params![local_path],
+        )?;
+        Ok(())
     }
 
     /// Direct children rows of a node uid (remote tree walk).

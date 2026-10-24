@@ -18,12 +18,16 @@ struct Fixture {
 }
 
 async fn start() -> Fixture {
+    start_with_retry_base(pds_core::RETRY_BASE_DEFAULT).await
+}
+
+async fn start_with_retry_base(retry_base: Duration) -> Fixture {
     init_logs();
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("sync");
     std::fs::create_dir_all(&root).unwrap();
     let (client, mock) = MockSidecar::new().connect();
-    start_with_client(dir, root, client, mock).await
+    start_with_client(dir, root, client, mock, retry_base).await
 }
 
 fn init_logs() {
@@ -38,6 +42,7 @@ async fn start_with_client(
     root: std::path::PathBuf,
     mut client: SidecarClient,
     mock: MockHandle,
+    retry_base: Duration,
 ) -> Fixture {
     init_logs();
     let notifications = client.take_notifications();
@@ -48,6 +53,7 @@ async fn start_with_client(
         EngineConfig {
             root: root.clone(),
             db_path: db_path.clone(),
+            retry_base,
         },
     )
     .unwrap();
@@ -132,6 +138,7 @@ async fn first_run_uploads_local_only_files() {
         EngineConfig {
             root: root.clone(),
             db_path: root.join(STATE_DIR).join("state.db"),
+            retry_base: pds_core::RETRY_BASE_DEFAULT,
         },
     )
     .unwrap();
@@ -202,7 +209,14 @@ async fn synced_delete_propagates_as_trash() {
     for i in 0..10 {
         mock.remote_create_file("root", &format!("seed{i}.txt"), b"x");
     }
-    let fx = start_with_client(dir, root.clone(), client, mock).await;
+    let fx = start_with_client(
+        dir,
+        root.clone(),
+        client,
+        mock,
+        pds_core::RETRY_BASE_DEFAULT,
+    )
+    .await;
 
     std::fs::remove_file(root.join("hello.txt")).unwrap();
     wait_for(|| fx.mock.trashed_uids().contains(&"node-hello".to_string())).await;
@@ -256,7 +270,14 @@ async fn mass_delete_guard_auto_pauses_and_requires_resume() {
     for i in 0..30 {
         mock.remote_create_file("root", &format!("f{i:02}.txt"), b"x");
     }
-    let fx = start_with_client(dir, root.clone(), client, mock).await;
+    let fx = start_with_client(
+        dir,
+        root.clone(),
+        client,
+        mock,
+        pds_core::RETRY_BASE_DEFAULT,
+    )
+    .await;
 
     // Delete 25 of 32 synced nodes: the ratio guard (>25% of synced nodes)
     // trips partway through. ONE explicit resume is the user's confirmation
@@ -306,7 +327,14 @@ async fn mass_delete_guard_re_trips_on_new_deletes_beyond_approved_set() {
     for i in 0..30 {
         mock.remote_create_file("root", &format!("f{i:02}.txt"), b"x");
     }
-    let fx = start_with_client(dir, root.clone(), client, mock).await;
+    let fx = start_with_client(
+        dir,
+        root.clone(),
+        client,
+        mock,
+        pds_core::RETRY_BASE_DEFAULT,
+    )
+    .await;
 
     // First batch: 25 deletes → guard trips → one resume drains them all.
     for i in 0..25 {
@@ -618,6 +646,112 @@ async fn remote_create_over_untracked_local_keeps_both() {
         assert_eq!(std::fs::read(fx.root.join(name)).unwrap(), b"local copy v2");
     }
     assert!(!entries.is_empty());
+    fx.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------
+// F2 — upload retry policy + 409 keep-both safety net (bug #1 follow-up)
+// ---------------------------------------------------------------------------
+
+// (a) Revision upload rejected with the 409 "no longer up to date" class →
+// keep-both (remote head downloaded as a conflict copy), ONE retry atop the
+// fresh head succeeds, no loop. Here the remote sha1 still matches our DB
+// head, so the getNode precondition passes — the 409 handler is the net
+// (server-side staleness is about the base REVISION, not just the digest).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn revision_upload_409_keeps_both_and_retries_once() {
+    let fx = start().await;
+    fx.mock.inject_upload_failures(
+        "node-hello",
+        &[(
+            1099,
+            "POST /drive/v2/volumes/x/links/y/revisions 409 'Current revision is no longer up to date'",
+            false,
+        )],
+    );
+
+    std::fs::write(fx.root.join("hello.txt"), b"local edit").unwrap();
+
+    // Remote head ("hello drive") survives as a conflict copy…
+    wait_for(|| {
+        conflict_entry(&fx.root, "hello")
+            .map(|e| std::fs::read(e.path()).unwrap() == b"hello drive")
+            .unwrap_or(false)
+    })
+    .await;
+    // …the retry lands the local edit as the new revision of the original node…
+    wait_for(|| fx.mock.file_content("node-hello").as_deref() == Some(b"local edit")).await;
+    // …and the conflict copy syncs up as a NEW node.
+    let conflict_uid = wait_for_mock(&fx.mock, "hello (conflict ").await;
+    assert_eq!(
+        fx.mock.file_content(&conflict_uid).as_deref(),
+        Some(b"hello drive".as_slice())
+    );
+
+    // Exactly two attempts (fail + one retry), no loop, nothing errored.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert_eq!(fx.mock.upload_attempts("hello.txt"), 2);
+    assert_eq!(fx.handle.status().await.unwrap().errored_nodes, 0);
+    assert_eq!(
+        std::fs::read(fx.root.join("hello.txt")).unwrap(),
+        b"local edit"
+    );
+    assert!(fx.mock.trashed_uids().is_empty());
+    fx.shutdown().await;
+}
+
+// (b) Persistent non-retryable error → node marked errored after the FIRST
+// attempt; never blind-requeued (the observed ~4/sec hot loop).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn non_retryable_upload_error_marks_errored_without_loop() {
+    let fx = start().await;
+    // Plenty of scripted failures: a loop would burn through them.
+    let failures: Vec<(i64, &str, bool)> = (0..30)
+        .map(|_| (1099, "integrity check failed", false))
+        .collect();
+    fx.mock.inject_upload_failures("node-hello", &failures);
+
+    std::fs::write(fx.root.join("hello.txt"), b"broken").unwrap();
+    wait_for(|| {
+        futures::executor::block_on(fx.handle.status())
+            .map(|s| s.errored_nodes == 1)
+            .unwrap_or(false)
+    })
+    .await;
+    // Bounded: exactly one attempt, still exactly one after settling.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert_eq!(fx.mock.upload_attempts("hello.txt"), 1);
+    assert_eq!(
+        fx.db.upload_error("hello.txt").unwrap().as_deref(),
+        Some("integrity check failed")
+    );
+    fx.shutdown().await;
+}
+
+// (c) Retryable errors → exponential backoff (not a hot loop), then success
+// once the failures stop.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn retryable_upload_error_backs_off_then_succeeds() {
+    let fx = start_with_retry_base(Duration::from_millis(20)).await;
+    let failures: Vec<(i64, &str, bool)> = (0..3).map(|_| (1003, "rate limited", true)).collect();
+    fx.mock.inject_upload_failures("node-hello", &failures);
+
+    let t0 = Instant::now();
+    std::fs::write(fx.root.join("hello.txt"), b"v2").unwrap();
+    wait_for(|| fx.mock.file_content("node-hello").as_deref() == Some(b"v2")).await;
+    let elapsed = t0.elapsed();
+
+    // 3 failures → waits of 20+40+80 ms before the 4th (successful) attempt.
+    // A no-backoff requeue loop would finish all 4 in a few milliseconds.
+    assert_eq!(fx.mock.upload_attempts("hello.txt"), 4);
+    assert!(
+        elapsed >= Duration::from_millis(100),
+        "backoff not respected: 4 attempts in {elapsed:?}"
+    );
+    assert_eq!(fx.handle.status().await.unwrap().errored_nodes, 0);
     fx.shutdown().await;
 }
 

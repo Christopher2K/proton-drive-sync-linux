@@ -8,7 +8,7 @@
 //! clock is fixed, and transfers "complete" synchronously (response first,
 //! then the `transfer.done` notification, per the protocol's ordering).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
 use serde_json::{Value, json};
@@ -41,6 +41,9 @@ struct State {
     scope_id: String,
     /// Call log for assertions: ("trash", uids), ("upload", name), ...
     calls: Vec<(String, Vec<String>)>,
+    /// Scripted `transfer.error`s for revision uploads, per node uid; popped
+    /// one per `drive.upload` attempt (content is NOT applied on failure).
+    upload_failures: HashMap<String, VecDeque<(i64, String, bool)>>,
     /// Outbound notification queue (drained by the server task).
     outbox: mpsc::UnboundedSender<String>,
 }
@@ -211,6 +214,32 @@ impl MockHandle {
             .and_then(|n| n.content.as_ref().map(|c| (**c).clone()))
     }
 
+    /// Script failures for the next `n` revision-upload attempts of
+    /// `node_uid`: each entry is `(code, message, retryable)` as sent in the
+    /// `transfer.error` notification. The upload attempt IS logged (so
+    /// `upload_attempts` counts it) but content is not applied.
+    pub fn inject_upload_failures(&self, node_uid: &str, failures: &[(i64, &str, bool)]) {
+        let mut st = self.state.lock().unwrap();
+        st.upload_failures.insert(
+            node_uid.to_string(),
+            failures
+                .iter()
+                .map(|(c, m, r)| (*c, (*m).to_string(), *r))
+                .collect(),
+        );
+    }
+
+    /// How many `drive.upload` calls (any outcome) were made for `name`.
+    pub fn upload_attempts(&self, name: &str) -> usize {
+        self.state
+            .lock()
+            .unwrap()
+            .calls
+            .iter()
+            .filter(|(m, a)| m == "upload" && a.iter().any(|n| n == name))
+            .count()
+    }
+
     /// Emit a raw drive event (for custom scenarios).
     pub fn emit_event(&self, event: &DriveEvent) {
         let st = self.state.lock().unwrap();
@@ -309,6 +338,7 @@ impl MockSidecar {
                 next_event: 0,
                 scope_id,
                 calls: Vec::new(),
+                upload_failures: HashMap::new(),
                 outbox,
             })),
         }
@@ -503,6 +533,24 @@ impl MockSidecar {
                     .and_then(Value::as_str)
                     .map(str::to_string);
                 st.calls.push(("upload".into(), vec![name.clone()]));
+
+                // Scripted failure (e.g. the 409 stale-revision class):
+                // respond with the transfer id, then a transfer.error —
+                // content is NOT applied, like a server-side rejection.
+                if let Some(existing) = &node_uid
+                    && let Some((code, message, retryable)) = st
+                        .upload_failures
+                        .get_mut(existing)
+                        .and_then(VecDeque::pop_front)
+                {
+                    let err = json!({
+                        "jsonrpc": "2.0",
+                        "method": "transfer.error",
+                        "params": {"transferId": transfer_id, "code": code, "message": message, "retryable": retryable},
+                    })
+                    .to_string();
+                    return vec![ok(json!({"transferId": transfer_id})), err];
+                }
 
                 let content = std::fs::read(&path).unwrap_or_default();
                 let uid = if let Some(existing) = node_uid {

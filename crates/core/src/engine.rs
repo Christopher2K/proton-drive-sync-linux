@@ -13,7 +13,7 @@
 //!   starts only after the initial materialization completes);
 //! - conflicts are keep-both in both directions (F7).
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -35,6 +35,14 @@ use crate::guard::DeleteGuard;
 /// Name of the engine-private directory inside the sync root (DB, socket).
 pub const STATE_DIR: &str = ".pds";
 const META_INITIAL_SYNC_DONE: &str = "initial_sync_done";
+
+/// First backoff delay after a retryable upload failure (F2).
+pub const RETRY_BASE_DEFAULT: Duration = Duration::from_secs(1);
+/// Cap for the exponential upload backoff (F2).
+pub const RETRY_BACKOFF_MAX: Duration = Duration::from_secs(300);
+/// Consecutive retryable failures after which a node is marked errored and
+/// the engine moves on (no hot-looping).
+pub const MAX_UPLOAD_RETRIES: i64 = 10;
 
 /// Engine run-state (F4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -63,6 +71,9 @@ pub struct EngineStatus {
     pub synced_nodes: usize,
     pub dirty_nodes: usize,
     pub queued_tombstones: usize,
+    /// Nodes whose upload failed terminally (non-retryable, or retries
+    /// exhausted). Surfaced so the UI/CLI can show them (F2/F7).
+    pub errored_nodes: usize,
 }
 
 /// Control commands (CLI socket / UI).
@@ -104,11 +115,58 @@ pub struct EngineConfig {
     pub root: PathBuf,
     /// Path of the SQLite state DB (usually `<root>/.pds/state.db`).
     pub db_path: PathBuf,
+    /// Base of the exponential upload retry backoff (normally
+    /// `RETRY_BASE_DEFAULT`; tests shrink it).
+    pub retry_base: Duration,
 }
 
 /// Outcome of a finished transfer relevant to the caller.
 struct TransferOutcome {
     node_uid: Option<String>,
+}
+
+/// Failure of an awaited transfer. Distinguishes sidecar-reported content
+/// errors (which drive the retry / keep-both policy, F2/F7) from local
+/// teardown (shutdown, sidecar death), which is propagated.
+#[derive(Debug)]
+enum TransferFailure {
+    /// A `transfer.error` notification from the sidecar.
+    Remote {
+        code: i64,
+        message: String,
+        retryable: bool,
+    },
+    /// Local abort: shutdown mid-transfer or the sidecar stream died.
+    Aborted(anyhow::Error),
+}
+
+impl std::fmt::Display for TransferFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TransferFailure::Remote {
+                code,
+                message,
+                retryable,
+            } => write!(
+                f,
+                "transfer error {code}: {message} (retryable={retryable})"
+            ),
+            TransferFailure::Aborted(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl std::error::Error for TransferFailure {}
+
+/// True for the 409 "Current revision is no longer up to date" class: the
+/// revision's base is stale server-side. The sidecar maps `ApiError(409)` to
+/// code 1099 with the API message text (`service.ts` `toRpcError` /
+/// `transferFailed` forward no `data`), so we match on the message.
+fn is_revision_conflict(code: i64, message: &str) -> bool {
+    code == pds_sidecar_client::types::error_codes::CONFLICT
+        || message
+            .to_ascii_lowercase()
+            .contains("no longer up to date")
 }
 
 pub struct Engine<S: SidecarApi> {
@@ -129,6 +187,12 @@ pub struct Engine<S: SidecarApi> {
     /// re-trip it. In-memory only — reset on engine restart is acceptable
     /// because the tombstones themselves are durable.
     approved_tombstones: HashSet<String>,
+    /// Earliest time each path may be retried after a retryable upload
+    /// failure (F2 backoff). In-memory; the failure COUNT is durable in the
+    /// DB so restarts don't reset the give-up budget.
+    retry_at: HashMap<String, Instant>,
+    /// Base delay for the exponential backoff (`EngineConfig::retry_base`).
+    retry_base: Duration,
     /// In-flight transfer currently being awaited (for pause/resume).
     active_transfer: Option<String>,
     /// Set when Shutdown arrived mid-transfer; the main loop exits ASAP.
@@ -157,6 +221,8 @@ impl<S: SidecarApi + 'static> Engine<S> {
             guard: DeleteGuard::default(),
             buffered_events: VecDeque::new(),
             approved_tombstones: HashSet::new(),
+            retry_at: HashMap::new(),
+            retry_base: config.retry_base,
             scope_id: None,
             active_transfer: None,
             shutting_down: false,
@@ -235,6 +301,9 @@ impl<S: SidecarApi + 'static> Engine<S> {
             if self.state == EngineState::Running && self.pump_work().await? {
                 continue;
             }
+            // If dirty rows are only waiting out a retry backoff, wake up
+            // when the earliest one matures (F2 — no busy loop, no stall).
+            let wake = self.next_retry_wake();
             tokio::select! {
                 cmd = self.cmd_rx.recv() => {
                     match cmd {
@@ -253,6 +322,12 @@ impl<S: SidecarApi + 'static> Engine<S> {
                         self.handle_fs_batch(events).await?;
                     }
                 }
+                () = async move {
+                    match wake {
+                        Some(t) => tokio::time::sleep_until(t.into()).await,
+                        None => std::future::pending::<()>().await,
+                    }
+                } => {}
             }
         }
     }
@@ -420,6 +495,12 @@ impl<S: SidecarApi + 'static> Engine<S> {
         Ok(())
     }
 
+    /// Earliest backoff expiry among scheduled retries, if any. Stale
+    /// entries are harmless (the wake just finds nothing eligible).
+    fn next_retry_wake(&self) -> Option<Instant> {
+        self.retry_at.values().copied().min()
+    }
+
     /// Create/write-close on a file: hash, then upload (new node or new
     /// revision) or mark dirty while paused (F4 buffering).
     async fn upsert_local_file(&mut self, rel: &str) -> Result<()> {
@@ -436,18 +517,24 @@ impl<S: SidecarApi + 'static> Engine<S> {
             .map(|d| d.as_secs() as i64);
         let name = rel.rsplit('/').next().unwrap_or(rel).to_string();
 
-        let (parent_uid, node_uid, synced_sha1) = match self.db.node_by_path(rel)? {
+        let (parent_uid, node_uid, synced_sha1, fresh_content) = match self.db.node_by_path(rel)? {
             Some(row) => {
                 if row.sync_state == SyncState::Synced && row.sha1.as_deref() == Some(&sha1) {
                     return Ok(()); // content unchanged
                 }
+                // A fresh local edit resets failure bookkeeping (the user
+                // may have fixed the cause); re-hashes of an already-dirty
+                // row must NOT clear an errored/backing-off state.
+                let fresh =
+                    row.sync_state != SyncState::Dirty || row.sha1.as_deref() != Some(&sha1);
                 if row.node_uid.starts_with("pending:") {
-                    (row.parent_uid.clone(), None, row.synced_sha1.clone())
+                    (row.parent_uid.clone(), None, row.synced_sha1.clone(), fresh)
                 } else {
                     (
                         row.parent_uid.clone(),
                         Some(row.node_uid.clone()),
                         row.synced_sha1.clone(),
+                        fresh,
                     )
                 }
             }
@@ -470,7 +557,7 @@ impl<S: SidecarApi + 'static> Engine<S> {
                     std::fs::rename(&abs, to_abs(&self.root, &new_rel))?;
                     return Box::pin(self.upsert_local_file(&new_rel)).await;
                 }
-                (parent_uid, None, None)
+                (parent_uid, None, None, false)
             }
         };
 
@@ -489,6 +576,10 @@ impl<S: SidecarApi + 'static> Engine<S> {
             // the last-synced remote head intact for the F7 precondition.
             synced_sha1,
         })?;
+        if fresh_content {
+            self.db.clear_upload_failures(rel)?;
+            self.retry_at.remove(rel);
+        }
 
         if self.state != EngineState::Running {
             debug!(path = %rel, "paused: buffered dirty file");
@@ -503,6 +594,14 @@ impl<S: SidecarApi + 'static> Engine<S> {
             return Ok(());
         };
         if row.sync_state != SyncState::Dirty || !row.is_file() {
+            return Ok(());
+        }
+        // Terminally errored or waiting out a retry backoff: leave it alone
+        // (F2 retry policy — no hot loop).
+        if self.db.upload_error(rel)?.is_some() {
+            return Ok(());
+        }
+        if self.retry_at.get(rel).is_some_and(|t| *t > Instant::now()) {
             return Ok(());
         }
         let abs = to_abs(&self.root, rel);
@@ -652,50 +751,164 @@ impl<S: SidecarApi + 'static> Engine<S> {
     /// Perform the actual upload transfer for a dirty row.
     async fn upload_row(&mut self, rel: &str, row: &NodeRow) -> Result<()> {
         let abs = to_abs(&self.root, rel);
-        let params = UploadParams {
-            parent_uid: if row.node_uid.starts_with("pending:") {
-                row.parent_uid.clone()
-            } else {
-                None
-            },
-            node_uid: if row.node_uid.starts_with("pending:") {
-                None
-            } else {
-                Some(row.node_uid.clone())
-            },
-            name: row.name.clone(),
-            path: abs.to_string_lossy().to_string(),
-            size: row.size.unwrap_or(0),
-            sha1: row.sha1.clone().unwrap_or_default(),
-            mtime: row.mtime.unwrap_or(0),
-        };
+        let params = upload_params(row, &abs);
         self.db.set_sync_state(rel, SyncState::Uploading)?;
         let sidecar = Arc::clone(&self.sidecar);
         let outcome = self
             .run_transfer("upload", Some(rel), sidecar.upload(&params))
             .await;
         match outcome {
-            Ok(done) => {
-                let mut row = self.db.node_by_path(rel)?.unwrap_or_else(|| row.clone());
-                if let Some(uid) = done.node_uid {
-                    row.node_uid = uid;
-                }
-                row.sync_state = SyncState::Synced;
-                // The uploaded content IS the remote head now.
-                row.synced_sha1 = row.sha1.clone();
-                self.db.upsert_node(&row)?;
-                info!(path = %rel, "uploaded");
-            }
-            Err(e) => {
-                // Retryable or not, M1 requeues as dirty (SPEC F2 backoff is
-                // the queue's; a fresh watcher event or resume re-drives it).
-                warn!(path = %rel, error = %e, "upload failed; requeued as dirty");
+            Ok(done) => self.finish_upload_success(rel, row, done),
+            Err(failure) => self.handle_upload_failure(rel, row, failure).await,
+        }
+    }
+
+    /// Success bookkeeping shared by `upload_row` and the single keep-both
+    /// retry: the uploaded content IS the remote head now.
+    fn finish_upload_success(
+        &mut self,
+        rel: &str,
+        row: &NodeRow,
+        done: TransferOutcome,
+    ) -> Result<()> {
+        let mut row = self.db.node_by_path(rel)?.unwrap_or_else(|| row.clone());
+        if let Some(uid) = done.node_uid {
+            row.node_uid = uid;
+        }
+        row.sync_state = SyncState::Synced;
+        row.synced_sha1 = row.sha1.clone();
+        self.db.upsert_node(&row)?;
+        self.db.clear_upload_failures(rel)?;
+        self.retry_at.remove(rel);
+        info!(path = %rel, "uploaded");
+        Ok(())
+    }
+
+    /// F2/F7 upload failure policy (e2e-m1 bug #1 follow-up):
+    /// - 409 "revision no longer up to date" class → keep-both (download the
+    ///   fresh remote head as a conflict copy) and retry ONCE atop it; a
+    ///   second failure marks the node errored instead of looping;
+    /// - other non-retryable errors → mark errored immediately (never
+    ///   blind-requeued);
+    /// - retryable errors → exponential backoff (base·2ⁿ, capped), and after
+    ///   MAX_UPLOAD_RETRIES consecutive failures → errored.
+    async fn handle_upload_failure(
+        &mut self,
+        rel: &str,
+        row: &NodeRow,
+        failure: TransferFailure,
+    ) -> Result<()> {
+        let (code, message, retryable) = match failure {
+            TransferFailure::Aborted(e) => {
+                // Shutdown/transport teardown — leave dirty for next run.
                 if self.db.node_by_path(rel)?.is_some() {
                     self.db.set_sync_state(rel, SyncState::Dirty)?;
                 }
+                return Err(e);
             }
+            TransferFailure::Remote {
+                code,
+                message,
+                retryable,
+            } => (code, message, retryable),
+        };
+        if self.db.node_by_path(rel)?.is_none() {
+            return Ok(()); // vanished mid-transfer; delete path owns it
+        }
+        self.db.set_sync_state(rel, SyncState::Dirty)?;
+
+        // The 409 class: the remote head moved under us (e.g. its event was
+        // applied first and updated our synced head, so the getNode
+        // precondition saw a false "match" — the precondition covers only
+        // the no-event-received window; THIS is the safety net).
+        if is_revision_conflict(code, &message) && !row.node_uid.starts_with("pending:") {
+            warn!(path = %rel, error = %message, "revision upload rejected (stale base); keeping both");
+            match self.sidecar.get_node(&row.node_uid).await {
+                Ok(node) => {
+                    let conflict_rel = self
+                        .download_remote_head_as_conflict(rel, row, &node)
+                        .await?;
+                    if let Some(mut r) = self.db.node_by_path(rel)? {
+                        // Record the fresh head so later preconditions see it.
+                        r.synced_sha1 = node.sha1.clone();
+                        self.db.upsert_node(&r)?;
+                    }
+                    info!(path = %rel, conflict = %conflict_rel, "retrying upload atop fresh remote head");
+                }
+                Err(e) => {
+                    // Node gone remotely: re-upload as a NEW file rather than
+                    // reviving a trashed node — local content survives.
+                    warn!(path = %rel, error = %e, "remote node vanished; re-uploading as new file");
+                    if let Some(mut r) = self.db.node_by_path(rel)? {
+                        r.node_uid = format!("pending:{rel}");
+                        r.sync_state = SyncState::Dirty;
+                        self.db.upsert_node(&r)?;
+                    }
+                }
+            }
+            return self.retry_upload_once(rel).await;
+        }
+
+        if !retryable {
+            self.db.mark_upload_errored(rel, &message)?;
+            self.retry_at.remove(rel);
+            warn!(path = %rel, code, error = %message, "non-retryable upload error; node marked errored");
+            return Ok(());
+        }
+        let count = self.db.record_retryable_failure(rel)?;
+        if count >= MAX_UPLOAD_RETRIES {
+            self.db.mark_upload_errored(rel, &message)?;
+            self.retry_at.remove(rel);
+            warn!(path = %rel, count, error = %message, "upload failed too many times; node marked errored");
+        } else {
+            let backoff = retry_backoff(self.retry_base, count);
+            self.retry_at
+                .insert(rel.to_string(), Instant::now() + backoff);
+            info!(path = %rel, count, backoff = ?backoff, "retryable upload error; backing off");
         }
         Ok(())
+    }
+
+    /// The single retry granted after a keep-both conflict resolution. Any
+    /// second failure marks the node errored — never loops.
+    async fn retry_upload_once(&mut self, rel: &str) -> Result<()> {
+        let Some(row) = self.db.node_by_path(rel)? else {
+            return Ok(());
+        };
+        if row.sync_state != SyncState::Dirty {
+            return Ok(());
+        }
+        let abs = to_abs(&self.root, rel);
+        if !abs.is_file() {
+            return Ok(());
+        }
+        let params = upload_params(&row, &abs);
+        self.db.set_sync_state(rel, SyncState::Uploading)?;
+        let sidecar = Arc::clone(&self.sidecar);
+        let outcome = self
+            .run_transfer("upload", Some(rel), sidecar.upload(&params))
+            .await;
+        match outcome {
+            Ok(done) => self.finish_upload_success(rel, &row, done),
+            Err(TransferFailure::Aborted(e)) => {
+                if self.db.node_by_path(rel)?.is_some() {
+                    self.db.set_sync_state(rel, SyncState::Dirty)?;
+                }
+                Err(e)
+            }
+            Err(TransferFailure::Remote {
+                code,
+                message,
+                retryable,
+            }) => {
+                warn!(path = %rel, code, retryable, error = %message, "second upload attempt failed; node marked errored");
+                if self.db.node_by_path(rel)?.is_some() {
+                    self.db.set_sync_state(rel, SyncState::Dirty)?;
+                    self.db.mark_upload_errored(rel, &message)?;
+                }
+                Ok(())
+            }
+        }
     }
 
     /// Ensure every component of `rel` (a folder path) exists remotely;
@@ -1010,20 +1223,24 @@ impl<S: SidecarApi + 'static> Engine<S> {
         kind: &str,
         local_path: Option<&str>,
         start: impl std::future::Future<Output = Result<String, pds_sidecar_client::Error>>,
-    ) -> Result<TransferOutcome> {
-        let transfer_id = start.await?;
+    ) -> Result<TransferOutcome, TransferFailure> {
+        let transfer_id = start
+            .await
+            .map_err(|e| TransferFailure::Aborted(e.into()))?;
         self.active_transfer = Some(transfer_id.clone());
-        self.db.upsert_transfer(
-            &transfer_id,
-            kind,
-            local_path,
-            None,
-            0,
-            None,
-            "running",
-            None,
-            now_unix(),
-        )?;
+        self.db
+            .upsert_transfer(
+                &transfer_id,
+                kind,
+                local_path,
+                None,
+                0,
+                None,
+                "running",
+                None,
+                now_unix(),
+            )
+            .map_err(|e| TransferFailure::Aborted(e.into()))?;
         let kind = kind.to_string();
         let local_path = local_path.map(str::to_string);
         let result = loop {
@@ -1033,9 +1250,13 @@ impl<S: SidecarApi + 'static> Engine<S> {
                         Some(Command::Shutdown) | None => {
                             let _ = self.sidecar.transfer_cancel(&transfer_id).await;
                             self.shutting_down = true;
-                            break Err(anyhow!("shutdown during transfer"));
+                            break Err(TransferFailure::Aborted(anyhow!("shutdown during transfer")));
                         }
-                        Some(c) => self.handle_command(c)?,
+                        Some(c) => {
+                            if let Err(e) = self.handle_command(c) {
+                                break Err(TransferFailure::Aborted(e));
+                            }
+                        }
                     }
                 }
                 n = self.notifications.recv() => {
@@ -1045,29 +1266,31 @@ impl<S: SidecarApi + 'static> Engine<S> {
                         {
                             break Ok(TransferOutcome { node_uid });
                         }
-                        Some(Notification::TransferError { transfer_id: tid, message, retryable, .. })
+                        Some(Notification::TransferError { transfer_id: tid, code, message, retryable })
                             if tid == transfer_id =>
                         {
-                            break Err(anyhow!("transfer {message} (retryable={retryable})"));
+                            break Err(TransferFailure::Remote { code, message, retryable });
                         }
                         Some(other) => self.backlog.push_back(other),
-                        None => break Err(anyhow!("sidecar closed during transfer")),
+                        None => break Err(TransferFailure::Aborted(anyhow!("sidecar closed during transfer"))),
                     }
                 }
             }
         };
         self.active_transfer = None;
-        self.db.upsert_transfer(
-            &transfer_id,
-            &kind,
-            local_path.as_deref(),
-            None,
-            0,
-            None,
-            if result.is_ok() { "done" } else { "error" },
-            result.as_ref().err().map(|e| e.to_string()).as_deref(),
-            now_unix(),
-        )?;
+        self.db
+            .upsert_transfer(
+                &transfer_id,
+                &kind,
+                local_path.as_deref(),
+                None,
+                0,
+                None,
+                if result.is_ok() { "done" } else { "error" },
+                result.as_ref().err().map(|e| e.to_string()).as_deref(),
+                now_unix(),
+            )
+            .map_err(|e| TransferFailure::Aborted(e.into()))?;
         result
     }
 
@@ -1113,6 +1336,8 @@ impl<S: SidecarApi + 'static> Engine<S> {
                     }
                     EngineState::Running => {}
                 }
+                // Explicit resume = "try now": drop pending retry backoffs.
+                self.retry_at.clear();
                 if let Some(tid) = self.active_transfer.clone() {
                     let sidecar = Arc::clone(&self.sidecar);
                     tokio::spawn(async move {
@@ -1130,6 +1355,7 @@ impl<S: SidecarApi + 'static> Engine<S> {
                         .map(|v| v.len())
                         .unwrap_or(0),
                     queued_tombstones: self.db.tombstones().map(|v| v.len()).unwrap_or(0),
+                    errored_nodes: self.db.count_errored().unwrap_or(0),
                 });
             }
             Command::Shutdown => {}
@@ -1153,11 +1379,18 @@ impl<S: SidecarApi + 'static> Engine<S> {
             self.apply_event(ev).await?;
             return Ok(true);
         }
+        // Uploads: skip terminally errored nodes and rows waiting out a
+        // retry backoff (F2 — no hot loop).
+        let errored: HashSet<String> = self.db.errored_paths()?.into_iter().collect();
+        let now = Instant::now();
         if let Some(row) = self
             .db
             .nodes_with_state(SyncState::Dirty)?
             .into_iter()
-            .next()
+            .find(|r| {
+                !errored.contains(&r.local_path)
+                    && self.retry_at.get(&r.local_path).is_none_or(|t| *t <= now)
+            })
         {
             self.upload_one(&row.local_path).await?;
             return Ok(true);
@@ -1175,6 +1408,35 @@ fn now_unix() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
+}
+
+/// Upload params for a dirty row: `pending:` uids upload as a NEW file under
+/// the parent; real uids upload as a new revision of the existing node.
+fn upload_params(row: &NodeRow, abs: &Path) -> UploadParams {
+    UploadParams {
+        parent_uid: if row.node_uid.starts_with("pending:") {
+            row.parent_uid.clone()
+        } else {
+            None
+        },
+        node_uid: if row.node_uid.starts_with("pending:") {
+            None
+        } else {
+            Some(row.node_uid.clone())
+        },
+        name: row.name.clone(),
+        path: abs.to_string_lossy().to_string(),
+        size: row.size.unwrap_or(0),
+        sha1: row.sha1.clone().unwrap_or_default(),
+        mtime: row.mtime.unwrap_or(0),
+    }
+}
+
+/// Exponential backoff after the `count`-th consecutive failure (1-based):
+/// base, 2·base, 4·base, … capped at RETRY_BACKOFF_MAX (F2).
+fn retry_backoff(base: Duration, count: i64) -> Duration {
+    let shift = (count - 1).clamp(0, 10) as u32; // 2^10·base already ≫ the cap
+    (base * 2u32.pow(shift)).min(RETRY_BACKOFF_MAX)
 }
 
 /// Absolute path from a root-relative '/'-separated path.
