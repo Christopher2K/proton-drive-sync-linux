@@ -39,6 +39,22 @@ interface ProtoNode {
   treeEventScopeId: string;
 }
 
+/**
+ * SDK telemetry MUST NOT use the default console logger: stdout is the
+ * JSON-RPC channel (a stray non-JSON line corrupts the protocol — found in
+ * the M1 live E2E as "skipping malformed line" warnings). Route everything
+ * to stderr; metrics are dropped for now.
+ */
+const telemetry = {
+  getLogger: (name: string) => ({
+    debug: (msg: string) => console.error(`[sdk:debug:${name}] ${msg}`),
+    info: (msg: string) => console.error(`[sdk:info:${name}] ${msg}`),
+    warn: (msg: string) => console.error(`[sdk:warn:${name}] ${msg}`),
+    error: (msg: string, error?: unknown) => console.error(`[sdk:error:${name}] ${msg}`, error ?? ""),
+  }),
+  recordMetric: () => {},
+};
+
 interface Transfer {
   id: string;
   kind: "upload" | "download";
@@ -156,6 +172,7 @@ export class SidecarService {
           generateKeySalt,
         } as any,
         config: { baseUrl: "drive-api.proton.me", clientUid: this.clientUid },
+        telemetry,
       } as any);
     }
     return this.client;
