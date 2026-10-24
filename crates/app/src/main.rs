@@ -84,10 +84,7 @@ fn tray_icon() -> gpui_tray::Result<Icon> {
 }
 
 fn on_open_status(_: &OpenStatus, cx: &mut App) {
-    if let Some(holder) = cx.try_global::<ModelHolder>() {
-        let model = holder.0.clone();
-        model.update(cx, |m, cx| m.open_front_window(cx));
-    }
+    app_model::open_front_window(cx);
 }
 
 fn on_toggle_pause(_: &TogglePause, cx: &mut App) {
@@ -112,11 +109,8 @@ fn on_quit(_: &QuitApp, cx: &mut App) {
 /// Dock-click reopen (only reachable unbundled; the bundle sets
 /// LSUIElement). Reopens the window matching the current phase.
 fn on_reopen(cx: &mut App) {
-    if cx.windows().is_empty()
-        && let Some(holder) = cx.try_global::<ModelHolder>()
-    {
-        let model = holder.0.clone();
-        model.update(cx, |m, cx| m.open_front_window(cx));
+    if cx.windows().is_empty() {
+        app_model::open_front_window(cx);
     }
 }
 

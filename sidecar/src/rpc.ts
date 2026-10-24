@@ -52,7 +52,12 @@ export class RpcServer {
   constructor(
     private readonly input: NodeJS.ReadableStream = process.stdin,
     private readonly output: NodeJS.WritableStream = process.stdout,
-  ) {}
+  ) {
+    // A write to a closed stdout (host died) surfaces as an 'error' event
+    // on the stream (EPIPE); without a listener Node escalates it to an
+    // uncaught exception. Host gone = nothing left to serve: exit quietly.
+    this.output.on("error", (err) => this.onOutputError(err));
+  }
 
   method(name: string, handler: Handler): void {
     this.handlers.set(name, handler);
@@ -76,7 +81,13 @@ export class RpcServer {
         if (line.trim().length > 0) void this.handleLine(line);
       }
     });
-    this.input.on("end", () => log("stdin closed — shutting down"));
+    this.input.on("end", () => {
+      // stdin closed = host gone. Exit explicitly: SDK HTTP agents and
+      // event-poll timers would otherwise keep the event loop (and this
+      // orphaned process) alive.
+      log("stdin closed — shutting down");
+      process.exit(0);
+    });
   }
 
   private async handleLine(line: string): Promise<void> {
@@ -111,7 +122,17 @@ export class RpcServer {
   }
 
   private write(msg: unknown): void {
-    this.output.write(JSON.stringify(msg) + "\n");
+    try {
+      this.output.write(JSON.stringify(msg) + "\n");
+    } catch (e) {
+      this.onOutputError(e);
+    }
+  }
+
+  /** stdout failed (EPIPE = host gone): stop quietly, no stack trace. */
+  private onOutputError(err: unknown): void {
+    log(`stdout write failed (${msg(err)}) — host gone, exiting`);
+    process.exit(0);
   }
 
   private writeError(id: number | string | null, code: number, message: string, data?: unknown) {

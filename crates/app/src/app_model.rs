@@ -91,67 +91,22 @@ impl AppModel {
 
         let after = self.state.phase;
         if after != before {
-            match after {
-                Phase::NeedsLogin => self.open_login_window(cx),
+            // Window management READS AppModel (opening a window renders the
+            // new view immediately, and both views do `model.read(cx)` in
+            // render) — doing it here, inside `update`, is a re-entrant
+            // entity access and panics (entity_map.rs: "already being
+            // updated"). Defer it past the end of this update.
+            cx.defer(move |cx| match after {
+                Phase::NeedsLogin => open_login_window(cx),
                 Phase::Running => {
-                    self.close_login_window(cx);
-                    self.open_status_window(cx);
+                    close_login_window(cx);
+                    open_status_window(cx);
                 }
-                Phase::Failed => self.open_status_window(cx), // shows the error
+                Phase::Failed => open_status_window(cx), // shows the error
                 Phase::Starting => {}
-            }
+            });
         }
         cx.notify();
-    }
-
-    /// Tray "Open Status" / dock reopen: surface the window matching the
-    /// current phase, activating an existing one if possible.
-    pub fn open_front_window(&mut self, cx: &mut App) {
-        cx.activate(true);
-        match self.state.phase {
-            Phase::NeedsLogin => self.open_login_window(cx),
-            _ => self.open_status_window(cx),
-        }
-    }
-
-    fn open_login_window(&mut self, cx: &mut App) {
-        if let Some(w) = &self.login_window
-            && w.update(cx, |_, window, _| window.activate_window())
-                .is_ok()
-        {
-            return;
-        }
-        let model = Self::this(cx);
-        let options = window_options(px(480.0), px(420.0), cx);
-        match cx.open_window(options, |_, cx| {
-            cx.new(|cx| LoginView::new(model.clone(), cx))
-        }) {
-            Ok(handle) => self.login_window = Some(handle),
-            Err(e) => error!("open login window: {e:#}"),
-        }
-    }
-
-    pub fn open_status_window(&mut self, cx: &mut App) {
-        if let Some(w) = &self.status_window
-            && w.update(cx, |_, window, _| window.activate_window())
-                .is_ok()
-        {
-            return;
-        }
-        let model = Self::this(cx);
-        let options = window_options(px(780.0), px(560.0), cx);
-        match cx.open_window(options, |_, cx| {
-            cx.new(|cx| StatusView::new(model.clone(), cx))
-        }) {
-            Ok(handle) => self.status_window = Some(handle),
-            Err(e) => error!("open status window: {e:#}"),
-        }
-    }
-
-    fn close_login_window(&mut self, cx: &mut App) {
-        if let Some(w) = self.login_window.take() {
-            let _ = w.update(cx, |_, window, _| window.remove_window());
-        }
     }
 
     /// Quit menu item / tray Quit: ask the engine to shut down; the pump
@@ -169,6 +124,70 @@ impl AppModel {
             let _ = cx.update(|cx| cx.quit());
         })
         .detach();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Window management — free functions taking `&mut App`, NEVER called from
+// inside `Entity<AppModel>::update`: `cx.open_window` renders the new view
+// immediately, and both views read AppModel in `render`, so an open nested
+// in a model update panics with re-entrant entity access. Pattern: read /
+// clone what's needed first, open the window, then store the handle with a
+// tiny update that performs no window work.
+// ---------------------------------------------------------------------------
+
+/// Tray "Open Status" / dock reopen: surface the window matching the
+/// current phase, activating an existing one if possible.
+pub fn open_front_window(cx: &mut App) {
+    let model = AppModel::this(cx);
+    cx.activate(true);
+    match model.read(cx).state.phase {
+        Phase::NeedsLogin => open_login_window(cx),
+        _ => open_status_window(cx),
+    }
+}
+
+fn open_login_window(cx: &mut App) {
+    let model = AppModel::this(cx);
+    let existing = model.read(cx).login_window;
+    if let Some(w) = existing
+        && w.update(cx, |_, window, _| window.activate_window())
+            .is_ok()
+    {
+        return;
+    }
+    let options = window_options(px(480.0), px(420.0), cx);
+    match cx.open_window(options, |_, cx| {
+        cx.new(|cx| LoginView::new(model.clone(), cx))
+    }) {
+        Ok(handle) => model.update(cx, |m, _| m.login_window = Some(handle)),
+        Err(e) => error!("open login window: {e:#}"),
+    }
+}
+
+fn open_status_window(cx: &mut App) {
+    let model = AppModel::this(cx);
+    let existing = model.read(cx).status_window;
+    if let Some(w) = existing
+        && w.update(cx, |_, window, _| window.activate_window())
+            .is_ok()
+    {
+        return;
+    }
+    let options = window_options(px(780.0), px(560.0), cx);
+    match cx.open_window(options, |_, cx| {
+        cx.new(|cx| StatusView::new(model.clone(), cx))
+    }) {
+        Ok(handle) => model.update(cx, |m, _| m.status_window = Some(handle)),
+        Err(e) => error!("open status window: {e:#}"),
+    }
+}
+
+fn close_login_window(cx: &mut App) {
+    let model = AppModel::this(cx);
+    let w = model.update(cx, |m, _| m.login_window.take());
+    if let Some(w) = w {
+        let _ = w.update(cx, |_, window, _| window.remove_window());
     }
 }
 

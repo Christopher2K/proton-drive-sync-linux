@@ -19,6 +19,14 @@ import { log, RpcServer } from "./rpc";
 import { SidecarService } from "./service";
 import { SessionStore } from "./sessionStore";
 
+// Last-resort: a bug that escapes per-request handling must not take the
+// process down with a bare stack trace — log it, then exit (stdout errors
+// from a dead host are handled in RpcServer and never reach this).
+process.on("uncaughtException", (e) => {
+  log("uncaught exception:", e);
+  process.exit(1);
+});
+
 const APP_VERSION_CONST = APP_VERSION;
 
 export function appVersion(): string {
