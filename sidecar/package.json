@@ -12,6 +12,7 @@
     "spike": "tsx src/spike.ts",
     "start": "tsx src/index.ts",
     "smoke": "tsx src/smoke.ts",
+    "test": "tsx src/eventLoop.test.ts",
     "typecheck": "tsc --noEmit",
     "postinstall": "patch-package"
   },

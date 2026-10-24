@@ -22,6 +22,7 @@ import {
 import { MemoryCache } from "@protontech/drive-sdk/dist/cache";
 import { DriveAccount } from "./account";
 import { logout as apiLogout, type Session } from "./auth";
+import { runEventLoop } from "./eventLoop";
 import { forkLogin } from "./fork";
 import { DriveHttpClient } from "./httpClient";
 import { isRetryable, log, RPC, RpcError, toRpcError, type RpcServer } from "./rpc";
@@ -453,21 +454,19 @@ export class SidecarService {
     this.eventScopes.get(scopeId)?.abort();
     const ac = new AbortController();
     this.eventScopes.set(scopeId, ac);
-    void (async () => {
-      try {
-        for await (const event of client.iterateEvents(scopeId, lastEventId, ac.signal)) {
-          this.forwardEvent(scopeId, event);
-        }
-      } catch (e) {
-        if (!ac.signal.aborted) {
-          // Protocol has no event-stream error notification; log for the
-          // operator. The host notices via missing events and may re-start.
-          log(`event stream for scope ${scopeId} failed:`, e);
-        }
-      } finally {
-        if (this.eventScopes.get(scopeId) === ac) this.eventScopes.delete(scopeId);
-      }
-    })();
+    // iterateEvents is pull-based and RETURNS after draining the currently
+    // available events (sdk-client.md §4.5) — a single call drops the scope
+    // and no live remote event ever arrives. runEventLoop re-invokes it on
+    // the EventScheduler cadence with the latest eventId as cursor.
+    void runEventLoop({
+      iterate: (cursor, signal) => client.iterateEvents(scopeId, cursor, signal),
+      forward: (event) => this.forwardEvent(scopeId, event),
+      signal: ac.signal,
+      initialCursor: lastEventId,
+      onError: (e) => log(`event stream for scope ${scopeId} failed (backing off, scope stays alive):`, e),
+    }).finally(() => {
+      if (this.eventScopes.get(scopeId) === ac) this.eventScopes.delete(scopeId);
+    });
     return {};
   }
 

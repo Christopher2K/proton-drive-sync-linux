@@ -94,6 +94,20 @@ async function main(): Promise<void> {
   const pause = await request(6, "transfer.pause", { transferId: "no-such-transfer" });
   check("transfer.pause (unknown id) → error -32602", pause.error?.code === -32602, pause);
 
+  // 8. drive.events.start twice on the same scope without auth → 1001 both
+  //    times (idempotent; no scope state leaks between the calls).
+  const evStart1 = await request(7, "drive.events.start", { scopeId: "smoke-scope" });
+  const evStart2 = await request(8, "drive.events.start", { scopeId: "smoke-scope" });
+  check(
+    "drive.events.start twice (no auth) → error 1001 both",
+    evStart1.error?.code === 1001 && evStart2.error?.code === 1001,
+    [evStart1, evStart2],
+  );
+
+  // 9. drive.events.stop on an unknown scope is an idempotent no-op → {}
+  const evStop = await request(9, "drive.events.stop", { scopeId: "smoke-scope" });
+  check("drive.events.stop (unknown scope) → {}", evStop.result !== undefined && !evStop.error, evStop);
+
   child.kill();
   if (failures > 0) {
     console.error(`\n${failures} check(s) FAILED`);
