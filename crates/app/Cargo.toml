@@ -1,0 +1,21 @@
+[package]
+name = "pds-app"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Menu-bar desktop shell for proton-drive-sync (unofficial)"
+
+[[bin]]
+name = "proton-drive-sync"
+path = "src/main.rs"
+
+[dependencies]
+gpui = { version = "0.2", features = ["runtime_shaders"] }
+gpui-tray = "0.3"
+pds-core.workspace = true
+pds-sidecar-client.workspace = true
+tokio.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+chrono.workspace = true

@@ -525,3 +525,18 @@ tracing = "0.1"
 # [profile.dev.package.gpui]
 # opt-level = 2
 ```
+
+## Errata (found during M2 implementation, verified against gpui 0.2.2 / gpui-tray 0.3.0)
+
+1. §3.2's `let Ok(()) = cx.update(|cx| this.update(...))` doesn't compile as written —
+   `AsyncApp::update` nests the `Result`; the `cx.spawn` closure params need explicit
+   types (`WeakEntity<Self>`, `&mut AsyncApp`) and an `AsyncApp::clone()` into the
+   'static future.
+2. §5: `cx.on_reopen(...)` lives on `Application` (register before `.run()`), not in
+   the run closure.
+3. gpui-tray's git example uses `QuitMode::Explicit`/`platform::application()` — not in
+   crates.io gpui 0.2.2. Unneeded: macOS gpui has no quit-on-last-window-close.
+4. Not in the doc: without full Xcode, gpui's build script fails (`xcrun metal`
+   missing) — fix: `gpui = { features = ["runtime_shaders"] }`.
+5. `Icon::system_symbol` + scale_factor/template setters are macOS-only — cross-platform
+   icon code needs cfg guards.

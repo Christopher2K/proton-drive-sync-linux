@@ -25,7 +25,7 @@ use notify_debouncer_mini::{DebouncedEvent, Debouncer, new_debouncer};
 use pds_sidecar_client::{
     DriveEvent, EventKind, Node, NodeKind, Notification, SidecarApi, UploadParams,
 };
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{broadcast, mpsc, oneshot};
 use tracing::{debug, info, warn};
 
 use crate::conflict::conflict_name;
@@ -87,10 +87,43 @@ pub enum Command {
     Status(oneshot::Sender<EngineStatus>),
 }
 
+/// What kind of user-visible thing happened (activity feed, SPEC.md §6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActivityKind {
+    /// Local file uploaded (new node or new revision).
+    Uploaded,
+    /// Remote file materialized locally.
+    Downloaded,
+    /// Synced node trashed remotely after a local delete (F3).
+    Trashed,
+    /// Keep-both conflict: local copy renamed aside (F7), or a revision
+    /// upload parked as remote-conflicted awaiting reconciliation.
+    Conflict,
+    /// Mass-delete guard tripped; engine auto-paused (F3.3).
+    GuardPaused,
+    /// Upload failed terminally (non-retryable, or retries exhausted).
+    UploadErrored,
+}
+
+/// A user-facing activity entry emitted by the engine. Broadcast to
+/// subscribers (the M2 desktop shell); the CLI ignores it. Not persisted —
+/// a window opened later sees only new entries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActivityItem {
+    /// Unix seconds.
+    pub at_unix: i64,
+    pub kind: ActivityKind,
+    /// Root-relative path the entry concerns.
+    pub path: String,
+    /// Extra context (error message, conflict copy name, …).
+    pub detail: Option<String>,
+}
+
 /// Handle to a running engine.
 #[derive(Clone)]
 pub struct EngineHandle {
     tx: mpsc::Sender<Command>,
+    activity_tx: broadcast::Sender<ActivityItem>,
 }
 
 impl EngineHandle {
@@ -110,6 +143,14 @@ impl EngineHandle {
             .await
             .context("engine gone")?;
         rx.await.context("engine gone")
+    }
+
+    /// Subscribe to the engine's activity feed (uploaded / downloaded /
+    /// trashed / conflict / guard / error entries). Lagging receivers skip
+    /// ahead (`broadcast::error::RecvError::Lagged`) — the feed is
+    /// informational only.
+    pub fn subscribe_activity(&self) -> broadcast::Receiver<ActivityItem> {
+        self.activity_tx.subscribe()
     }
 }
 
@@ -202,6 +243,8 @@ pub struct Engine<S: SidecarApi> {
     shutting_down: bool,
     /// Set once `run()` has been entered.
     started: AtomicBool,
+    /// Activity feed broadcast (UI); sends are no-ops without receivers.
+    activity_tx: broadcast::Sender<ActivityItem>,
 }
 
 impl<S: SidecarApi + 'static> Engine<S> {
@@ -213,6 +256,7 @@ impl<S: SidecarApi + 'static> Engine<S> {
         std::fs::create_dir_all(&config.root)?;
         let db = Db::open(&config.db_path)?;
         let (tx, cmd_rx) = mpsc::channel(64);
+        let (activity_tx, _) = broadcast::channel(256);
         let engine = Self {
             sidecar,
             db,
@@ -230,8 +274,9 @@ impl<S: SidecarApi + 'static> Engine<S> {
             active_transfer: None,
             shutting_down: false,
             started: AtomicBool::new(false),
+            activity_tx: activity_tx.clone(),
         };
-        Ok((engine, EngineHandle { tx }))
+        Ok((engine, EngineHandle { tx, activity_tx }))
     }
 
     /// Run until shutdown. Consumes the engine.
@@ -288,6 +333,16 @@ impl<S: SidecarApi + 'static> Engine<S> {
             .watch(&self.root, RecursiveMode::Recursive)
             .context("watch sync root")?;
         Ok(debouncer)
+    }
+
+    /// Push an entry onto the activity feed; no-op when nobody listens.
+    fn emit_activity(&self, kind: ActivityKind, path: &str, detail: Option<String>) {
+        let _ = self.activity_tx.send(ActivityItem {
+            at_unix: now_unix(),
+            kind,
+            path: path.to_string(),
+            detail,
+        });
     }
 
     async fn main_loop(&mut self, fs_rx: &mut mpsc::Receiver<Vec<DebouncedEvent>>) -> Result<()> {
@@ -431,6 +486,11 @@ impl<S: SidecarApi + 'static> Engine<S> {
                     path = %row.local_path,
                     conflict = %conflicted,
                     "initial sync: local/remote content differ, keeping both"
+                );
+                self.emit_activity(
+                    ActivityKind::Conflict,
+                    &row.local_path,
+                    Some(format!("kept both; local copy renamed to {conflicted}")),
                 );
             }
             out.push((row.local_path.clone(), row.node_uid.clone()));
@@ -781,6 +841,7 @@ impl<S: SidecarApi + 'static> Engine<S> {
         self.clear_upload_blocks(rel)?;
         self.retry_at.remove(rel);
         info!(path = %rel, "uploaded");
+        self.emit_activity(ActivityKind::Uploaded, rel, None);
         Ok(())
     }
 
@@ -830,6 +891,11 @@ impl<S: SidecarApi + 'static> Engine<S> {
                 path = %rel, error = %message,
                 "revision upload rejected (stale base); parked as remote-conflicted, awaiting remote event"
             );
+            self.emit_activity(
+                ActivityKind::Conflict,
+                rel,
+                Some("remote changed during upload; awaiting reconciliation".into()),
+            );
             return Ok(());
         }
 
@@ -837,6 +903,7 @@ impl<S: SidecarApi + 'static> Engine<S> {
             self.db.mark_upload_errored(rel, &message)?;
             self.retry_at.remove(rel);
             warn!(path = %rel, code, error = %message, "non-retryable upload error; node marked errored");
+            self.emit_activity(ActivityKind::UploadErrored, rel, Some(message));
             return Ok(());
         }
         let count = self.db.record_retryable_failure(rel)?;
@@ -844,6 +911,7 @@ impl<S: SidecarApi + 'static> Engine<S> {
             self.db.mark_upload_errored(rel, &message)?;
             self.retry_at.remove(rel);
             warn!(path = %rel, count, error = %message, "upload failed too many times; node marked errored");
+            self.emit_activity(ActivityKind::UploadErrored, rel, Some(message));
         } else {
             let backoff = retry_backoff(self.retry_base, count);
             self.retry_at
@@ -948,6 +1016,7 @@ impl<S: SidecarApi + 'static> Engine<S> {
                     synced_total,
                     "mass-deletion guard tripped: auto-paused, explicit resume required"
                 );
+                self.emit_activity(ActivityKind::GuardPaused, &t.local_path, None);
                 return Ok(false);
             }
         }
@@ -960,6 +1029,7 @@ impl<S: SidecarApi + 'static> Engine<S> {
             self.remove_node_recursive(&t.local_path)?;
             self.db.remove_tombstone(&t.local_path)?;
             self.approved_tombstones.remove(&t.local_path);
+            self.emit_activity(ActivityKind::Trashed, &t.local_path, None);
         } else {
             warn!(path = %t.local_path, "trash failed remotely; keeping tombstone");
             return Ok(false);
@@ -1077,6 +1147,11 @@ impl<S: SidecarApi + 'static> Engine<S> {
             if diverged {
                 let conflicted = rename_for_conflict(&self.db, &self.root, &rel)?;
                 warn!(path = %rel, conflict = %conflicted, "remote event vs local content: keeping both");
+                self.emit_activity(
+                    ActivityKind::Conflict,
+                    &rel,
+                    Some(format!("kept both; local copy renamed to {conflicted}")),
+                );
             }
         }
 
@@ -1168,6 +1243,7 @@ impl<S: SidecarApi + 'static> Engine<S> {
         })?;
         self.clear_upload_blocks(rel)?;
         info!(path = %rel, "downloaded");
+        self.emit_activity(ActivityKind::Downloaded, rel, None);
         Ok(())
     }
 

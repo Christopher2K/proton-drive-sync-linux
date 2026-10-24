@@ -7,6 +7,7 @@
 pub mod client;
 pub mod jsonrpc;
 pub mod mock;
+pub mod spawn;
 pub mod types;
 
 pub use client::{AuthStatus, SidecarApi, SidecarClient};
