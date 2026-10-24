@@ -33,7 +33,14 @@ Environment knobs:
 |---|---|
 | `PDS_SYNC_ROOT` | Sync folder (default: `~/ProtonDrive`, created if missing) |
 | `PDS_SIDECAR_CMD` | Sidecar command override, e.g. `node sidecar/dist/index.js` |
+| `PDS_DEBUG_SIGNOUT` | Dev hook: confirm sign-out automatically once the engine runs (real logout — the session is deleted!) |
 | `RUST_LOG` | Log filter (default `info,pds_core=debug`), logs go to stderr |
+
+Signing out (tray **Sign Out…** or the status-window footer) asks for
+confirmation, stops the engine gracefully, calls `auth.logout` (deletes the
+session server-side and wipes `session.json`), then returns to the login
+view so a different account can sign in immediately. Files on disk and the
+local state DB are kept.
 
 First run: the login window opens, click **Sign in with Proton**, finish in
 the browser; the status window appears once the engine starts.

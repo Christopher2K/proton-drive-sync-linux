@@ -31,6 +31,18 @@ pub enum Phase {
     Failed,
 }
 
+/// Sign-out progress (SPEC: destructive → confirm first). Local UI intent
+/// until `InProgress`, when the runtime performs shutdown + `auth.logout`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SignOutState {
+    #[default]
+    None,
+    /// The confirm panel is showing in the status window.
+    Confirming,
+    /// Confirmed; engine shutdown + `auth.logout` in flight.
+    InProgress,
+}
+
 /// Fork-login progress, driven by sidecar traffic.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LoginState {
@@ -63,6 +75,8 @@ pub struct ModelState {
     pub root: PathBuf,
     /// Set once Quit was requested; the runtime shuts the engine down.
     pub quitting: bool,
+    /// Sign-out confirm/in-progress state.
+    pub sign_out: SignOutState,
 }
 
 impl ModelState {
@@ -78,12 +92,34 @@ impl ModelState {
             errored: Vec::new(),
             root,
             quitting: false,
+            sign_out: SignOutState::None,
         }
     }
 
     /// Engine run-state, if a status snapshot has arrived.
     pub fn engine_state(&self) -> Option<EngineState> {
         self.status.as_ref().map(|s| s.state)
+    }
+
+    /// Open the sign-out confirm panel (only meaningful while running).
+    pub fn begin_sign_out(&mut self) {
+        if self.phase == Phase::Running {
+            self.sign_out = SignOutState::Confirming;
+        }
+    }
+
+    /// Dismiss the confirm panel without signing out.
+    pub fn cancel_sign_out(&mut self) {
+        if self.sign_out == SignOutState::Confirming {
+            self.sign_out = SignOutState::None;
+        }
+    }
+
+    /// Confirm: the caller follows up with `UiCommand::SignOut`.
+    pub fn confirm_sign_out(&mut self) {
+        if self.sign_out == SignOutState::Confirming {
+            self.sign_out = SignOutState::InProgress;
+        }
     }
 }
 
@@ -113,6 +149,9 @@ pub enum AppUpdate {
     },
     /// Unrecoverable runtime failure (sidecar spawn, auth probe, …).
     Failed { error: String },
+    /// Sign-out completed: engine stopped, `auth.logout` done (or the
+    /// session was already gone — 1001 is treated as success).
+    SignedOut,
     /// Engine task ended (after a requested shutdown, or unexpectedly).
     Exited { reason: String },
 }
@@ -123,6 +162,9 @@ pub enum UiCommand {
     StartLogin,
     Pause,
     Resume,
+    /// Confirmed sign-out: stop the engine, `auth.logout`, respawn the
+    /// sidecar into the login flow.
+    SignOut,
     Shutdown,
 }
 
@@ -165,6 +207,19 @@ pub fn apply(state: &mut ModelState, update: &AppUpdate) {
         AppUpdate::Failed { error } => {
             state.phase = Phase::Failed;
             state.fatal = Some(error.clone());
+        }
+        AppUpdate::SignedOut => {
+            // Back to a pristine signed-out state; the login window opens
+            // so a different account can sign in immediately.
+            state.phase = Phase::NeedsLogin;
+            state.fatal = None;
+            state.email = None;
+            state.login = LoginState::Idle;
+            state.status = None;
+            state.activity.clear();
+            state.conflicts.clear();
+            state.errored.clear();
+            state.sign_out = SignOutState::None;
         }
         AppUpdate::Exited { reason } => {
             // An exit during a requested quit is normal; anything else is
@@ -382,6 +437,61 @@ mod tests {
             },
         );
         assert_ne!(s.phase, Phase::Failed);
+    }
+
+    #[test]
+    fn sign_out_flow_returns_to_login() {
+        let mut s = ModelState::new(PathBuf::from("/tmp/root"));
+        // Signed in and running, with some session state accumulated.
+        apply(
+            &mut s,
+            &AppUpdate::EngineStarted {
+                email: "a@b.c".into(),
+            },
+        );
+        apply(&mut s, &AppUpdate::Status(status(EngineState::Running)));
+        apply(
+            &mut s,
+            &AppUpdate::Activity(item(ActivityKind::Uploaded, "f")),
+        );
+        apply(
+            &mut s,
+            &AppUpdate::Inbox {
+                conflicts: vec!["x".into()],
+                errored: vec![("y".into(), "boom".into())],
+            },
+        );
+
+        // signed-in -> confirming
+        s.begin_sign_out();
+        assert_eq!(s.sign_out, SignOutState::Confirming);
+        // cancel path
+        s.cancel_sign_out();
+        assert_eq!(s.sign_out, SignOutState::None);
+        // confirming -> confirmed (in progress) -> signed out
+        s.begin_sign_out();
+        s.confirm_sign_out();
+        assert_eq!(s.sign_out, SignOutState::InProgress);
+        assert_eq!(s.phase, Phase::Running); // engine still up during logout
+
+        apply(&mut s, &AppUpdate::SignedOut);
+        assert_eq!(s.phase, Phase::NeedsLogin);
+        assert_eq!(s.login, LoginState::Idle);
+        assert_eq!(s.sign_out, SignOutState::None);
+        assert!(s.email.is_none());
+        assert!(s.status.is_none());
+        assert!(s.activity.is_empty());
+        assert!(s.conflicts.is_empty());
+        assert!(s.errored.is_empty());
+    }
+
+    #[test]
+    fn begin_sign_out_requires_running_phase() {
+        let mut s = ModelState::new(PathBuf::from("/tmp/root"));
+        s.begin_sign_out(); // phase == Starting: nothing to sign out of
+        assert_eq!(s.sign_out, SignOutState::None);
+        s.confirm_sign_out(); // no-op without Confirming
+        assert_eq!(s.sign_out, SignOutState::None);
     }
 
     #[test]

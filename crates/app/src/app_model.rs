@@ -10,7 +10,7 @@ use gpui::{
     WindowOptions, px, size,
 };
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
-use tracing::{error, warn};
+use tracing::{error, info, warn};
 
 use crate::login::LoginView;
 use crate::model::{self, APP_TITLE, AppUpdate, ModelState, Phase, UiCommand};
@@ -80,7 +80,9 @@ impl AppModel {
         match &update {
             // Sign-in page → the user's browser (fork login, protocol.md).
             AppUpdate::LoginUrl { url, .. } => open_in_browser(url),
-            AppUpdate::Status(_) | AppUpdate::EngineStarted { .. } => refresh_tray(cx, &self.state),
+            AppUpdate::Status(_) | AppUpdate::EngineStarted { .. } | AppUpdate::SignedOut => {
+                refresh_tray(cx, &self.state)
+            }
             AppUpdate::Exited { .. } if self.state.quitting => {
                 // Engine thread finished the requested shutdown; quit now.
                 cx.quit();
@@ -91,13 +93,17 @@ impl AppModel {
 
         let after = self.state.phase;
         if after != before {
+            info!(?before, ?after, "phase transition");
             // Window management READS AppModel (opening a window renders the
             // new view immediately, and both views do `model.read(cx)` in
             // render) — doing it here, inside `update`, is a re-entrant
             // entity access and panics (entity_map.rs: "already being
             // updated"). Defer it past the end of this update.
             cx.defer(move |cx| match after {
-                Phase::NeedsLogin => open_login_window(cx),
+                Phase::NeedsLogin => {
+                    close_status_window(cx);
+                    open_login_window(cx);
+                }
                 Phase::Running => {
                     close_login_window(cx);
                     open_status_window(cx);
@@ -165,7 +171,7 @@ fn open_login_window(cx: &mut App) {
     }
 }
 
-fn open_status_window(cx: &mut App) {
+pub fn open_status_window(cx: &mut App) {
     let model = AppModel::this(cx);
     let existing = model.read(cx).status_window;
     if let Some(w) = existing
@@ -186,6 +192,14 @@ fn open_status_window(cx: &mut App) {
 fn close_login_window(cx: &mut App) {
     let model = AppModel::this(cx);
     let w = model.update(cx, |m, _| m.login_window.take());
+    if let Some(w) = w {
+        let _ = w.update(cx, |_, window, _| window.remove_window());
+    }
+}
+
+fn close_status_window(cx: &mut App) {
+    let model = AppModel::this(cx);
+    let w = model.update(cx, |m, _| m.status_window.take());
     if let Some(w) = w {
         let _ = w.update(cx, |_, window, _| window.remove_window());
     }

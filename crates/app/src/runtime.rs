@@ -51,40 +51,92 @@ pub fn start_engine_runtime(
         .expect("spawn engine thread");
 }
 
+/// Why an engine session ended.
+enum EngineExit {
+    /// App is quitting (`UiCommand::Shutdown` / UI gone) or the engine task
+    /// ended on its own. Carries the human-readable reason for `Exited`.
+    Quit(String),
+    /// `UiCommand::SignOut`: engine already shut down; caller performs
+    /// `auth.logout` and loops back to the login flow.
+    SignOut,
+}
+
 async fn run(
     root: PathBuf,
     sidecar_cmd: Option<String>,
     updates: &UnboundedSender<AppUpdate>,
     mut cmds: UnboundedReceiver<UiCommand>,
 ) -> Result<()> {
-    let (mut client, _child) = spawn_sidecar(sidecar_cmd.as_deref())?;
-    let mut notifications = client.take_notifications();
+    // Session loop: sign-out drops the sidecar (its notification stream is
+    // consumed by the engine and can't be reclaimed) and restarts the whole
+    // stack into the login flow, so a different account can sign in.
+    loop {
+        let (mut client, child) = spawn_sidecar(sidecar_cmd.as_deref())?;
+        let mut notifications = client.take_notifications();
+        let client = Arc::new(client);
 
-    let auth = client.auth_status().await.context("auth.status")?;
-    let email = if auth.logged_in {
-        let email = auth.email.unwrap_or_else(|| "unknown account".into());
-        let _ = updates.send(AppUpdate::AuthOk {
-            email: email.clone(),
-        });
-        email
-    } else {
-        let _ = updates.send(AppUpdate::AuthRequired);
-        login_flow(&client, &mut notifications, &mut cmds, updates).await?
-    };
-    info!(email = %email, root = %root.display(), "starting sync engine");
+        let auth = client.auth_status().await.context("auth.status")?;
+        let email = if auth.logged_in {
+            let email = auth.email.unwrap_or_else(|| "unknown account".into());
+            let _ = updates.send(AppUpdate::AuthOk {
+                email: email.clone(),
+            });
+            email
+        } else {
+            let _ = updates.send(AppUpdate::AuthRequired);
+            login_flow(client.as_ref(), &mut notifications, &mut cmds, updates).await?
+        };
+        info!(email = %email, root = %root.display(), "starting sync engine");
 
-    let db_path = root.join(STATE_DIR).join("state.db");
-    let (engine, handle) = Engine::new(
-        Arc::new(client),
-        notifications,
-        EngineConfig {
-            db_path: db_path.clone(),
-            root: root.clone(),
-            retry_base: RETRY_BASE_DEFAULT,
-        },
-    )?;
-    let _ = updates.send(AppUpdate::EngineStarted { email });
+        let db_path = root.join(STATE_DIR).join("state.db");
+        let (engine, handle) = Engine::new(
+            client.clone(),
+            notifications,
+            EngineConfig {
+                db_path: db_path.clone(),
+                root: root.clone(),
+                retry_base: RETRY_BASE_DEFAULT,
+            },
+        )?;
+        let _ = updates.send(AppUpdate::EngineStarted { email });
 
+        match drive_engine(engine, handle, &db_path, &mut cmds, updates).await {
+            EngineExit::Quit(reason) => {
+                let _ = updates.send(AppUpdate::Exited { reason });
+                return Ok(());
+            }
+            EngineExit::SignOut => {
+                // Engine is already stopped (graceful shutdown above).
+                // auth.logout DELETEs the session server-side and wipes
+                // session.json; 1001 (already gone) or any other failure
+                // still proceeds — the local state is signed out either way
+                // (the sidecar wipes session.json even on API failure).
+                match client.logout().await {
+                    Ok(()) => info!("signed out"),
+                    Err(e)
+                        if e.code()
+                            == Some(pds_sidecar_client::types::error_codes::AUTH_REQUIRED) =>
+                    {
+                        info!("auth.logout: session already gone (1001), proceeding");
+                    }
+                    Err(e) => warn!("auth.logout failed ({e}); proceeding to signed-out state"),
+                }
+                drop(child); // kill_on_drop: stop the old sidecar process
+                let _ = updates.send(AppUpdate::SignedOut);
+            }
+        }
+    }
+}
+
+/// Run the engine session until a UI command or engine exit ends it.
+/// Handles the 1 s status/inbox polling and the activity feed.
+async fn drive_engine(
+    engine: Engine<pds_sidecar_client::SidecarClient>,
+    handle: pds_core::EngineHandle,
+    db_path: &Path,
+    cmds: &mut UnboundedReceiver<UiCommand>,
+    updates: &UnboundedSender<AppUpdate>,
+) -> EngineExit {
     let mut engine_task = tokio::spawn(engine.run());
     let mut activity_rx = handle.subscribe_activity();
     let mut tick = tokio::time::interval(Duration::from_secs(1));
@@ -101,7 +153,15 @@ async fn run(
                 }
                 Some(UiCommand::Shutdown) | None => {
                     let _ = handle.shutdown().await;
-                    break;
+                    let res = engine_task.await;
+                    return EngineExit::Quit(engine_result(res));
+                }
+                Some(UiCommand::SignOut) => {
+                    // Graceful engine stop first; logout happens in `run`.
+                    let _ = handle.shutdown().await;
+                    let res = engine_task.await;
+                    info!(reason = %engine_result(res), "engine stopped for sign-out");
+                    return EngineExit::SignOut;
                 }
                 Some(UiCommand::StartLogin) => {} // already logged in
             },
@@ -112,30 +172,21 @@ async fn run(
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                     warn!(skipped = n, "activity feed lagged; entries dropped");
                 }
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                    return EngineExit::Quit("activity channel closed".into());
+                }
             },
             _ = tick.tick() => {
                 if let Ok(st) = handle.status().await {
                     let _ = updates.send(AppUpdate::Status(st));
                 }
-                poll_inbox(&mut db, &db_path, updates);
+                poll_inbox(&mut db, db_path, updates);
             }
             res = &mut engine_task => {
-                let _ = updates.send(AppUpdate::Exited {
-                    reason: engine_result(res),
-                });
-                return Ok(());
+                return EngineExit::Quit(engine_result(res));
             }
         }
     }
-
-    // Requested shutdown: wait for the engine to finish draining, then tell
-    // the UI it may quit.
-    let res = engine_task.await;
-    let _ = updates.send(AppUpdate::Exited {
-        reason: engine_result(res),
-    });
-    Ok(())
 }
 
 fn engine_result(res: Result<Result<()>, tokio::task::JoinError>) -> String {

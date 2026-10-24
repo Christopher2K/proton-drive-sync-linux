@@ -61,6 +61,63 @@ pub fn wide_button<V: 'static>(
         .child(label.into())
 }
 
+/// A destructive-action button (sign-out confirm).
+pub fn danger_button<V: 'static>(
+    id: &'static str,
+    label: impl Into<gpui::SharedString>,
+    cx: &mut Context<V>,
+    on_click: impl Fn(&mut V, &ClickEvent, &mut Window, &mut Context<V>) + 'static,
+) -> Stateful<Div> {
+    div()
+        .id(id)
+        .px_4()
+        .py_2()
+        .rounded_md()
+        .bg(rgb(DANGER))
+        .text_color(rgb(0xffffff))
+        .cursor_pointer()
+        .hover(|s| s.bg(rgb(0xd96a6a)))
+        .on_click(cx.listener(on_click))
+        .child(label.into())
+}
+
+/// A subtle bordered button (cancel).
+pub fn ghost_button<V: 'static>(
+    id: &'static str,
+    label: impl Into<gpui::SharedString>,
+    cx: &mut Context<V>,
+    on_click: impl Fn(&mut V, &ClickEvent, &mut Window, &mut Context<V>) + 'static,
+) -> Stateful<Div> {
+    div()
+        .id(id)
+        .px_4()
+        .py_2()
+        .rounded_md()
+        .border_1()
+        .border_color(rgb(BORDER))
+        .text_color(rgb(TEXT))
+        .cursor_pointer()
+        .hover(|s| s.bg(rgb(PANEL)))
+        .on_click(cx.listener(on_click))
+        .child(label.into())
+}
+
+/// A subtle dim text button (footer "Sign out…").
+pub fn text_button<V: 'static>(
+    id: &'static str,
+    label: impl Into<gpui::SharedString>,
+    cx: &mut Context<V>,
+    on_click: impl Fn(&mut V, &ClickEvent, &mut Window, &mut Context<V>) + 'static,
+) -> Stateful<Div> {
+    div()
+        .id(id)
+        .text_color(rgb(DIM))
+        .cursor_pointer()
+        .hover(|s| s.text_color(rgb(TEXT)))
+        .on_click(cx.listener(on_click))
+        .child(label.into())
+}
+
 /// A dimmed secondary-text line.
 pub fn dim(text: impl Into<gpui::SharedString>) -> Div {
     div().text_color(rgb(DIM)).child(text.into())

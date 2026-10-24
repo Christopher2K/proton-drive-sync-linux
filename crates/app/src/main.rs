@@ -21,7 +21,7 @@ use tracing::{error, info};
 use app_model::AppModel;
 use model::{APP_TITLE, ModelState, UiCommand};
 
-actions!(pds_app, [OpenStatus, TogglePause, QuitApp]);
+actions!(pds_app, [OpenStatus, TogglePause, SignOut, QuitApp]);
 
 /// What the tray menu builder needs to render the pause/resume label.
 #[derive(Clone, Copy, Default)]
@@ -45,6 +45,8 @@ fn tray_menu(cx: &mut App) -> Vec<MenuItem> {
     vec![
         MenuItem::action("Open Status", OpenStatus),
         MenuItem::action(label, TogglePause),
+        MenuItem::separator(),
+        MenuItem::action("Sign Out…", SignOut),
         MenuItem::separator(),
         MenuItem::action(format!("Quit {APP_TITLE}"), QuitApp),
     ]
@@ -94,6 +96,27 @@ fn on_toggle_pause(_: &TogglePause, cx: &mut App) {
             let cmd = model::toggle_command(&m.state);
             m.send(cmd);
         });
+    }
+}
+
+/// Tray "Sign Out…": open/focus the status window with the confirm panel
+/// showing (sign-out is destructive — the panel, not the menu, confirms).
+fn on_sign_out(_: &SignOut, cx: &mut App) {
+    let confirming = cx
+        .try_global::<ModelHolder>()
+        .map(|holder| holder.0.clone())
+        .map(|model| {
+            model.update(cx, |m, cx| {
+                m.state.begin_sign_out();
+                cx.notify();
+                m.state.sign_out == model::SignOutState::Confirming
+            })
+        })
+        .unwrap_or(false);
+    if confirming {
+        app_model::open_status_window(cx);
+    } else {
+        app_model::open_front_window(cx);
     }
 }
 
@@ -172,7 +195,7 @@ fn main() {
         cx.set_global(TrayState::default());
         let model =
             cx.new(|cx| AppModel::new(ModelState::new(root.clone()), ui_tx, updates_rx, cx));
-        cx.set_global(ModelHolder(model));
+        cx.set_global(ModelHolder(model.clone()));
 
         match build_tray(cx) {
             Ok(tray) => cx.set_global(TrayHolder(tray)),
@@ -187,11 +210,44 @@ fn main() {
 
         cx.on_action(on_open_status);
         cx.on_action(on_toggle_pause);
+        cx.on_action(on_sign_out);
         cx.on_action(on_quit);
 
         // Never quit when the last window closes (menu-bar app): simply no
         // on_window_closed handler. macOS does not auto-quit either.
 
         runtime::start_engine_runtime(root, sidecar_cmd, updates_tx, ui_rx);
+
+        // Dev hook: `PDS_DEBUG_SIGNOUT=1` confirms sign-out as soon as the
+        // engine is running — exercises the whole flow (graceful engine
+        // stop → auth.logout → login view) without GUI automation.
+        if std::env::var_os("PDS_DEBUG_SIGNOUT").is_some() {
+            cx.spawn(async move |cx| {
+                for _ in 0..60 {
+                    cx.background_executor()
+                        .timer(std::time::Duration::from_millis(500))
+                        .await;
+                    let triggered = cx
+                        .update(|cx| {
+                            model.update(cx, |m, cx| {
+                                m.state.begin_sign_out();
+                                if m.state.sign_out == model::SignOutState::Confirming {
+                                    m.state.confirm_sign_out();
+                                    m.send(UiCommand::SignOut);
+                                    cx.notify();
+                                    true
+                                } else {
+                                    false
+                                }
+                            })
+                        })
+                        .unwrap_or(false);
+                    if triggered {
+                        break;
+                    }
+                }
+            })
+            .detach();
+        }
     });
 }

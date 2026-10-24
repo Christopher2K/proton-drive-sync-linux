@@ -9,7 +9,7 @@ use gpui::{
 use pds_core::EngineState;
 
 use crate::app_model::AppModel;
-use crate::model::{self, ModelState, Phase, format_time, kind_label};
+use crate::model::{self, ModelState, Phase, SignOutState, UiCommand, format_time, kind_label};
 use crate::widgets::{self, ACCENT, BG, BORDER, DANGER, DIM, OK, PANEL, TEXT, WARN};
 
 pub struct StatusView {
@@ -197,6 +197,63 @@ impl StatusView {
 
         panel
     }
+
+    /// Centered sign-out confirmation (Confirming) / progress (InProgress)
+    /// panel, replacing the activity+inbox body while active.
+    fn confirm_panel(&self, state: &ModelState, cx: &mut Context<Self>) -> Div {
+        let email = state.email.clone().unwrap_or_else(|| "this account".into());
+        let mut panel = div()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .p_4()
+            .rounded_md()
+            .border_1()
+            .border_color(rgb(BORDER))
+            .bg(rgb(PANEL))
+            .child(div().text_base().child(format!("Sign out of {email}?")))
+            .child(div().text_sm().text_color(rgb(DIM)).child(
+                "Sync will stop and the saved session will be deleted. Files on disk are kept.",
+            ));
+        if state.sign_out == SignOutState::InProgress {
+            panel = panel.child(widgets::dim("Signing out…"));
+        } else {
+            panel = panel.child(
+                div()
+                    .flex()
+                    .gap_2()
+                    .child(widgets::danger_button(
+                        "confirm-sign-out",
+                        "Sign Out",
+                        cx,
+                        |this, _, _, cx| {
+                            this.model.update(cx, |m, cx| {
+                                m.state.confirm_sign_out();
+                                m.send(UiCommand::SignOut);
+                                cx.notify();
+                            });
+                        },
+                    ))
+                    .child(widgets::ghost_button(
+                        "cancel-sign-out",
+                        "Cancel",
+                        cx,
+                        |this, _, _, cx| {
+                            this.model.update(cx, |m, cx| {
+                                m.state.cancel_sign_out();
+                                cx.notify();
+                            });
+                        },
+                    )),
+            );
+        }
+        div()
+            .flex_1()
+            .flex()
+            .items_center()
+            .justify_center()
+            .child(panel)
+    }
 }
 
 impl Render for StatusView {
@@ -254,6 +311,18 @@ impl Render for StatusView {
                 activity_col.child(activity)
             };
 
+        let body = if state.sign_out == SignOutState::None {
+            div()
+                .flex_1()
+                .flex()
+                .flex_row()
+                .min_h(px(0.0))
+                .child(activity_col)
+                .child(self.inbox(&state))
+        } else {
+            self.confirm_panel(&state, cx)
+        };
+
         div()
             .flex()
             .flex_col()
@@ -262,24 +331,34 @@ impl Render for StatusView {
             .text_color(rgb(TEXT))
             .text_sm()
             .child(self.header(&state, cx))
+            .child(body)
             .child(
                 div()
-                    .flex_1()
                     .flex()
-                    .flex_row()
-                    .min_h(px(0.0))
-                    .child(activity_col)
-                    .child(self.inbox(&state)),
-            )
-            .child(
-                div()
+                    .items_center()
+                    .justify_between()
+                    .gap_3()
                     .px_4()
                     .py_2()
                     .border_t_1()
                     .border_color(rgb(BORDER))
                     .text_color(rgb(DIM))
-                    .whitespace_nowrap()
-                    .child(format!("Sync folder: {}", state.root.display())),
+                    .child(
+                        div()
+                            .whitespace_nowrap()
+                            .child(format!("Sync folder: {}", state.root.display())),
+                    )
+                    .child(widgets::text_button(
+                        "sign-out",
+                        "Sign out…",
+                        cx,
+                        |this, _, _, cx| {
+                            this.model.update(cx, |m, cx| {
+                                m.state.begin_sign_out();
+                                cx.notify();
+                            });
+                        },
+                    )),
             )
     }
 }
