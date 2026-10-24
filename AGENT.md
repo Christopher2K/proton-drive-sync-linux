@@ -24,7 +24,8 @@ A cross-platform (macOS + Linux) desktop app that syncs Proton Drive into a loca
 - [x] Product specification written (`SPEC.md`)
 - [x] M0 — Spike: **PASSED 2026-10-23** against a real account — fork auth, key unlock, SDK bootstrap, list, upload, verified download, trash, event cursor (FastForward). Go decision confirmed.
 - [x] M1 — Headless sync engine: **PASSED live E2E 2026-10-24** (scratch account) — F1–F4, F6, F7 all verified against real Proton Drive. 54/54 Rust tests, sidecar smoke + event-loop tests green. E2E bugs found & fixed: telemetry-on-stdout, F7 stale-base race (server 409 → parked → event-path keep-both), guard cascade, CLI per-root resolution, event-stream polling (sidecar now polls /events/{cursor} every ~30s).
-- [ ] M2 — GPUI shell ← **next up**
+- [x] M2 — GPUI shell: **code complete 2026-10-23** — `crates/app` windowless tray app (gpui 0.2.2 + gpui-tray 0.3), fork login view, status dashboard, activity feed, conflicts inbox. 62/62 tests, headless proof OK. **Pending: interactive run by the user** (`cargo run -p pds-app` or packaging/macos/bundle.sh).
+- [ ] M3 — Linux FUSE VFS ← **next up**
 - [ ] M2 — GPUI shell
 - [ ] M3 — Linux FUSE VFS
 - [ ] M4 — macOS File Provider
