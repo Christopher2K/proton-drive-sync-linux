@@ -6,6 +6,26 @@ members = ["crates/*"]
 edition = "2024"
 license = "MIT"
 
+[workspace.dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "process", "net", "sync", "time", "fs", "signal"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+async-trait = "0.1"
+thiserror = "2"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+rusqlite = { version = "0.35", features = ["bundled"] }
+notify = "8"
+notify-debouncer-mini = "0.7"
+sha1 = "0.10"
+chrono = "0.4"
+clap = { version = "4", features = ["derive"] }
+tempfile = "3"
+
+pds-sidecar-client = { path = "crates/sidecar-client" }
+pds-core = { path = "crates/core" }
+
 [profile.release]
 lto = true
 codegen-units = 1

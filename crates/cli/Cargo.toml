@@ -1,0 +1,20 @@
+[package]
+name = "pds-cli"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Headless proton-drive-sync CLI (M1)"
+
+[[bin]]
+name = "pds"
+path = "src/main.rs"
+
+[dependencies]
+pds-core.workspace = true
+pds-sidecar-client.workspace = true
+tokio.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+clap.workspace = true
+serde_json.workspace = true

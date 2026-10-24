@@ -6,3 +6,20 @@ license.workspace = true
 description = "Sync engine, state DB, queues, and trash guards for proton-drive-sync"
 
 [dependencies]
+pds-sidecar-client.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+rusqlite.workspace = true
+notify.workspace = true
+notify-debouncer-mini.workspace = true
+sha1.workspace = true
+chrono.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tracing-subscriber.workspace = true
+serial_test = "3"

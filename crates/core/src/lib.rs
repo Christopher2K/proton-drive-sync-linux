@@ -3,15 +3,14 @@
 //! See `SPEC.md` at the repo root. All Proton Drive API traffic goes through
 //! the Node.js sidecar (`sidecar/`), never from Rust directly.
 
-/// Sync state machine placeholder — real implementation lands in M1.
-pub fn spec_version() -> &'static str {
-    "0.1"
-}
+pub mod conflict;
+pub mod db;
+pub mod engine;
+pub mod guard;
 
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn scaffold_builds() {
-        assert_eq!(super::spec_version(), "0.1");
-    }
-}
+pub use db::{Db, NodeRow, SyncState, Tombstone};
+pub use engine::{
+    Command, Engine, EngineConfig, EngineHandle, EngineState, EngineStatus, STATE_DIR, sha1_file,
+    to_abs, to_rel,
+};
+pub use guard::{DeleteGuard, GUARD_MAX_DELETES, GUARD_MAX_RATIO, GUARD_WINDOW};
