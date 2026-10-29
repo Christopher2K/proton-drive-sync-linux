@@ -1,7 +1,6 @@
-//! Pure view-model for the menu-bar shell: the state the UI renders, the
-//! updates the engine runtime sends, the commands the UI sends back, and
-//! the reducer applying updates to state. No gpui imports — this module is
-//! deliberately unit-testable.
+//! Pure application state: the values the UI renders, the updates the engine
+//! sends, and the reducer that applies them. No GPUI or tokio imports, so the
+//! whole view model is unit-testable.
 
 use std::path::PathBuf;
 
@@ -11,33 +10,113 @@ use pds_core::{ActivityItem, ActivityKind, EngineState, EngineStatus};
 pub const DISCLOSURE: &str =
     "This is a third-party application not officially supported by Proton.";
 
-/// Window title / tray tooltip. Clearly unofficial, no Proton branding.
-pub const APP_TITLE: &str = "Proton Drive Sync (unofficial)";
+/// Window title and in-app product name. Clearly unofficial, no Proton branding.
+pub const APP_TITLE: &str = "Proton Drive Sync";
+pub const APP_TAGLINE: &str = "Unofficial Linux client";
 
 /// Cap on the in-memory activity feed (newest first).
 pub const ACTIVITY_CAP: usize = 500;
 
-/// High-level app phase, driving which window the shell shows.
+/// Top-level navigation destination.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Page {
+    #[default]
+    Overview,
+    Activity,
+    Conflicts,
+    Settings,
+}
+
+impl Page {
+    pub const ALL: [Page; 4] = [Page::Overview, Page::Activity, Page::Conflicts, Page::Settings];
+
+    pub fn title(self) -> &'static str {
+        match self {
+            Page::Overview => "Overview",
+            Page::Activity => "Activity",
+            Page::Conflicts => "Conflicts",
+            Page::Settings => "Settings",
+        }
+    }
+
+    pub fn subtitle(self) -> &'static str {
+        match self {
+            Page::Overview => "Your sync status at a glance",
+            Page::Activity => "Recent uploads, downloads, and remote changes",
+            Page::Conflicts => "Items that need your attention",
+            Page::Settings => "Account, folders, and application controls",
+        }
+    }
+}
+
+/// Activity feed filter pills.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ActivityFilter {
+    #[default]
+    All,
+    Uploads,
+    Downloads,
+    Deletes,
+    Conflicts,
+    Problems,
+}
+
+impl ActivityFilter {
+    pub const ALL: [ActivityFilter; 6] = [
+        ActivityFilter::All,
+        ActivityFilter::Uploads,
+        ActivityFilter::Downloads,
+        ActivityFilter::Deletes,
+        ActivityFilter::Conflicts,
+        ActivityFilter::Problems,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            ActivityFilter::All => "All",
+            ActivityFilter::Uploads => "Uploads",
+            ActivityFilter::Downloads => "Downloads",
+            ActivityFilter::Deletes => "Deletes",
+            ActivityFilter::Conflicts => "Conflicts",
+            ActivityFilter::Problems => "Problems",
+        }
+    }
+
+    pub fn matches(self, kind: ActivityKind) -> bool {
+        match self {
+            ActivityFilter::All => true,
+            ActivityFilter::Uploads => kind == ActivityKind::Uploaded,
+            ActivityFilter::Downloads => kind == ActivityKind::Downloaded,
+            ActivityFilter::Deletes => kind == ActivityKind::Trashed,
+            ActivityFilter::Conflicts => kind == ActivityKind::Conflict,
+            ActivityFilter::Problems => {
+                matches!(kind, ActivityKind::UploadErrored | ActivityKind::GuardPaused)
+            }
+        }
+    }
+}
+
+/// High-level app phase. Login, onboarding, running, and failure are distinct
+/// screens within the single application window.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Phase {
     /// Probing the sidecar / starting the engine.
     #[default]
     Starting,
-    /// Sidecar reachable but no session — show the login window.
+    /// Sidecar reachable but no session — show the sign-in screen.
     NeedsLogin,
-    /// Engine running (or paused) — show the status window.
+    /// Engine running (or paused) — show the main shell.
     Running,
-    /// Unrecoverable startup/runtime failure; see `ModelState::fatal`.
+    /// Unrecoverable startup/runtime failure; see [`AppState::fatal`].
     Failed,
 }
 
-/// Sign-out progress (SPEC: destructive → confirm first). Local UI intent
-/// until `InProgress`, when the runtime performs shutdown + `auth.logout`.
+/// Sign-out progress (destructive → confirm first).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SignOutState {
     #[default]
     None,
-    /// The confirm panel is showing in the status window.
+    /// The confirmation modal is showing.
     Confirming,
     /// Confirmed; engine shutdown + `auth.logout` in flight.
     InProgress,
@@ -56,10 +135,9 @@ pub enum LoginState {
     Failed(String),
 }
 
-/// Everything the windows render. Owned by the `AppModel` entity; mutated
-/// only through [`apply`].
+/// Everything the UI renders. Mutated only through [`apply`].
 #[derive(Debug, Clone)]
-pub struct ModelState {
+pub struct AppState {
     pub phase: Phase,
     /// Error text when `phase == Phase::Failed`.
     pub fatal: Option<String>,
@@ -77,9 +155,11 @@ pub struct ModelState {
     pub quitting: bool,
     /// Sign-out confirm/in-progress state.
     pub sign_out: SignOutState,
+    /// Currently visible page (ignored while signing in).
+    pub page: Page,
 }
 
-impl ModelState {
+impl AppState {
     pub fn new(root: PathBuf) -> Self {
         Self {
             phase: Phase::Starting,
@@ -93,6 +173,7 @@ impl ModelState {
             root,
             quitting: false,
             sign_out: SignOutState::None,
+            page: Page::Overview,
         }
     }
 
@@ -101,32 +182,70 @@ impl ModelState {
         self.status.as_ref().map(|s| s.state)
     }
 
-    /// Open the sign-out confirm panel (only meaningful while running).
-    pub fn begin_sign_out(&mut self) {
+    /// True when the engine is not actively syncing: no status yet, user
+    /// paused, or the delete guard paused it. `GuardPaused` counts as paused
+    /// (deletions are held), matching the UI's toggle mapping.
+    #[cfg(test)]
+    pub fn is_paused(&self) -> bool {
+        self.engine_state() != Some(EngineState::Running)
+    }
+
+    pub fn account_label(&self) -> String {
+        self.email
+            .clone()
+            .unwrap_or_else(|| "Not signed in".into())
+    }
+
+    pub fn open_sign_out(&mut self) {
         if self.phase == Phase::Running {
             self.sign_out = SignOutState::Confirming;
         }
     }
 
-    /// Dismiss the confirm panel without signing out.
     pub fn cancel_sign_out(&mut self) {
         if self.sign_out == SignOutState::Confirming {
             self.sign_out = SignOutState::None;
         }
     }
 
-    /// Confirm: the caller follows up with `UiCommand::SignOut`.
     pub fn confirm_sign_out(&mut self) {
         if self.sign_out == SignOutState::Confirming {
             self.sign_out = SignOutState::InProgress;
         }
     }
+
+    /// Number of entries a filter would show.
+    pub fn activity_count(&self, filter: ActivityFilter) -> usize {
+        self.activity
+            .iter()
+            .filter(|item| filter.matches(item.kind))
+            .count()
+    }
+
+    /// Newest-first entries matching `filter` (cloned for list rendering).
+    pub fn filtered_activity(&self, filter: ActivityFilter) -> Vec<ActivityItem> {
+        self.activity
+            .iter()
+            .filter(|item| filter.matches(item.kind))
+            .cloned()
+            .collect()
+    }
+
+    /// Newest `limit` entries of any kind.
+    pub fn recent_activity(&self, limit: usize) -> &[ActivityItem] {
+        &self.activity[..self.activity.len().min(limit)]
+    }
+
+    /// Badge count shown next to the Conflicts nav item.
+    pub fn attention_count(&self) -> usize {
+        self.conflicts.len() + self.errored.len()
+    }
 }
 
-/// Engine-runtime → UI updates (tokio side sends, `AppModel` pump applies).
+/// Engine-runtime → UI updates.
 #[derive(Debug, Clone)]
 pub enum AppUpdate {
-    /// `auth.status` says no session; the login window is needed.
+    /// `auth.status` says no session; the sign-in screen is needed.
     AuthRequired,
     /// A session already exists; the engine is starting.
     AuthOk { email: String },
@@ -134,7 +253,7 @@ pub enum AppUpdate {
     LoginStarted,
     /// `auth.signInUrl` notification: display + open in the browser.
     LoginUrl { url: String, user_code: String },
-    /// `auth.loginFork` failed; the login view offers a retry.
+    /// `auth.loginFork` failed; the sign-in screen offers a retry.
     LoginFailed { error: String },
     /// Engine constructed and running.
     EngineStarted { email: String },
@@ -149,27 +268,14 @@ pub enum AppUpdate {
     },
     /// Unrecoverable runtime failure (sidecar spawn, auth probe, …).
     Failed { error: String },
-    /// Sign-out completed: engine stopped, `auth.logout` done (or the
-    /// session was already gone — 1001 is treated as success).
+    /// Sign-out completed: engine stopped, `auth.logout` done.
     SignedOut,
     /// Engine task ended (after a requested shutdown, or unexpectedly).
     Exited { reason: String },
 }
 
-/// UI → engine-runtime commands.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum UiCommand {
-    StartLogin,
-    Pause,
-    Resume,
-    /// Confirmed sign-out: stop the engine, `auth.logout`, respawn the
-    /// sidecar into the login flow.
-    SignOut,
-    Shutdown,
-}
-
 /// The state reducer. Pure: no IO, no gpui — unit tests drive this.
-pub fn apply(state: &mut ModelState, update: &AppUpdate) {
+pub fn apply(state: &mut AppState, update: &AppUpdate) {
     match update {
         AppUpdate::AuthRequired => {
             state.phase = Phase::NeedsLogin;
@@ -193,6 +299,8 @@ pub fn apply(state: &mut ModelState, update: &AppUpdate) {
         AppUpdate::EngineStarted { email } => {
             state.email = Some(email.clone());
             state.phase = Phase::Running;
+            state.fatal = None;
+            state.page = Page::Overview;
         }
         AppUpdate::Status(status) => {
             state.status = Some(status.clone());
@@ -207,10 +315,11 @@ pub fn apply(state: &mut ModelState, update: &AppUpdate) {
         AppUpdate::Failed { error } => {
             state.phase = Phase::Failed;
             state.fatal = Some(error.clone());
+            state.sign_out = SignOutState::None;
         }
         AppUpdate::SignedOut => {
-            // Back to a pristine signed-out state; the login window opens
-            // so a different account can sign in immediately.
+            // Back to a pristine signed-out state so another account can sign
+            // in immediately. Files on disk and the state DB are kept.
             state.phase = Phase::NeedsLogin;
             state.fatal = None;
             state.email = None;
@@ -220,10 +329,9 @@ pub fn apply(state: &mut ModelState, update: &AppUpdate) {
             state.conflicts.clear();
             state.errored.clear();
             state.sign_out = SignOutState::None;
+            state.page = Page::Overview;
         }
         AppUpdate::Exited { reason } => {
-            // An exit during a requested quit is normal; anything else is
-            // surfaced as a failure so the shell doesn't look alive-but-dead.
             if !state.quitting {
                 state.phase = Phase::Failed;
                 state.fatal = Some(format!("sync engine stopped: {reason}"));
@@ -238,33 +346,26 @@ pub fn push_activity(list: &mut Vec<ActivityItem>, item: ActivityItem, cap: usiz
     list.truncate(cap);
 }
 
-/// Tray menu / big-toggle label: pausing is the action while running.
-pub fn pause_label(state: &ModelState) -> &'static str {
+/// Toggle label: pausing is the action while running.
+pub fn pause_label(state: &AppState) -> &'static str {
     match state.engine_state() {
-        Some(EngineState::Running) => "Pause Syncing",
-        _ => "Resume Syncing",
+        Some(EngineState::Running) => "Pause syncing",
+        Some(EngineState::Paused) => "Resume syncing",
+        Some(EngineState::GuardPaused) => "Review and resume",
+        None => "Starting…",
     }
 }
 
-/// The command the big toggle / tray item sends: the inverse of the
-/// current run-state.
-pub fn toggle_command(state: &ModelState) -> UiCommand {
-    match state.engine_state() {
-        Some(EngineState::Running) => UiCommand::Pause,
-        _ => UiCommand::Resume,
-    }
-}
-
-/// Short badge text for the header.
-pub fn badge(state: &ModelState) -> &'static str {
+/// Short badge text for the header and sidebar.
+pub fn badge(state: &AppState) -> &'static str {
     match state.phase {
-        Phase::Starting => "starting",
-        Phase::NeedsLogin => "sign-in required",
-        Phase::Failed => "stopped",
+        Phase::Starting => "Starting",
+        Phase::NeedsLogin => "Sign-in required",
+        Phase::Failed => "Stopped",
         Phase::Running => match state.engine_state() {
-            Some(EngineState::Running) | None => "running",
-            Some(EngineState::Paused) => "paused",
-            Some(EngineState::GuardPaused) => "paused — mass-delete guard",
+            Some(EngineState::Running) | None => "Syncing",
+            Some(EngineState::Paused) => "Paused",
+            Some(EngineState::GuardPaused) => "Delete guard",
         },
     }
 }
@@ -272,12 +373,12 @@ pub fn badge(state: &ModelState) -> &'static str {
 /// Feed label for one activity entry.
 pub fn kind_label(kind: ActivityKind) -> &'static str {
     match kind {
-        ActivityKind::Uploaded => "uploaded",
-        ActivityKind::Downloaded => "downloaded",
-        ActivityKind::Trashed => "trashed",
-        ActivityKind::Conflict => "conflict",
-        ActivityKind::GuardPaused => "guard paused",
-        ActivityKind::UploadErrored => "upload error",
+        ActivityKind::Uploaded => "Uploaded",
+        ActivityKind::Downloaded => "Downloaded",
+        ActivityKind::Trashed => "Trashed",
+        ActivityKind::Conflict => "Conflict",
+        ActivityKind::GuardPaused => "Guard paused",
+        ActivityKind::UploadErrored => "Upload error",
     }
 }
 
@@ -290,15 +391,6 @@ pub fn format_time(unix: i64) -> String {
                 .to_string()
         })
         .unwrap_or_default()
-}
-
-/// The sync root: `$PDS_SYNC_ROOT` or `~/ProtonDrive`.
-pub fn sync_root() -> PathBuf {
-    if let Some(dir) = std::env::var_os("PDS_SYNC_ROOT") {
-        return PathBuf::from(dir);
-    }
-    let home = std::env::var_os("HOME").expect("HOME not set");
-    PathBuf::from(home).join("ProtonDrive")
 }
 
 #[cfg(test)]
@@ -327,7 +419,7 @@ mod tests {
 
     #[test]
     fn auth_flow_drives_phases() {
-        let mut s = ModelState::new(PathBuf::from("/tmp/root"));
+        let mut s = AppState::new(PathBuf::from("/tmp/root"));
         assert_eq!(s.phase, Phase::Starting);
 
         apply(&mut s, &AppUpdate::AuthRequired);
@@ -358,7 +450,7 @@ mod tests {
 
     #[test]
     fn login_failure_allows_retry() {
-        let mut s = ModelState::new(PathBuf::from("/tmp/root"));
+        let mut s = AppState::new(PathBuf::from("/tmp/root"));
         apply(&mut s, &AppUpdate::AuthRequired);
         apply(&mut s, &AppUpdate::LoginStarted);
         apply(
@@ -368,7 +460,6 @@ mod tests {
             },
         );
         assert_eq!(s.login, LoginState::Failed("denied".into()));
-        // Retry goes back to waiting.
         apply(&mut s, &AppUpdate::LoginStarted);
         assert_eq!(s.login, LoginState::Waiting);
     }
@@ -389,23 +480,48 @@ mod tests {
     }
 
     #[test]
-    fn pause_label_and_toggle_flip_with_engine_state() {
-        let mut s = ModelState::new(PathBuf::from("/tmp/root"));
-        // No status yet: offer Resume (harmless no-op on a running engine).
-        assert_eq!(pause_label(&s), "Resume Syncing");
+    fn activity_filters_narrow_the_feed() {
+        let mut s = AppState::new(PathBuf::from("/tmp/root"));
+        for (kind, path) in [
+            (ActivityKind::Uploaded, "up"),
+            (ActivityKind::Downloaded, "down"),
+            (ActivityKind::Trashed, "gone"),
+            (ActivityKind::Conflict, "clash"),
+            (ActivityKind::UploadErrored, "bad"),
+        ] {
+            apply(&mut s, &AppUpdate::Activity(item(kind, path)));
+        }
+
+        assert_eq!(s.activity_count(ActivityFilter::All), 5);
+        assert_eq!(s.activity_count(ActivityFilter::Uploads), 1);
+        assert_eq!(s.activity_count(ActivityFilter::Downloads), 1);
+        assert_eq!(s.activity_count(ActivityFilter::Deletes), 1);
+        assert_eq!(s.activity_count(ActivityFilter::Conflicts), 1);
+        assert_eq!(s.activity_count(ActivityFilter::Problems), 1);
+        assert_eq!(s.filtered_activity(ActivityFilter::Conflicts)[0].path, "clash");
+    }
+
+    #[test]
+    fn pause_label_flips_with_engine_state() {
+        let mut s = AppState::new(PathBuf::from("/tmp/root"));
+        assert_eq!(pause_label(&s), "Starting…");
 
         apply(&mut s, &AppUpdate::Status(status(EngineState::Running)));
-        assert_eq!(pause_label(&s), "Pause Syncing");
-        assert_eq!(toggle_command(&s), UiCommand::Pause);
+        assert_eq!(pause_label(&s), "Pause syncing");
+        assert!(!s.is_paused());
 
         apply(&mut s, &AppUpdate::Status(status(EngineState::Paused)));
-        assert_eq!(pause_label(&s), "Resume Syncing");
-        assert_eq!(toggle_command(&s), UiCommand::Resume);
+        assert_eq!(pause_label(&s), "Resume syncing");
+        assert!(s.is_paused());
+
+        apply(&mut s, &AppUpdate::Status(status(EngineState::GuardPaused)));
+        assert_eq!(pause_label(&s), "Review and resume");
+        assert!(s.is_paused());
     }
 
     #[test]
     fn badge_reflects_guard_pause() {
-        let mut s = ModelState::new(PathBuf::from("/tmp/root"));
+        let mut s = AppState::new(PathBuf::from("/tmp/root"));
         apply(
             &mut s,
             &AppUpdate::EngineStarted {
@@ -413,12 +529,12 @@ mod tests {
             },
         );
         apply(&mut s, &AppUpdate::Status(status(EngineState::GuardPaused)));
-        assert_eq!(badge(&s), "paused — mass-delete guard");
+        assert_eq!(badge(&s), "Delete guard");
     }
 
     #[test]
     fn unexpected_exit_is_fatal_but_requested_quit_is_not() {
-        let mut s = ModelState::new(PathBuf::from("/tmp/root"));
+        let mut s = AppState::new(PathBuf::from("/tmp/root"));
         apply(
             &mut s,
             &AppUpdate::Exited {
@@ -428,7 +544,7 @@ mod tests {
         assert_eq!(s.phase, Phase::Failed);
         assert!(s.fatal.as_deref().unwrap().contains("sidecar died"));
 
-        let mut s = ModelState::new(PathBuf::from("/tmp/root"));
+        let mut s = AppState::new(PathBuf::from("/tmp/root"));
         s.quitting = true;
         apply(
             &mut s,
@@ -441,8 +557,7 @@ mod tests {
 
     #[test]
     fn sign_out_flow_returns_to_login() {
-        let mut s = ModelState::new(PathBuf::from("/tmp/root"));
-        // Signed in and running, with some session state accumulated.
+        let mut s = AppState::new(PathBuf::from("/tmp/root"));
         apply(
             &mut s,
             &AppUpdate::EngineStarted {
@@ -462,17 +577,15 @@ mod tests {
             },
         );
 
-        // signed-in -> confirming
-        s.begin_sign_out();
+        s.open_sign_out();
         assert_eq!(s.sign_out, SignOutState::Confirming);
-        // cancel path
         s.cancel_sign_out();
         assert_eq!(s.sign_out, SignOutState::None);
-        // confirming -> confirmed (in progress) -> signed out
-        s.begin_sign_out();
+
+        s.open_sign_out();
         s.confirm_sign_out();
         assert_eq!(s.sign_out, SignOutState::InProgress);
-        assert_eq!(s.phase, Phase::Running); // engine still up during logout
+        assert_eq!(s.phase, Phase::Running);
 
         apply(&mut s, &AppUpdate::SignedOut);
         assert_eq!(s.phase, Phase::NeedsLogin);
@@ -486,17 +599,17 @@ mod tests {
     }
 
     #[test]
-    fn begin_sign_out_requires_running_phase() {
-        let mut s = ModelState::new(PathBuf::from("/tmp/root"));
-        s.begin_sign_out(); // phase == Starting: nothing to sign out of
+    fn open_sign_out_requires_running_phase() {
+        let mut s = AppState::new(PathBuf::from("/tmp/root"));
+        s.open_sign_out();
         assert_eq!(s.sign_out, SignOutState::None);
-        s.confirm_sign_out(); // no-op without Confirming
+        s.confirm_sign_out();
         assert_eq!(s.sign_out, SignOutState::None);
     }
 
     #[test]
     fn inbox_replaces_conflicts_and_errors() {
-        let mut s = ModelState::new(PathBuf::from("/tmp/root"));
+        let mut s = AppState::new(PathBuf::from("/tmp/root"));
         apply(
             &mut s,
             &AppUpdate::Inbox {
@@ -505,7 +618,7 @@ mod tests {
             },
         );
         assert_eq!(s.conflicts, ["a.txt"]);
-        assert_eq!(s.errored.len(), 1);
+        assert_eq!(s.attention_count(), 2);
         apply(
             &mut s,
             &AppUpdate::Inbox {

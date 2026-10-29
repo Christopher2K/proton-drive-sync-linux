@@ -10,8 +10,7 @@ name = "proton-drive-sync"
 path = "src/main.rs"
 
 [dependencies]
-gpui = { version = "0.2", features = ["runtime_shaders"] }
-gpui-tray = "0.3"
+gpui = "0.2"
 pds-core.workspace = true
 pds-sidecar-client.workspace = true
 tokio.workspace = true

@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128">
+  <!-- App icon: a drive/cloud mark in the app's accent blue on the dark
+       surface colour (see crates/app/src/theme.rs). -->
+  <rect width="128" height="128" rx="24" fill="#101218"/>
+  <g fill="none" stroke="#5b8def" stroke-width="7" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M40 78a16 16 0 0 1 2-31.8 22 22 0 0 1 42.6-5.4A17 17 0 0 1 90 74"/>
+    <path d="M64 88l14-14M64 88L50 74M64 88v24"/>
+  </g>
+</svg>

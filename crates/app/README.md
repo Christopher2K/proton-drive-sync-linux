@@ -1,26 +1,34 @@
-# pds-app — `proton-drive-sync` desktop shell (M2)
+# pds-app — `proton-drive-sync` Linux desktop app (M2)
 
-Windowless menu-bar app embedding the M1 sync engine in-process, built with
-upstream `gpui 0.2` + `gpui-tray 0.3` (see `docs/research/gpui.md`).
+Native Linux GPUI application embedding the M1 sync engine, single main
+window with sidebar navigation (upstream `gpui 0.2`, Wayland/X11).
 
-- Tray icon with **Open Status / Pause|Resume Syncing / Quit** (label flips
-  via `Tray::refresh_menu`; the menu rebuilds itself from app state after
-  every click and on each engine status tick).
-- **Login view** when the sidecar has no session: mandated disclosure text,
-  "Sign in with Proton" → `auth.loginFork`, shows the URL + user code from
-  `auth.signInUrl` and opens the URL in the system browser.
-- **Status window**: account email, engine state badge (running / paused /
-  guard-paused), synced/pending/deletes/conflicts/errors counts, a big
-  pause/resume toggle, a virtualized activity feed (uploaded, downloaded,
-  trashed, conflict, guard, upload-error entries with timestamps), a
-  conflicts + failed-uploads inbox (scanned from the state DB), and the sync
-  root in the footer.
-- Closing windows never quits the app; the tray owns the lifetime. Quit
-  asks the engine to shut down gracefully (3 s fallback force-quit).
+- **Login view** when the sidecar has no session: mandated disclosure text
+  ("This is a third-party application not officially supported by Proton."),
+  **Sign in with Proton** → `auth.loginFork`, shows the URL + user code from
+  `auth.signInUrl` and opens the URL in the system browser (`xdg-open`).
+- **Overview**: account, engine state badge, sync counts, big pause/resume
+  toggle, delete-guard banner when the guard tripped.
+- **Activity**: feed of uploads, downloads, trashes, conflicts, guard and
+  upload-error entries with timestamps and filters.
+- **Conflicts**: conflicts + failed uploads inbox (scanned from the state
+  DB), with reveal-in-file-manager actions.
+- **Settings**: sync root, sidecar override, engine details.
+- **Sign-out** (sidebar footer) asks for confirmation, stops the engine
+  gracefully, calls `auth.logout` (deletes the session server-side and wipes
+  `session.json`), then returns to the login view. Files on disk and the
+  local state DB are kept.
+- Closing the window quits gracefully: close is vetoed, the engine is asked
+  to shut down, and the app exits when it reports back (3 s fallback).
+
+Layout: `main.rs` (window + CLI) · `ui/` (pages + shell) · `state.rs` (pure
+state + reducer, tested) · `engine.rs` (tokio engine thread) ·
+`components.rs`/`theme.rs` (design system) · `actions.rs` (key bindings) ·
+`platform.rs` (XDG paths, `xdg-open`).
 
 ## Run it (dev)
 
-From the **repository root** (the sidecar path is resolved relative to the
+From the **repository root** (the sidecar is discovered relative to the
 working directory):
 
 ```sh
@@ -33,34 +41,23 @@ Environment knobs:
 |---|---|
 | `PDS_SYNC_ROOT` | Sync folder (default: `~/ProtonDrive`, created if missing) |
 | `PDS_SIDECAR_CMD` | Sidecar command override, e.g. `node sidecar/dist/index.js` |
+| `PDS_SIDECAR_DIR` | Sidecar directory override for auto-discovery |
 | `PDS_DEBUG_SIGNOUT` | Dev hook: confirm sign-out automatically once the engine runs (real logout — the session is deleted!) |
 | `RUST_LOG` | Log filter (default `info,pds_core=debug`), logs go to stderr |
 
-Signing out (tray **Sign Out…** or the status-window footer) asks for
-confirmation, stops the engine gracefully, calls `auth.logout` (deletes the
-session server-side and wipes `session.json`), then returns to the login
-view so a different account can sign in immediately. Files on disk and the
-local state DB are kept.
+## Headless smoke proof (no display needed)
 
-First run: the login window opens, click **Sign in with Proton**, finish in
-the browser; the status window appears once the engine starts.
-
-## Headless smoke proof (no GUI interaction)
-
-Boots the app with `Application::headless()`, builds the tray, runs the
-event loop briefly, and quits — proves the binary links and starts:
+Boots the GPUI event loop without a window and quits — proves the binary
+links and the platform backend initializes (use under `xvfb-run` on
+headless machines):
 
 ```sh
-PDS_HEADLESS_PROOF=1 ./target/debug/proton-drive-sync
-# headless proof: tray built
+xvfb-run -a target/debug/proton-drive-sync --headless
 # headless proof: event loop OK
 ```
 
-## Build notes
+## Window identity
 
-- gpui's Metal shaders are compiled **at runtime** (`runtime_shaders`
-  feature) because this machine has no full Xcode (no `metal` CLI). Runtime
-  compilation uses the Metal framework and works without Xcode; the cost is
-  a small startup delay. With Xcode installed the feature can be dropped.
-- Shipping as a real menu-bar app (no Dock icon) needs a `.app` bundle with
-  `LSUIElement=YES` — see gpui.md §6 for the minimal `Info.plist`.
+The window sets the Wayland app id / X11 WM_CLASS to `proton-drive-sync`,
+matching `packaging/linux/proton-drive-sync.desktop` (`StartupWMClass`) so
+desktop shells associate the window with the installed icon.

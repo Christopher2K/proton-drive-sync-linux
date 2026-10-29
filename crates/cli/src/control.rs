@@ -49,10 +49,7 @@ fn data_dir() -> PathBuf {
         return PathBuf::from(xdg).join("proton-drive-sync");
     }
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-    #[cfg(target_os = "macos")]
-    return PathBuf::from(home).join("Library/Application Support/proton-drive-sync");
-    #[cfg(not(target_os = "macos"))]
-    return PathBuf::from(home).join(".local/share/proton-drive-sync");
+    PathBuf::from(home).join(".local/share/proton-drive-sync")
 }
 
 // --- root registry -----------------------------------------------------

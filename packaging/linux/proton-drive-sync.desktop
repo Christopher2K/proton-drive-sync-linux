@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Proton Drive Sync
+GenericName=File Synchronizer
+Comment=Sync a folder with Proton Drive (unofficial)
+Exec=proton-drive-sync
+Icon=proton-drive-sync
+Terminal=false
+Categories=Network;FileTransfer;
+Keywords=proton;drive;sync;files;backup;
+StartupNotify=true
+StartupWMClass=proton-drive-sync

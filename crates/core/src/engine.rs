@@ -535,6 +535,9 @@ impl<S: SidecarApi + 'static> Engine<S> {
     // ------------------------------------------------------------------
 
     async fn handle_fs_batch(&mut self, events: Vec<DebouncedEvent>) -> Result<()> {
+        // Queue of (rel, is_dir) to process, parent dirs before their
+        // children so uploads can rely on the remote folder chain.
+        let mut queue: Vec<(String, bool)> = Vec::new();
         let mut seen = HashSet::new();
         for ev in events {
             let path = ev.path;
@@ -552,6 +555,24 @@ impl<S: SidecarApi + 'static> Engine<S> {
                 continue; // our own / the sidecar's transient transfer files
             }
             if abs.is_dir() {
+                // A directory that is new to the DB may have been created
+                // together with its contents; inotify attached its recursive
+                // watch too late and drops the children's events (FSEvents
+                // replays them, so this only bites Linux). Sweep the live
+                // subtree now; `seen` dedups against the batch's own events.
+                let known = self.db.node_by_path(&rel)?.is_some();
+                queue.push((rel.clone(), true));
+                if !known {
+                    self.sweep_new_dir(&rel, &mut seen, &mut queue);
+                }
+            } else {
+                // File, or already gone (the delete path re-checks liveness).
+                queue.push((rel, false));
+            }
+        }
+        for (rel, is_dir) in queue {
+            let abs = to_abs(&self.root, &rel);
+            if is_dir {
                 self.ensure_remote_folder_async(&rel).await?;
             } else if abs.is_file() {
                 self.upsert_local_file(&rel).await?;
@@ -560,6 +581,33 @@ impl<S: SidecarApi + 'static> Engine<S> {
             }
         }
         Ok(())
+    }
+
+    /// Collect the live children of `rel` (recursively, parent-first) that
+    /// are not already in `seen`. Recovers the inotify recursive-watch race:
+    /// contents created in the same breath as their parent folder never
+    /// produce watcher events of their own.
+    fn sweep_new_dir(&self, rel: &str, seen: &mut HashSet<String>, queue: &mut Vec<(String, bool)>) {
+        let entries = match std::fs::read_dir(to_abs(&self.root, rel)) {
+            Ok(entries) => entries,
+            Err(_) => return, // vanished or unreadable: nothing to recover
+        };
+        for entry in entries.flatten() {
+            let child_rel = format!("{rel}/{}", entry.file_name().to_string_lossy());
+            if child_rel == STATE_DIR || child_rel.starts_with(&format!("{STATE_DIR}/")) {
+                continue;
+            }
+            if is_temp_file(&child_rel) || !seen.insert(child_rel.clone()) {
+                continue;
+            }
+            // DirEntry::metadata does not follow symlinks: linked dirs are
+            // not walked (no loops), linked files upload as regular files.
+            let is_dir = entry.metadata().map(|m| m.is_dir()).unwrap_or(false);
+            queue.push((child_rel.clone(), is_dir));
+            if is_dir {
+                self.sweep_new_dir(&child_rel, seen, queue);
+            }
+        }
     }
 
     /// Earliest backoff expiry among scheduled retries, if any. Stale

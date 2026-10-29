@@ -1,29 +1,58 @@
-//! The tokio side of the shell: owns a dedicated runtime thread that spawns
-//! the sidecar, drives login, runs the M1 sync engine, and streams
-//! status/activity/inbox updates to the UI. The UI talks back through an
-//! unbounded command channel — the [`EngineHandle`] never leaves this
-//! thread, so the UI crate never touches tokio types.
+//! The tokio side of the desktop app.
+//!
+//! A single dedicated thread owns the Node sidecar and the sync engine. The
+//! GPUI thread never touches tokio types: commands go out through an mpsc
+//! channel and progress comes back as [`AppUpdate`] values. This keeps the UI
+//! responsive even while a large transfer or a key-unlock operation is in
+//! flight.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result};
 use pds_core::{Db, Engine, EngineConfig, RETRY_BASE_DEFAULT, STATE_DIR};
+use pds_sidecar_client::types::error_codes;
 use pds_sidecar_client::{Notification, SidecarApi, spawn::spawn_sidecar};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tracing::{info, warn};
 
-use crate::model::{AppUpdate, UiCommand};
+use crate::state::AppUpdate;
 
-/// Start the engine thread. Returns immediately; progress arrives as
-/// [`AppUpdate`]s. Dropping `cmds` (app quit) shuts the engine down.
-pub fn start_engine_runtime(
+/// Commands the UI sends to the background engine thread.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UiCommand {
+    /// Start the browser fork-login flow (only valid while signed out).
+    StartLogin,
+    Pause,
+    Resume,
+    /// Confirmed sign-out: stop the engine, call `auth.logout`, and return to
+    /// the sign-in screen.
+    SignOut,
+    Shutdown,
+}
+
+/// Cloneable handle to the background thread.
+#[derive(Clone)]
+pub struct EngineService {
+    tx: UnboundedSender<UiCommand>,
+}
+
+impl EngineService {
+    pub fn send(&self, cmd: UiCommand) {
+        let _ = self.tx.send(cmd);
+    }
+}
+
+/// Start the sidecar + engine thread. Returns immediately; all progress is
+/// reported through `updates`.
+pub fn start(
     root: PathBuf,
     sidecar_cmd: Option<String>,
     updates: UnboundedSender<AppUpdate>,
-    cmds: UnboundedReceiver<UiCommand>,
-) {
+) -> EngineService {
+    let (tx, cmds) = tokio::sync::mpsc::unbounded_channel();
+
     std::thread::Builder::new()
         .name("pds-engine".into())
         .spawn(move || {
@@ -35,11 +64,12 @@ pub fn start_engine_runtime(
                 Ok(rt) => rt,
                 Err(e) => {
                     let _ = updates.send(AppUpdate::Failed {
-                        error: format!("tokio runtime: {e}"),
+                        error: format!("could not start the async runtime: {e}"),
                     });
                     return;
                 }
             };
+
             rt.block_on(async move {
                 if let Err(e) = run(root, sidecar_cmd, &updates, cmds).await {
                     let _ = updates.send(AppUpdate::Failed {
@@ -49,15 +79,16 @@ pub fn start_engine_runtime(
             });
         })
         .expect("spawn engine thread");
+
+    EngineService { tx }
 }
 
 /// Why an engine session ended.
 enum EngineExit {
-    /// App is quitting (`UiCommand::Shutdown` / UI gone) or the engine task
-    /// ended on its own. Carries the human-readable reason for `Exited`.
+    /// App is quitting, or the engine task ended on its own.
     Quit(String),
-    /// `UiCommand::SignOut`: engine already shut down; caller performs
-    /// `auth.logout` and loops back to the login flow.
+    /// `UiCommand::SignOut`: engine already stopped; the caller logs out and
+    /// loops back to the sign-in flow.
     SignOut,
 }
 
@@ -68,8 +99,8 @@ async fn run(
     mut cmds: UnboundedReceiver<UiCommand>,
 ) -> Result<()> {
     // Session loop: sign-out drops the sidecar (its notification stream is
-    // consumed by the engine and can't be reclaimed) and restarts the whole
-    // stack into the login flow, so a different account can sign in.
+    // consumed by the engine and can't be reclaimed) and restarts into the
+    // login flow so a different account can sign in.
     loop {
         let (mut client, child) = spawn_sidecar(sidecar_cmd.as_deref())?;
         let mut notifications = client.take_notifications();
@@ -84,7 +115,15 @@ async fn run(
             email
         } else {
             let _ = updates.send(AppUpdate::AuthRequired);
-            login_flow(client.as_ref(), &mut notifications, &mut cmds, updates).await?
+            match login_flow(client.as_ref(), &mut notifications, &mut cmds, updates).await? {
+                Some(email) => email,
+                None => {
+                    let _ = updates.send(AppUpdate::Exited {
+                        reason: "shutdown".into(),
+                    });
+                    return Ok(());
+                }
+            }
         };
         info!(email = %email, root = %root.display(), "starting sync engine");
 
@@ -106,20 +145,17 @@ async fn run(
                 return Ok(());
             }
             EngineExit::SignOut => {
-                // Engine is already stopped (graceful shutdown above).
-                // auth.logout DELETEs the session server-side and wipes
-                // session.json; 1001 (already gone) or any other failure
-                // still proceeds — the local state is signed out either way
-                // (the sidecar wipes session.json even on API failure).
+                // The engine is already stopped (graceful shutdown above).
+                // `auth.logout` deletes the session server-side and wipes
+                // session.json; a 1001 "already gone" is success enough.
                 match client.logout().await {
                     Ok(()) => info!("signed out"),
-                    Err(e)
-                        if e.code()
-                            == Some(pds_sidecar_client::types::error_codes::AUTH_REQUIRED) =>
-                    {
+                    Err(e) if e.code() == Some(error_codes::AUTH_REQUIRED) => {
                         info!("auth.logout: session already gone (1001), proceeding");
                     }
-                    Err(e) => warn!("auth.logout failed ({e}); proceeding to signed-out state"),
+                    Err(e) => {
+                        warn!("auth.logout failed ({e}); proceeding to signed-out state")
+                    }
                 }
                 drop(child); // kill_on_drop: stop the old sidecar process
                 let _ = updates.send(AppUpdate::SignedOut);
@@ -128,8 +164,7 @@ async fn run(
     }
 }
 
-/// Run the engine session until a UI command or engine exit ends it.
-/// Handles the 1 s status/inbox polling and the activity feed.
+/// Run one engine session until a UI command or engine exit ends it.
 async fn drive_engine(
     engine: Engine<pds_sidecar_client::SidecarClient>,
     handle: pds_core::EngineHandle,
@@ -146,10 +181,14 @@ async fn drive_engine(
         tokio::select! {
             cmd = cmds.recv() => match cmd {
                 Some(UiCommand::Pause) => {
-                    let _ = handle.pause().await;
+                    if let Err(e) = handle.pause().await {
+                        warn!("pause: {e}");
+                    }
                 }
                 Some(UiCommand::Resume) => {
-                    let _ = handle.resume().await;
+                    if let Err(e) = handle.resume().await {
+                        warn!("resume: {e}");
+                    }
                 }
                 Some(UiCommand::Shutdown) | None => {
                     let _ = handle.shutdown().await;
@@ -163,7 +202,7 @@ async fn drive_engine(
                     info!(reason = %engine_result(res), "engine stopped for sign-out");
                     return EngineExit::SignOut;
                 }
-                Some(UiCommand::StartLogin) => {} // already logged in
+                Some(UiCommand::StartLogin) => {} // already signed in
             },
             item = activity_rx.recv() => match item {
                 Ok(item) => {
@@ -197,9 +236,7 @@ fn engine_result(res: Result<Result<()>, tokio::task::JoinError>) -> String {
     }
 }
 
-/// Scan the state DB for the conflicts/errors inbox. The DB is opened once
-/// and reopened on failure; a busy/locked tick just sends empty lists less
-/// often — the next tick fills in.
+/// Scan the state DB for the conflicts/errors inbox.
 fn poll_inbox(db: &mut Option<Db>, db_path: &Path, updates: &UnboundedSender<AppUpdate>) {
     if db.is_none() {
         *db = Db::open(db_path).ok();
@@ -226,22 +263,21 @@ fn poll_inbox(db: &mut Option<Db>, db_path: &Path, updates: &UnboundedSender<App
     let _ = updates.send(AppUpdate::Inbox { conflicts, errored });
 }
 
-/// Drive `auth.loginFork` until it succeeds or the app shuts down. The
-/// `auth.signInUrl` notification is forwarded so the UI can display/open
-/// it; other notifications can't meaningfully arrive before the engine
-/// starts (no event scopes, no transfers) and are logged.
+/// Drive `auth.loginFork` until it succeeds or the app shuts down.
+/// `Ok(None)` means the app asked to quit before login completed.
 async fn login_flow(
     client: &impl SidecarApi,
     notifications: &mut tokio::sync::mpsc::Receiver<Notification>,
     cmds: &mut UnboundedReceiver<UiCommand>,
     updates: &UnboundedSender<AppUpdate>,
-) -> Result<String> {
+) -> Result<Option<String>> {
     loop {
         match cmds.recv().await {
             Some(UiCommand::StartLogin) => {
                 let _ = updates.send(AppUpdate::LoginStarted);
                 match await_login(client, notifications, cmds, updates).await {
-                    Ok(email) => return Ok(email),
+                    Ok(Some(email)) => return Ok(Some(email)),
+                    Ok(None) => return Ok(None),
                     Err(e) => {
                         let _ = updates.send(AppUpdate::LoginFailed {
                             error: format!("{e:#}"),
@@ -249,9 +285,7 @@ async fn login_flow(
                     }
                 }
             }
-            Some(UiCommand::Shutdown) | None => {
-                return Err(anyhow!("shutdown before login completed"));
-            }
+            Some(UiCommand::Shutdown) | None => return Ok(None),
             _ => {}
         }
     }
@@ -262,12 +296,12 @@ async fn await_login(
     notifications: &mut tokio::sync::mpsc::Receiver<Notification>,
     cmds: &mut UnboundedReceiver<UiCommand>,
     updates: &UnboundedSender<AppUpdate>,
-) -> Result<String> {
+) -> Result<Option<String>> {
     let login = client.login_fork();
     tokio::pin!(login);
     loop {
         tokio::select! {
-            res = &mut login => return res.map_err(|e| anyhow!("{e}")),
+            res = &mut login => return Ok(Some(res.map_err(|e| anyhow::anyhow!("{e}"))?)),
             n = notifications.recv() => match n {
                 Some(Notification::AuthSignInUrl { url, user_code }) => {
                     let _ = updates.send(AppUpdate::LoginUrl { url, user_code });
@@ -275,14 +309,10 @@ async fn await_login(
                 Some(other) => {
                     info!(notification = ?other, "notification during login ignored");
                 }
-                // The transport is shared: if the notification stream died,
-                // the pending login call is dead too.
-                None => return Err(anyhow!("sidecar connection lost during login")),
+                None => return Err(anyhow::anyhow!("sidecar connection lost during sign-in")),
             },
             cmd = cmds.recv() => match cmd {
-                Some(UiCommand::Shutdown) | None => {
-                    return Err(anyhow!("shutdown during login"));
-                }
+                Some(UiCommand::Shutdown) | None => return Ok(None),
                 _ => {}
             },
         }
