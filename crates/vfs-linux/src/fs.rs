@@ -457,6 +457,14 @@ impl fuser::Filesystem for PdsFs {
         // Kick the engine early; the bounded wait happens in read().
         if !content_ready && self.overlay_entry(&rel).is_none() {
             self.store.begin_hydrate(&rel);
+        } else {
+            // LRU touch (M3.2 eviction). Open-for-read of hydrated content.
+            self.store.record_access(&rel);
+        }
+        // Open files are never evicted; overlay (write-created) files are
+        // not tracked (they are never in the hydrated map).
+        if self.overlay_entry(&rel).is_none() {
+            self.store.add_open_handle(&rel);
         }
         reply.opened(FileHandle(0), FopenFlags::empty());
     }
@@ -475,6 +483,10 @@ impl fuser::Filesystem for PdsFs {
         let Some(rel) = self.rel_of_any(ino) else {
             return reply.error(Errno::ENOENT);
         };
+        // LRU touch on every read pass (cheap; open() covers the cold case).
+        if self.overlay_entry(&rel).is_none() {
+            self.store.record_access(&rel);
+        }
         let Some((is_dir, node_size, _mtime, _ready)) = self.node_meta(&rel) else {
             return reply.error(Errno::ENOENT);
         };
@@ -572,6 +584,14 @@ impl fuser::Filesystem for PdsFs {
         reply: ReplyEmpty,
     ) {
         debug!(fh = fh.0, "vfs: release");
+        // fh 0 = read open (tracked for eviction protection); fh ≥ 1 =
+        // write handle created by `create`.
+        if fh.0 == 0 {
+            if let Some(rel) = self.rel_of_any(ino) {
+                self.store.remove_open_handle(&rel);
+            }
+            return reply.ok();
+        }
         let handle = self.handles.lock().expect("handles mutex").remove(&fh.0);
         if let Some(h) = handle
             && h.dirty

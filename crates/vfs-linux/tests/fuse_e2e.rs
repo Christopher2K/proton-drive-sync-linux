@@ -50,6 +50,7 @@ async fn fuse_mount_serves_placeholders_and_hydrates() {
             db_path: root.join(STATE_DIR).join("state.db"),
             retry_base: pds_core::RETRY_BASE_DEFAULT,
             placeholders: true,
+            eviction_cap: None,
         },
     )
     .unwrap();

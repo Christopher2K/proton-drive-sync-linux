@@ -28,6 +28,10 @@ struct Fixture {
 }
 
 async fn start() -> Fixture {
+    start_with_cap(None).await
+}
+
+async fn start_with_cap(eviction_cap: Option<u64>) -> Fixture {
     init_logs();
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("sync");
@@ -42,6 +46,7 @@ async fn start() -> Fixture {
             db_path: root.join(STATE_DIR).join("state.db"),
             retry_base: pds_core::RETRY_BASE_DEFAULT,
             placeholders: true,
+            eviction_cap,
         },
     )
     .unwrap();
@@ -150,6 +155,98 @@ async fn vfs_snapshot_reflects_remote_events() {
     assert!(!fx.root.join("later.txt").exists());
     assert!(!fx.store.snapshot().by_path["later.txt"].content_ready);
     fx.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn pin_downloads_and_unpin_allows_eviction() {
+    // 1-byte cap: everything hydrated is over cap, so the pass after any
+    // hydration evicts everything not pinned/protected/open.
+    let fx = start_with_cap(Some(1)).await;
+    wait_for(|| fx.store.snapshot().by_path.contains_key("hello.txt")).await;
+
+    // Pin downloads immediately and the pin survives in the DB.
+    fx.handle.pin("hello.txt").await.unwrap();
+    wait_for(|| {
+        fx.store
+            .backing_path("hello.txt")
+            .map(|p| p.is_file())
+            .unwrap_or(false)
+    })
+    .await;
+
+    // Unpin; the next hydration evicts hello.txt (LRU, unpinned).
+    fx.handle.unpin("hello.txt").await.unwrap();
+    fx.mock.remote_create_file("root", "b.txt", b"bbbb");
+    wait_for(|| fx.store.snapshot().by_path.contains_key("b.txt")).await;
+    fx.store.begin_hydrate("b.txt");
+    wait_for(|| {
+        fx.store
+            .backing_path("b.txt")
+            .map(|p| p.is_file())
+            .unwrap_or(false)
+    })
+    .await;
+    wait_for(|| fx.store.backing_path("hello.txt").is_none()).await;
+    // Snapshot flips content_ready back off for the evicted file.
+    wait_for(|| !fx.store.snapshot().by_path["hello.txt"].content_ready).await;
+    fx.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn pinned_file_survives_eviction() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("sync");
+    std::fs::create_dir_all(&root).unwrap();
+    let (mut client, mock) = MockSidecar::new().connect();
+    mock.remote_create_file("root", "a.txt", b"aaa");
+    mock.remote_create_file("root", "b.txt", b"bbb");
+    let notifications = client.take_notifications();
+    let (engine, handle) = Engine::new(
+        Arc::new(client),
+        notifications,
+        EngineConfig {
+            root: root.clone(),
+            db_path: root.join(STATE_DIR).join("state.db"),
+            retry_base: pds_core::RETRY_BASE_DEFAULT,
+            placeholders: true,
+            eviction_cap: Some(1),
+        },
+    )
+    .unwrap();
+    let store = handle.store().cloned().unwrap();
+    let engine = tokio::spawn(engine.run());
+    wait_for(|| store.snapshot().by_path.contains_key("a.txt")).await;
+
+    handle.pin("a.txt").await.unwrap();
+    wait_for(|| {
+        store
+            .backing_path("a.txt")
+            .map(|p| p.is_file())
+            .unwrap_or(false)
+    })
+    .await;
+
+    // Hydrate b: eviction pass runs, but a.txt is pinned and stays.
+    store.begin_hydrate("b.txt");
+    wait_for(|| {
+        store
+            .backing_path("b.txt")
+            .map(|p| p.is_file())
+            .unwrap_or(false)
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        store
+            .backing_path("a.txt")
+            .map(|p| p.is_file())
+            .unwrap_or(false),
+        "pinned file must survive the eviction pass"
+    );
+    handle.shutdown().await.ok();
+    let _ = engine.await;
 }
 
 // Keep imports honest even if a test is skipped.

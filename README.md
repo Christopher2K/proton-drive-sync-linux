@@ -56,7 +56,7 @@ This installs the `proton-drive-sync` binary, the `pds` CLI, the sidecar (with v
 
 ## CLI companion
 
-`pds sync` runs the engine headless; `pds status|pause|resume` control a running engine; `pds conflicts` lists the conflict inbox. `pds mount <folder> <mountpoint>` serves a **placeholder view** of a sync root (requires `/dev/fuse`): files hydrate from Drive on first open, and files/folders you create through the mount upload to Drive on close (M3; snapshot-backed files are read-only for now). See `pds --help`.
+`pds sync` runs the engine headless; `pds status|pause|resume` control a running engine; `pds conflicts` lists the conflict inbox. `pds mount <folder> <mountpoint>` serves a **placeholder view** of a sync root (requires `/dev/fuse`): files hydrate from Drive on first open, and files/folders you create through the mount upload to Drive on close (M3; snapshot-backed files are read-only for now). Hydrated content is an LRU cache capped at 10 GiB — `pds pin <folder> <path>` keeps a file (or folder, recursively) offline-safe, `pds unpin` releases it. See `pds --help`.
 
 ## Testing
 

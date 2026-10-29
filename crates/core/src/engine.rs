@@ -19,7 +19,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use notify::{RecommendedWatcher, RecursiveMode};
 use notify_debouncer_mini::{DebouncedEvent, Debouncer, new_debouncer};
 use pds_sidecar_client::{
@@ -86,6 +86,17 @@ pub enum Command {
     Resume,
     Shutdown,
     Status(oneshot::Sender<EngineStatus>),
+    /// Keep `rel`'s content in the backing cache (download if missing).
+    Pin(String, oneshot::Sender<Result<()>>),
+    /// Drop the pin; the file becomes evictable again.
+    Unpin(String, oneshot::Sender<Result<()>>),
+}
+
+/// A queued pin command awaiting its (async) hydration.
+struct PinRequest {
+    rel: String,
+    reply: oneshot::Sender<Result<()>>,
+    pin: bool,
 }
 /// What kind of user-visible thing happened (activity feed, SPEC.md §6).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -153,6 +164,29 @@ impl EngineHandle {
         rx.await.context("engine gone")
     }
 
+    /// Pin a file's content in the backing cache (placeholder mode). The
+    /// engine downloads it if not hydrated. Fails on unknown paths and in
+    /// materialized mode.
+    pub async fn pin(&self, rel: &str) -> Result<()> {
+        let (tx, rx) = oneshot::channel();
+        self.tx
+            .send(Command::Pin(rel.to_string(), tx))
+            .await
+            .context("engine gone")?;
+        rx.await.context("engine gone")?
+    }
+
+    /// Drop a pin set via [`EngineHandle::pin`]. The file stays hydrated
+    /// until the eviction pass picks it.
+    pub async fn unpin(&self, rel: &str) -> Result<()> {
+        let (tx, rx) = oneshot::channel();
+        self.tx
+            .send(Command::Unpin(rel.to_string(), tx))
+            .await
+            .context("engine gone")?;
+        rx.await.context("engine gone")?
+    }
+
     /// Subscribe to the engine's activity feed (uploaded / downloaded /
     /// trashed / conflict / guard / error entries). Lagging receivers skip
     /// ahead (`broadcast::error::RecvError::Lagged`) — the feed is
@@ -174,7 +208,15 @@ pub struct EngineConfig {
     /// a FUSE filesystem serves them with on-demand hydration via
     /// [`EngineHandle::store`]. Default `false` (proven materialized mode).
     pub placeholders: bool,
+    /// Backing-cache size cap for placeholder mode (M3.2 eviction). When
+    /// hydrated content exceeds this, the least-recently-used files are
+    /// dehydrated (backing content deleted; placeholder stays). `None`
+    /// disables eviction (tests, explicit opt-out).
+    pub eviction_cap: Option<u64>,
 }
+
+/// Default backing-cache cap: 10 GiB (SPEC F5).
+pub const EVICTION_CAP_DEFAULT: u64 = 10 * 1024 * 1024 * 1024;
 
 /// Outcome of a finished transfer relevant to the caller.
 struct TransferOutcome {
@@ -236,6 +278,8 @@ pub struct Engine<S: SidecarApi> {
     store: Option<Store>,
     /// Hydrated file contents live here, outside the FUSE-visible root.
     backing_dir: PathBuf,
+    /// Backing-cache size cap (placeholder mode). `None` disables eviction.
+    eviction_cap: Option<u64>,
     notifications: mpsc::Receiver<Notification>,
     backlog: VecDeque<Notification>,
     cmd_rx: mpsc::Receiver<Command>,
@@ -258,6 +302,8 @@ pub struct Engine<S: SidecarApi> {
     retry_base: Duration,
     /// In-flight transfer currently being awaited (for pause/resume).
     active_transfer: Option<String>,
+    /// Pin commands queued from the control socket, awaiting async drain.
+    pending_pins: VecDeque<PinRequest>,
     /// Set when Shutdown arrived mid-transfer; the main loop exits ASAP.
     shutting_down: bool,
     /// Set once `run()` has been entered.
@@ -291,6 +337,7 @@ impl<S: SidecarApi + 'static> Engine<S> {
             placeholders,
             store,
             backing_dir: config.root.join(".pds-vfs-backing"),
+            eviction_cap: config.eviction_cap,
             notifications,
             backlog: VecDeque::new(),
             cmd_rx,
@@ -302,6 +349,7 @@ impl<S: SidecarApi + 'static> Engine<S> {
             retry_base: config.retry_base,
             scope_id: None,
             active_transfer: None,
+            pending_pins: VecDeque::new(),
             shutting_down: false,
             started: AtomicBool::new(false),
             activity_tx: activity_tx.clone(),
@@ -403,8 +451,19 @@ impl<S: SidecarApi + 'static> Engine<S> {
             // Placeholder mode: download requested files (M3 hydration).
             if self.store.is_some() {
                 let store = self.store.clone().expect("store checked above");
+                // Pins queue downloads too; drain them first so a just-pinned
+                // file hydrates before unrelated requests.
+                if let Some(req) = self.pending_pins.pop_front() {
+                    let rel = req.rel.clone();
+                    let result = if req.pin { self.pin_file(&rel).await } else { Ok(()) };
+                    let _ = req.reply.send(result);
+                    continue;
+                }
                 if let Some(rel) = store.next_hydrate_request() {
                     self.hydrate_one(&store, &rel).await;
+                    // Hydration may have pushed the cache over the cap;
+                    // the fresh file itself is protected from eviction.
+                    self.maybe_evict(&store, &rel);
                     continue;
                 }
                 if let Some(rel) = store.next_write_request() {
@@ -1440,6 +1499,61 @@ impl<S: SidecarApi + 'static> Engine<S> {
         store.finish_hydrate(rel, true);
     }
 
+    /// Eviction pass (M3.2): while hydrated content exceeds the cap,
+    /// dehydrate the least-recently-used files. Never touches pinned,
+    /// dirty/un-uploaded (sync_state != Synced covers write-through
+    /// files until their upload lands), or currently open files; never
+    /// evicts the file that just hydrated. Runs on the idle path of the
+    /// main loop (single-threaded engine → no hydration race).
+    fn maybe_evict(&mut self, store: &Store, protect: &str) {
+        let Some(cap) = self.eviction_cap else {
+            return;
+        };
+        let Ok(rows) = self.db.all_nodes() else {
+            return;
+        };
+        let by_path: HashMap<&str, &NodeRow> =
+            rows.iter().map(|r| (r.local_path.as_str(), r)).collect();
+        let total: u64 = store
+            .hydrated_by_age()
+            .iter()
+            .filter_map(|(rel, _)| by_path.get(rel.as_str()).and_then(|r| r.size))
+            .map(|s| s.max(0) as u64)
+            .sum();
+        if total <= cap {
+            return;
+        }
+        let mut total = total;
+        for (rel, _age) in store.hydrated_by_age() {
+            if total <= cap {
+                break;
+            }
+            if rel == protect {
+                continue;
+            }
+            let Some(row) = by_path.get(rel.as_str()) else {
+                // No row (stale backing entry after a delete): drop the file.
+                let _ = std::fs::remove_file(to_abs(&self.backing_dir, &rel));
+                store.clear_backing(&rel);
+                continue;
+            };
+            if row.pinned || row.sync_state != SyncState::Synced || store.is_open(&rel) {
+                continue;
+            }
+            let size = row.size.unwrap_or(0).max(0) as u64;
+            let abs = to_abs(&self.backing_dir, &rel);
+            if std::fs::remove_file(&abs).is_ok() {
+                store.clear_backing(&rel);
+                total = total.saturating_sub(size);
+                debug!(path = %rel, bytes = size, "dehydrated (LRU eviction)");
+            }
+        }
+        // Snapshot so content_ready flips back to placeholder immediately.
+        if let Err(e) = self.publish_vfs_snapshot(store) {
+            warn!(error = %e, "post-evict VFS snapshot failed");
+        }
+    }
+
     /// Download a node into the backing dir (placeholder mode). Same atomic
     /// tmp+rename pattern as [`Engine::download_file`], different target.
     async fn download_to_backing(&mut self, uid: &str, rel: &str) -> Result<()> {
@@ -1745,7 +1859,72 @@ impl<S: SidecarApi + 'static> Engine<S> {
                 });
             }
             Command::Shutdown => {}
+            Command::Pin(rel, reply) => {
+                // pin_file downloads, so it cannot run inline (non-async
+                // context): queue it and complete the reply when drained.
+                self.pending_pins.push_back(PinRequest {
+                    rel,
+                    reply,
+                    pin: true,
+                });
+            }
+            Command::Unpin(rel, reply) => {
+                let _ = reply.send(self.unpin_file(&rel));
+            }
         }
+        Ok(())
+    }
+
+    /// Pin: mark the row (and rows under it, for folders) `pinned` and make
+    /// sure the content is hydrated. Directories pin recursively — a pin is
+    /// "keep this subtree offline".
+    async fn pin_file(&mut self, rel: &str) -> Result<()> {
+        if !self.placeholders {
+            bail!("pins apply to placeholder (mount) mode");
+        }
+        let Some(row) = self.db.node_by_path(rel)? else {
+            bail!("unknown path `{rel}`");
+        };
+        let targets: Vec<String> = if row.is_file() {
+            vec![rel.to_string()]
+        } else {
+            self.db
+                .nodes_under(&format!("{rel}/%"))?
+                .into_iter()
+                .filter(|r| r.is_file())
+                .map(|r| r.local_path)
+                .chain(std::iter::once(rel.to_string()))
+                .collect()
+        };
+        for t in &targets {
+            self.db.set_pinned(t, true)?;
+        }
+        // Hydrate whatever is missing (sequential; sidecar transfers are
+        // serialized per engine anyway).
+        for t in targets.iter().filter(|t| *t != rel || row.is_file()) {
+            if self.store.as_ref().and_then(|s| s.backing_path(t)).is_none() {
+                let store = self.store.clone().expect("placeholders checked");
+                self.hydrate_one(&store, t).await;
+            }
+        }
+        info!(path = %rel, files = targets.len(), "pinned");
+        Ok(())
+    }
+
+    /// Unpin: drop the flag; content stays until the eviction pass picks it.
+    fn unpin_file(&mut self, rel: &str) -> Result<()> {
+        if !self.placeholders {
+            bail!("pins apply to placeholder (mount) mode");
+        }
+        let Some(row) = self.db.node_by_path(rel)? else {
+            bail!("unknown path `{rel}`");
+        };
+        if row.is_file() {
+            self.db.set_pinned(rel, false)?;
+        } else {
+            self.db.set_pinned_tree(rel, false)?;
+        }
+        info!(path = %rel, "unpinned");
         Ok(())
     }
 

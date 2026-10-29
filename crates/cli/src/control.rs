@@ -233,16 +233,23 @@ async fn serve_conn(stream: UnixStream, handle: EngineHandle) -> Result<()> {
     let (read, mut write) = stream.into_split();
     let mut line = String::new();
     BufReader::new(read).read_line(&mut line).await?;
-    let reply = match line.trim() {
-        "pause" => handle.pause().await.map(|_| "ok: paused".to_string()),
-        "resume" => handle.resume().await.map(|_| "ok: resumed".to_string()),
-        "status" => handle.status().await.map(|s| {
-            format!(
-                "{} (synced={}, dirty={}, tombstones={}, errored={})",
-                s.state, s.synced_nodes, s.dirty_nodes, s.queued_tombstones, s.errored_nodes
-            )
-        }),
-        other => Ok(format!("error: unknown command `{other}`")),
+    let trimmed = line.trim();
+    let reply: Result<String> = if let Some(rel) = trimmed.strip_prefix("pin ") {
+        pin_unpin(&handle, true, rel.trim()).await
+    } else if let Some(rel) = trimmed.strip_prefix("unpin ") {
+        pin_unpin(&handle, false, rel.trim()).await
+    } else {
+        match trimmed {
+            "pause" => handle.pause().await.map(|_| "ok: paused".to_string()),
+            "resume" => handle.resume().await.map(|_| "ok: resumed".to_string()),
+            "status" => handle.status().await.map(|s| {
+                format!(
+                    "{} (synced={}, dirty={}, tombstones={}, errored={})",
+                    s.state, s.synced_nodes, s.dirty_nodes, s.queued_tombstones, s.errored_nodes
+                )
+            }),
+            other => Ok(format!("error: unknown command `{other}`")),
+        }
     };
     let text = match reply {
         Ok(t) => t,
@@ -281,9 +288,41 @@ pub async fn send_simple(cmd: &str, root: Option<&Path>) -> Result<()> {
     Ok(())
 }
 
+/// `pds pin <mount-folder> <path>` / `pds unpin …`: paths are relative to
+/// the sync root and resolved against the running engine's own root (the
+/// control socket carries only the rel).
+pub async fn send_pin(cmd: &str, folder: &Path, rel: &str) -> Result<()> {
+    let root = folder.canonicalize()?;
+    let reply = send(&format!("{cmd} {rel}"), Some(&root)).await?;
+    if reply.starts_with("error:") {
+        bail!(reply);
+    }
+    println!("{reply}");
+    Ok(())
+}
+
 /// Engine status line for `pds status`.
 pub async fn query_status(root: Option<&Path>) -> Result<String> {
     send("status", root).await
+}
+
+/// Shared tail of the `pin`/`unpin` control commands: validate the rel,
+/// dispatch to the engine, format the reply line.
+async fn pin_unpin(handle: &EngineHandle, pin: bool, rel: &str) -> Result<String> {
+    if rel.is_empty() || rel.contains("..") || rel.starts_with('/') {
+        bail!("pin takes a root-relative path (e.g. `docs/report.pdf`)");
+    }
+    let result = if pin {
+        handle.pin(rel).await
+    } else {
+        handle.unpin(rel).await
+    };
+    result.map(|_| {
+        format!(
+            "ok: {} {rel}",
+            if pin { "pin" } else { "unpin" }
+        )
+    })
 }
 
 #[cfg(test)]

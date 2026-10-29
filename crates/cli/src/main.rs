@@ -73,6 +73,22 @@ enum Cmd {
         /// Mountpoint (created if missing).
         mountpoint: PathBuf,
     },
+    /// Keep a file's content in the mount's local cache (download now,
+    /// never evicted). Path is relative to the sync root; folders pin
+    /// recursively.
+    Pin {
+        /// Sync root of the running mount.
+        folder: PathBuf,
+        /// Root-relative path to pin.
+        path: String,
+    },
+    /// Release a pin (the file becomes evictable again).
+    Unpin {
+        /// Sync root of the running mount.
+        folder: PathBuf,
+        /// Root-relative path to unpin.
+        path: String,
+    },
 }
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
@@ -97,6 +113,8 @@ async fn main() -> Result<()> {
             folder,
             mountpoint,
         } => mount(folder, mountpoint, cli.sidecar_cmd.as_deref()).await,
+        Cmd::Pin { folder, path } => control::send_pin("pin", &folder, &path).await,
+        Cmd::Unpin { folder, path } => control::send_pin("unpin", &folder, &path).await,
     }
 }
 
@@ -179,6 +197,7 @@ async fn sync(folder: PathBuf, sidecar_cmd: Option<&str>) -> Result<()> {
             root: root.clone(),
             retry_base: pds_core::RETRY_BASE_DEFAULT,
             placeholders: false,
+            eviction_cap: None,
         },
     )?;
 
@@ -236,6 +255,7 @@ async fn mount(folder: PathBuf, mountpoint: PathBuf, sidecar_cmd: Option<&str>) 
             root: root.clone(),
             retry_base: pds_core::RETRY_BASE_DEFAULT,
             placeholders: true,
+            eviction_cap: Some(pds_core::EVICTION_CAP_DEFAULT),
         },
     )?;
     let store = handle

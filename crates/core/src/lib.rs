@@ -12,7 +12,7 @@ pub mod store;
 pub use db::{Db, NodeRow, SyncState, Tombstone};
 pub use engine::{
     ActivityItem, ActivityKind, Command, Engine, EngineConfig, EngineHandle, EngineState,
-    EngineStatus, RETRY_BASE_DEFAULT, STATE_DIR, sha1_file, to_abs, to_rel,
+    EngineStatus, EVICTION_CAP_DEFAULT, RETRY_BASE_DEFAULT, STATE_DIR, sha1_file, to_abs, to_rel,
 };
 pub use guard::{DeleteGuard, GUARD_MAX_DELETES, GUARD_MAX_RATIO, GUARD_WINDOW};
 pub use store::Store;

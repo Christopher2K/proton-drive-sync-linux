@@ -58,6 +58,13 @@ struct Inner {
     pending_mkdirs: VecDeque<String>,
     /// Paths deleted through the mount, awaiting a remote trash.
     pending_deletes: VecDeque<String>,
+    /// Last access per hydrated rel (LRU order for eviction; M3.2).
+    /// Monotonic counter, not wall time: avoids clock skew and gives a
+    /// total order even for same-second reads.
+    last_access: HashMap<String, u64>,
+    access_counter: u64,
+    /// Open FUSE handles per rel — never evict open files.
+    open_handles: HashMap<String, usize>,
     /// Monotonic generation for `publish_snapshot`.
     next_generation: u64,
 }
@@ -139,8 +146,62 @@ impl Store {
         let mut inner = self.lock();
         if !ok {
             inner.hydrated.remove(rel);
+        } else {
+            // A fresh hydration is by definition the most recent use.
+            inner.access_counter += 1;
+            let stamp = inner.access_counter;
+            inner.last_access.insert(rel.to_string(), stamp);
         }
         inner.hydrating.remove(rel);
+    }
+
+    // ---- pin / evict (M3.2) ----------------------------------------------
+
+    /// VFS: record a read (or hydration-triggering open) of `rel` for the
+    /// LRU order. Cheap: a mutex + counter bump.
+    pub fn record_access(&self, rel: &str) {
+        let mut inner = self.lock();
+        inner.access_counter += 1;
+        let stamp = inner.access_counter;
+        inner.last_access.insert(rel.to_string(), stamp);
+    }
+
+    /// VFS: an open handle appeared/closed for `rel`. Open files are never
+    /// evicted.
+    pub fn add_open_handle(&self, rel: &str) {
+        *self.lock().open_handles.entry(rel.to_string()).or_insert(0) += 1;
+    }
+
+    pub fn remove_open_handle(&self, rel: &str) {
+        let mut inner = self.lock();
+        if let Some(n) = inner.open_handles.get_mut(rel) {
+            *n = n.saturating_sub(1);
+            if *n == 0 {
+                inner.open_handles.remove(rel);
+            }
+        }
+    }
+
+    /// LRU-ordered hydrated paths (engine, eviction pass).
+    pub fn hydrated_by_age(&self) -> Vec<(String, u64)> {
+        let inner = self.lock();
+        let mut v: Vec<(String, u64)> = inner
+            .hydrated
+            .keys()
+            .map(|rel| {
+                (
+                    rel.clone(),
+                    inner.last_access.get(rel).copied().unwrap_or(0),
+                )
+            })
+            .collect();
+        v.sort_by_key(|(_, age)| *age);
+        v
+    }
+
+    /// Is `rel` held open by the VFS right now?
+    pub fn is_open(&self, rel: &str) -> bool {
+        self.lock().open_handles.contains_key(rel)
     }
 
     // ---- write-through (M3.2) ---------------------------------------------
@@ -265,6 +326,8 @@ impl Store {
         inner.uploading.remove(rel);
         inner.pending_mkdirs.retain(|p| p != rel);
         inner.pending_deletes.retain(|p| p != rel);
+        inner.last_access.remove(rel);
+        inner.open_handles.remove(rel);
     }
 
     /// Drop `rel` and every path under it (recursive delete through the
@@ -280,6 +343,8 @@ impl Store {
         inner.uploading.retain(|p| keep(p));
         inner.pending_mkdirs.retain(|p| keep(p));
         inner.pending_deletes.retain(|p| keep(p));
+        inner.last_access.retain(|p, _| keep(p));
+        inner.open_handles.retain(|p, _| keep(p));
     }
 
     // ---- VFS side ------------------------------------------------------
@@ -444,5 +509,35 @@ mod tests {
         store.forget_tree("gone");
         assert_eq!(store.next_mkdir_request(), None);
         assert_eq!(store.next_write_request(), None);
+    }
+
+    #[test]
+    fn access_tracking_and_open_handles() {
+        let store = Store::new();
+        store.set_backing("a.txt", PathBuf::from("/tmp/a"));
+        store.set_backing("b.txt", PathBuf::from("/tmp/b"));
+
+        // Hydration itself counts as the most recent access.
+        store.record_access("a.txt");
+        store.record_access("b.txt");
+        let ages = store.hydrated_by_age();
+        assert_eq!(ages[0].0, "a.txt", "older access evicted first");
+        assert_eq!(ages[1].0, "b.txt");
+
+        // Re-read bumps a.txt to newest.
+        store.record_access("a.txt");
+        let ages = store.hydrated_by_age();
+        assert_eq!(ages[0].0, "b.txt");
+
+        // Open handles tracked independently; forget clears them.
+        store.add_open_handle("b.txt");
+        assert!(store.is_open("b.txt"));
+        store.add_open_handle("b.txt");
+        store.remove_open_handle("b.txt");
+        assert!(store.is_open("b.txt"), "still one handle open");
+        store.remove_open_handle("b.txt");
+        assert!(!store.is_open("b.txt"));
+        store.forget("a.txt");
+        assert!(store.hydrated_by_age().iter().all(|(r, _)| r != "a.txt"));
     }
 }

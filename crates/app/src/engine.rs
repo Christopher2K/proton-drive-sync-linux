@@ -136,6 +136,7 @@ async fn run(
                 root: root.clone(),
                 retry_base: RETRY_BASE_DEFAULT,
                 placeholders: false,
+            eviction_cap: None,
             },
         )?;
         let _ = updates.send(AppUpdate::EngineStarted { email });

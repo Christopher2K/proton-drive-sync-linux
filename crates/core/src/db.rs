@@ -268,6 +268,24 @@ impl Db {
         Ok(())
     }
 
+    /// Pin flag for one row (M3.2 eviction protection).
+    pub fn set_pinned(&self, local_path: &str, pinned: bool) -> rusqlite::Result<()> {
+        self.lock().execute(
+            "UPDATE nodes SET pinned=?2 WHERE local_path=?1",
+            params![local_path, pinned as i64],
+        )?;
+        Ok(())
+    }
+
+    /// Pin flag for `rel` and every path under it (folder pins).
+    pub fn set_pinned_tree(&self, rel: &str, pinned: bool) -> rusqlite::Result<()> {
+        self.lock().execute(
+            "UPDATE nodes SET pinned=?2 WHERE local_path=?1 OR local_path LIKE ?1 || '/%'",
+            params![rel, pinned as i64],
+        )?;
+        Ok(())
+    }
+
     pub fn nodes_with_state(&self, state: SyncState) -> rusqlite::Result<Vec<NodeRow>> {
         let conn = self.lock();
         let mut stmt = conn.prepare(
