@@ -407,6 +407,19 @@ impl<S: SidecarApi + 'static> Engine<S> {
                     self.hydrate_one(&store, &rel).await;
                     continue;
                 }
+                if let Some(rel) = store.next_write_request() {
+                    self.upload_write_one(&store, &rel).await;
+                    continue;
+                }
+                if let Some(rel) = store.next_delete_request() {
+                    if let Err(e) = self.handle_local_delete(&rel).await {
+                        warn!(path = %rel, error = %e, "write-through delete failed");
+                    }
+                    if let Err(e) = self.publish_vfs_snapshot(&store) {
+                        warn!(error = %e, "post-delete VFS snapshot failed");
+                    }
+                    continue;
+                }
             }
             // F4: when running, pump queued work (tombstones → uploads → events).
             if self.state == EngineState::Running && self.pump_work().await? {
@@ -692,7 +705,7 @@ impl<S: SidecarApi + 'static> Engine<S> {
     /// Create/write-close on a file: hash, then upload (new node or new
     /// revision) or mark dirty while paused (F4 buffering).
     async fn upsert_local_file(&mut self, rel: &str) -> Result<()> {
-        let abs = to_abs(&self.root, rel);
+        let abs = self.content_path(rel);
         let meta = match std::fs::metadata(&abs) {
             Ok(m) => m,
             Err(_) => return Ok(()), // vanished again — delete path handles it
@@ -792,7 +805,7 @@ impl<S: SidecarApi + 'static> Engine<S> {
         if self.retry_at.get(rel).is_some_and(|t| *t > Instant::now()) {
             return Ok(());
         }
-        let abs = to_abs(&self.root, rel);
+        let abs = self.content_path(rel);
         if !abs.is_file() {
             return Ok(()); // vanished before upload; delete path owns it
         }
@@ -931,7 +944,7 @@ impl<S: SidecarApi + 'static> Engine<S> {
 
     /// Perform the actual upload transfer for a dirty row.
     async fn upload_row(&mut self, rel: &str, row: &NodeRow) -> Result<()> {
-        let abs = to_abs(&self.root, rel);
+        let abs = self.content_path(rel);
         let params = upload_params(row, &abs);
         self.db.set_sync_state(rel, SyncState::Uploading)?;
         let sidecar = Arc::clone(&self.sidecar);
@@ -1108,6 +1121,10 @@ impl<S: SidecarApi + 'static> Engine<S> {
         if row.sync_state != SyncState::Synced {
             // Never confirmed synced → local removal only (F3.1).
             self.db.remove_node(rel)?;
+            if let Some(store) = &self.store {
+                store.forget(rel);
+                std::fs::remove_file(to_abs(&self.backing_dir, rel)).ok();
+            }
             return Ok(());
         }
         // Durable tombstone first; drained immediately if running (F3.4).
@@ -1116,6 +1133,11 @@ impl<S: SidecarApi + 'static> Engine<S> {
             node_uid: row.node_uid.clone(),
             deleted_at: now_unix(),
         })?;
+        // Write-through: drop queued work and the hydrated copy too.
+        if let Some(store) = &self.store {
+            store.forget(rel);
+            std::fs::remove_file(to_abs(&self.backing_dir, rel)).ok();
+        }
         Ok(())
     }
 
@@ -1358,6 +1380,12 @@ impl<S: SidecarApi + 'static> Engine<S> {
     // Transfers
     // ------------------------------------------------------------------
 
+    /// Where this engine reads local file content from (visible root, or
+    /// backing dir in placeholder mode — see [`content_root`]).
+    fn content_path(&self, rel: &str) -> PathBuf {
+        to_abs(content_root(self.placeholders, &self.root, &self.backing_dir), rel)
+    }
+
     /// Publish the current DB state as the VFS tree snapshot (M3). Files
     /// with a backing file on disk are flagged `content_ready`.
     fn publish_vfs_snapshot(&self, store: &Store) -> Result<()> {
@@ -1432,12 +1460,122 @@ impl<S: SidecarApi + 'static> Engine<S> {
         Ok(())
     }
 
+    /// Drain one write-queue entry: upload the backing content through the
+    /// standard machinery (F7 precondition, retries, pause buffering). The
+    /// engine creates the DB row from scratch here — the VFS does not own
+    /// rows. Failures stay dirty and re-queue via the store.
+    async fn upload_write_one(&mut self, store: &Store, rel: &str) {
+        // Parent folders first: the VFS queues mkdirs before the writes
+        // inside them, but a crash could leave an orphan write queued.
+        while let Some(dir) = store.next_mkdir_request() {
+            if let Err(e) = self.ensure_remote_folder_async(&dir).await {
+                warn!(path = %dir, error = %e, "write mkdir failed");
+            }
+        }
+        let result = self.write_upload_row(rel).await;
+        if let Err(e) = &result {
+            warn!(path = %rel, error = %e, "write upload failed");
+        }
+        store.finish_write(rel, result.is_ok());
+        if let Err(e) = self.publish_vfs_snapshot(store) {
+            warn!(error = %e, "post-write VFS snapshot failed");
+        }
+    }
+
+    /// DB row creation + upload for a write-through file. Mirrors
+    /// [`Engine::upsert_local_file`] but sources content from the backing
+    /// dir and never renames on collision (the VFS file stays where the
+    /// user put it; the collision path uploads under an available name
+    /// instead and re-keys the row).
+    async fn write_upload_row(&mut self, rel: &str) -> Result<()> {
+        let abs = to_abs(&self.backing_dir, rel);
+        let meta = std::fs::metadata(&abs).context("backing file vanished")?;
+        let (sha1, size) = sha1_file(&abs)?;
+        let mtime = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs() as i64);
+        let name = rel.rsplit('/').next().unwrap_or(rel).to_string();
+
+        let (parent_uid, node_uid, synced_sha1) = match self.db.node_by_path(rel)? {
+            Some(row) => {
+                if row.sync_state == SyncState::Synced && row.sha1.as_deref() == Some(&sha1) {
+                    return Ok(()); // content unchanged (spurious close)
+                }
+                // Revision of an existing (possibly pending) node.
+                (
+                    row.parent_uid.clone(),
+                    (!row.node_uid.starts_with("pending:")).then(|| row.node_uid.clone()),
+                    row.synced_sha1.clone(),
+                )
+            }
+            None => {
+                let parent_rel = rel.rsplit_once('/').map(|(d, _)| d);
+                let parent_uid = match parent_rel {
+                    Some(d) => Some(self.ensure_remote_folder_async(d).await?),
+                    None => self.db_root_uid()?,
+                };
+                // F7: never silently overwrite a remote sibling — but the
+                // backing file cannot move (the VFS serves that path), so
+                // upload under an available name and re-key the row to it.
+                let parent = parent_uid.clone().ok_or_else(|| anyhow!("no root uid"))?;
+                let mut remote_name = name.clone();
+                if let Ok(available) = self.sidecar.get_available_name(&parent, &name).await
+                    && available != name
+                {
+                    warn!(path = %rel, renamed = %available, "remote name collision on write-through");
+                    remote_name = available;
+                }
+                self.db.upsert_node(&NodeRow {
+                    local_path: rel.to_string(),
+                    node_uid: format!("pending:{rel}"),
+                    parent_uid,
+                    name: remote_name,
+                    kind: NodeKind::File,
+                    size: Some(size as i64),
+                    sha1: Some(sha1.clone()),
+                    mtime,
+                    sync_state: SyncState::Dirty,
+                    pinned: false,
+                    synced_sha1: None,
+                })?;
+                (None, None, None)
+            }
+        };
+
+        if let Some(row) = self.db.node_by_path(rel)? {
+            self.db.upsert_node(&NodeRow {
+                local_path: rel.to_string(),
+                node_uid: node_uid.unwrap_or_else(|| row.node_uid.clone()),
+                parent_uid,
+                name: row.name.clone(),
+                kind: NodeKind::File,
+                size: Some(size as i64),
+                sha1: Some(sha1),
+                mtime,
+                sync_state: SyncState::Dirty,
+                pinned: row.pinned,
+                synced_sha1,
+            })?;
+            self.db.clear_upload_failures(rel).ok();
+            self.retry_at.remove(rel);
+
+            if self.state != EngineState::Running {
+                debug!(path = %rel, "paused: write-through upload buffered");
+                return Ok(());
+            }
+            self.upload_one(rel).await?;
+        }
+        Ok(())
+    }
+
     /// Download `uid` to `rel` and mark the row synced.
     async fn download_file(&mut self, uid: &str, rel: &str) -> Result<()> {
-        let abs = to_abs(&self.root, rel);
+        let abs = self.content_path(rel);
         let node = self.sidecar.get_node(uid).await.ok();
         let tmp_rel = format!("{rel}.pds-part");
-        let tmp = to_abs(&self.root, &tmp_rel);
+        let tmp = self.content_path(&tmp_rel);
         let sidecar = Arc::clone(&self.sidecar);
         let outcome = self
             .run_transfer("download", Some(rel), sidecar.download(uid, &tmp))
@@ -1621,6 +1759,12 @@ impl<S: SidecarApi + 'static> Engine<S> {
         if !self.db.tombstones()?.is_empty() {
             // Guard may auto-pause; false means "stop pumping".
             self.drain_one_tombstone().await?;
+            // Write-through: the VFS tree must drop the path right away.
+            if let Some(store) = &self.store
+                && let Err(e) = self.publish_vfs_snapshot(store)
+            {
+                warn!(error = %e, "post-trash VFS snapshot failed");
+            }
             return Ok(true);
         }
         if let Some(ev) = self.buffered_events.pop_front() {
@@ -1658,6 +1802,17 @@ fn now_unix() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
+}
+
+/// Where the engine reads local file content from for `rel`: the visible
+/// root in materialized mode, the backing dir in placeholder mode (VFS
+/// writes never touch the visible root).
+fn content_root<'a>(placeholders: bool, root: &'a Path, backing_dir: &'a Path) -> &'a Path {
+    if placeholders {
+        backing_dir
+    } else {
+        root
+    }
 }
 
 /// Upload params for a dirty row: `pending:` uids upload as a NEW file under

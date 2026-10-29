@@ -247,10 +247,11 @@ async fn mount(folder: PathBuf, mountpoint: PathBuf, sidecar_cmd: Option<&str>) 
     let engine_task = tokio::spawn(engine.run());
 
     // FUSE session on its own thread; unmounts when the handle drops.
-    let fs = pds_vfs_linux::PdsFs::new(store, root.join(STATE_DIR));
+    let fs = pds_vfs_linux::PdsFs::new(store, root.join(STATE_DIR), root.join(".pds-vfs-backing"));
     let mut cfg = fuser::Config::default();
+    // Writable mount: the fs enforces read-only per file (snapshot-backed
+    // content is RO; new files created through the mount upload on close).
     cfg.mount_options = vec![
-        fuser::MountOption::RO,
         fuser::MountOption::FSName("proton-drive-sync".into()),
         fuser::MountOption::Subtype("pds".into()),
     ];

@@ -21,7 +21,9 @@ use pds_vfs_linux::PdsFs;
 #[serial_test::serial]
 async fn fuse_mount_serves_placeholders_and_hydrates() {
     let _ = tracing_subscriber::fmt()
-        .with_env_filter("pds_core=debug,pds_sidecar_client=debug")
+        .with_env_filter(std::env::var("RUST_LOG").unwrap_or_else(|_| {
+            "pds_core=debug,pds_sidecar_client=debug".to_string()
+        }))
         .with_test_writer()
         .try_init();
 
@@ -54,13 +56,13 @@ async fn fuse_mount_serves_placeholders_and_hydrates() {
     let store = handle.store().cloned().unwrap();
     let engine_task = tokio::spawn(engine.run());
 
-    // Mount and keep the session handle alive. fuser's spawn_mount runs its
-    // own session threads; fusermount3 needs a moment to settle the mount.
-    let fs = PdsFs::new(store, root.join(STATE_DIR));
+    // Mount writable; the fs itself enforces read-only per file
+    // (snapshot-backed content is RO, write-created files are RW).
+    let fs = PdsFs::new(store.clone(), root.join(STATE_DIR), root.join(".pds-vfs-backing"));
     let mut cfg = Config::default();
     cfg.mount_options = vec![
-        MountOption::RO,
         MountOption::FSName("pds-e2e".into()),
+        MountOption::Subtype("pds".into()),
     ];
     let mnt_for_thread = mnt.clone();
     let session = tokio::task::spawn_blocking(move || {
@@ -119,10 +121,81 @@ async fn fuse_mount_serves_placeholders_and_hydrates() {
     assert!(!root.join("big.bin").exists());
     assert!(root.join(".pds-vfs-backing").join("big.bin").is_file());
 
-    // 5. The mount is read-only.
+    // 5. Snapshot-backed files stay read-only in M3.2 (revision writes are
+    // a later slice)…
     let err = std::fs::write(mnt.join("hello.txt"), b"nope")
-        .expect_err("write must fail on RO mount");
+        .expect_err("write to a hydrated file must fail with EROFS");
     assert_eq!(err.raw_os_error(), Some(30)); // EROFS
+
+    // 6. Write-through: create a file through the mount, upload fires.
+    std::fs::write(mnt.join("notes.txt"), b"written via fuse").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if mock.uploaded_names().iter().any(|n| n == "notes.txt") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "write-through upload never happened"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    // Visible root stays clean; content waits in the backing dir.
+    assert!(!root.join("notes.txt").exists());
+    assert_eq!(
+        std::fs::read(root.join(".pds-vfs-backing").join("notes.txt")).unwrap(),
+        b"written via fuse"
+    );
+    // The engine's snapshot now serves the file with its row (uid assigned).
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if let Some(node) = store.snapshot().by_path.get("notes.txt") {
+            assert!(node.content_ready, "uploaded file is content-ready");
+            break;
+        }
+        assert!(Instant::now() < deadline, "no snapshot entry after upload");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    // …and a fresh open reads the uploaded content back.
+    assert_eq!(
+        std::fs::read(mnt.join("notes.txt")).unwrap(),
+        b"written via fuse"
+    );
+
+    // 7. mkdir + nested create upload the folder chain too.
+    std::fs::create_dir(mnt.join("docs")).unwrap();
+    std::fs::write(mnt.join("docs").join("a.md"), b"# hi").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if mock.uploaded_names().iter().any(|n| n == "a.md") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "nested write-through upload never happened"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // 8. unlink through the mount trashes remotely (tombstone drains).
+    std::fs::remove_file(mnt.join("notes.txt")).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let trashed = mock.trashed_uids();
+        if !trashed.is_empty() {
+            break;
+        }
+        assert!(Instant::now() < deadline, "unlink never trashed remotely");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    // The mount no longer lists it.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let names: Vec<String> = std::fs::read_dir(&mnt)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    assert!(!names.contains(&"notes.txt".to_string()), "{names:?}");
 
     handle.shutdown().await.ok();
     drop(session);

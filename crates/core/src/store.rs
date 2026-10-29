@@ -50,6 +50,14 @@ struct Inner {
     hydrating: HashSet<String>,
     /// rel → backing file path for hydrated files.
     hydrated: HashMap<String, PathBuf>,
+    /// Write-created or write-modified files awaiting upload, oldest first.
+    pending_writes: VecDeque<String>,
+    /// Files the engine is currently uploading from the write queue.
+    uploading: HashSet<String>,
+    /// Folders created through the mount, awaiting a remote mirror.
+    pending_mkdirs: VecDeque<String>,
+    /// Paths deleted through the mount, awaiting a remote trash.
+    pending_deletes: VecDeque<String>,
     /// Monotonic generation for `publish_snapshot`.
     next_generation: u64,
 }
@@ -109,10 +117,7 @@ impl Store {
 
     /// Remove the backing entry (row deleted, or eviction).
     pub fn clear_backing(&self, rel: &str) {
-        let mut inner = self.lock();
-        inner.hydrated.remove(rel);
-        inner.hydrating.remove(rel);
-        inner.pending.retain(|p| p != rel);
+        self.forget(rel);
     }
 
     /// Next queued hydrate request, if any (engine, from the main loop).
@@ -136,6 +141,145 @@ impl Store {
             inner.hydrated.remove(rel);
         }
         inner.hydrating.remove(rel);
+    }
+
+    // ---- write-through (M3.2) ---------------------------------------------
+
+    /// Record a finished write to a backing file (VFS `write`/`setattr`,
+    /// after the bytes are on disk) and wake the engine to upload it.
+    /// Re-queues while an upload is in flight: the newer content must be
+    /// uploaded again after the current attempt (latest content wins —
+    /// the engine re-hashes at upload time).
+    pub fn record_write(&self, rel: &str) {
+        let first = {
+            let mut inner = self.lock();
+            let rel = rel.to_string();
+            if inner.pending_writes.contains(&rel) {
+                false
+            } else {
+                inner.pending_writes.push_back(rel);
+                true
+            }
+        };
+        if first {
+            self.notify.notify_one();
+        }
+    }
+
+    /// Next write-created/-modified file to upload, if any (engine).
+    /// Entries whose previous upload is still in flight stay queued.
+    pub fn next_write_request(&self) -> Option<String> {
+        let mut inner = self.lock();
+        let mut skipped = Vec::new();
+        let mut result = None;
+        while let Some(rel) = inner.pending_writes.pop_front() {
+            if inner.uploading.contains(&rel) {
+                skipped.push(rel);
+            } else {
+                inner.uploading.insert(rel.clone());
+                result = Some(rel);
+                break;
+            }
+        }
+        for rel in skipped.into_iter().rev() {
+            inner.pending_writes.push_front(rel);
+        }
+        result
+    }
+
+    /// Engine finished one upload attempt from the write queue. On failure
+    /// the file re-queues (retry on the next main-loop pass).
+    pub fn finish_write(&self, rel: &str, ok: bool) {
+        let mut inner = self.lock();
+        inner.uploading.remove(rel);
+        if !ok {
+            inner.pending_writes.push_back(rel.to_string());
+        }
+    }
+
+    /// True while the engine is uploading `rel` (VFS: hide the `.pdsw-`
+    /// partial and answer reads from the last complete backing content).
+    pub fn is_uploading(&self, rel: &str) -> bool {
+        self.lock().uploading.contains(rel)
+    }
+
+    /// Number of queued + in-flight write uploads (status display).
+    pub fn pending_writes(&self) -> usize {
+        let inner = self.lock();
+        inner.pending_writes.len() + inner.uploading.len()
+    }
+
+    /// Queue a folder created through the mount (VFS `mkdir`).
+    pub fn record_mkdir(&self, rel: &str) {
+        let first = {
+            let mut inner = self.lock();
+            let rel = rel.to_string();
+            let first = !inner.pending_mkdirs.contains(&rel);
+            if first {
+                inner.pending_mkdirs.push_back(rel);
+            }
+            first
+        };
+        if first {
+            self.notify.notify_one();
+        }
+    }
+
+    /// Next folder to create remotely (engine). Parents sort before
+    /// children because the VFS queues them parent-first.
+    pub fn next_mkdir_request(&self) -> Option<String> {
+        self.lock().pending_mkdirs.pop_front()
+    }
+
+    /// Queue a path removed through the mount (VFS `unlink`/`rmdir`).
+    /// Deletion order is the VFS's problem (children are unlinked first);
+    /// the engine mirrors each as a durable tombstone + trash.
+    pub fn record_delete(&self, rel: &str) {
+        let first = {
+            let mut inner = self.lock();
+            let rel = rel.to_string();
+            let first = !inner.pending_deletes.contains(&rel);
+            if first {
+                inner.pending_deletes.push_back(rel);
+            }
+            first
+        };
+        if first {
+            self.notify.notify_one();
+        }
+    }
+
+    /// Next path to delete remotely (engine), oldest first.
+    pub fn next_delete_request(&self) -> Option<String> {
+        self.lock().pending_deletes.pop_front()
+    }
+
+    /// Drop a path from every queue (row deleted, or hydration failed).
+    /// Called with the DB-rel form of the path.
+    pub fn forget(&self, rel: &str) {
+        let mut inner = self.lock();
+        inner.hydrated.remove(rel);
+        inner.hydrating.remove(rel);
+        inner.pending.retain(|p| p != rel);
+        inner.pending_writes.retain(|p| p != rel);
+        inner.uploading.remove(rel);
+        inner.pending_mkdirs.retain(|p| p != rel);
+        inner.pending_deletes.retain(|p| p != rel);
+    }
+
+    /// Drop `rel` and every path under it (recursive delete through the
+    /// mount: children were queued explicitly, but drop leftovers anyway).
+    pub fn forget_tree(&self, rel: &str) {
+        let prefix = format!("{rel}/");
+        let mut inner = self.lock();
+        let keep = |p: &String| p != rel && !p.starts_with(&prefix);
+        inner.hydrated.retain(|p, _| keep(p));
+        inner.hydrating.retain(|p| keep(p));
+        inner.pending.retain(|p| keep(p));
+        inner.pending_writes.retain(|p| keep(p));
+        inner.uploading.retain(|p| keep(p));
+        inner.pending_mkdirs.retain(|p| keep(p));
+        inner.pending_deletes.retain(|p| keep(p));
     }
 
     // ---- VFS side ------------------------------------------------------
@@ -251,5 +395,54 @@ mod tests {
         // engine drops the queued request because content is already there
         assert_eq!(store.next_hydrate_request(), None);
         assert_eq!(store.backing_path("a.txt"), Some(PathBuf::from("/tmp/x")));
+    }
+
+    #[test]
+    fn write_queue_roundtrip_and_retry() {
+        let store = Store::new();
+        assert_eq!(store.pending_writes(), 0);
+        store.record_write("new.txt");
+        store.record_write("new.txt"); // dedup while queued
+        assert_eq!(store.pending_writes(), 1);
+        assert_eq!(store.next_write_request(), Some("new.txt".into()));
+        assert!(store.is_uploading("new.txt"));
+        // re-queue during upload is kept for the retry pass
+        store.record_write("new.txt");
+        assert_eq!(store.pending_writes(), 2);
+        assert_eq!(store.next_write_request(), None, "in-flight not re-served");
+
+        store.finish_write("new.txt", true);
+        assert!(!store.is_uploading("new.txt"));
+        assert_eq!(store.next_write_request(), Some("new.txt".into()));
+        store.finish_write("new.txt", false); // failure re-queues
+        assert_eq!(store.next_write_request(), Some("new.txt".into()));
+        store.finish_write("new.txt", true);
+
+        store.record_write("gone.txt");
+        store.forget("gone.txt");
+        assert_eq!(store.next_write_request(), None);
+    }
+
+    #[test]
+    fn mkdir_and_delete_queues() {
+        let store = Store::new();
+        store.record_mkdir("docs");
+        store.record_mkdir("docs/sub");
+        assert_eq!(store.next_mkdir_request(), Some("docs".into()));
+        assert_eq!(store.next_mkdir_request(), Some("docs/sub".into()));
+        assert_eq!(store.next_mkdir_request(), None);
+
+        store.record_delete("docs/sub/a.txt");
+        store.record_delete("docs/sub/a.txt"); // dedup
+        assert_eq!(store.pending_writes(), 0);
+        assert_eq!(store.next_delete_request(), Some("docs/sub/a.txt".into()));
+        assert_eq!(store.next_delete_request(), None);
+
+        // forget_tree drops queued work under a removed folder.
+        store.record_mkdir("gone");
+        store.record_write("gone/f.txt");
+        store.forget_tree("gone");
+        assert_eq!(store.next_mkdir_request(), None);
+        assert_eq!(store.next_write_request(), None);
     }
 }

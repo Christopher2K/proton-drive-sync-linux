@@ -25,7 +25,8 @@ A **Linux** desktop app that syncs Proton Drive into a local folder. **Read `SPE
 - [x] M0 — Spike: **PASSED 2026-10-23** against a real account — fork auth, key unlock, SDK bootstrap, list, upload, verified download, trash, event cursor (FastForward). Go decision confirmed.
 - [x] M1 — Headless sync engine: **PASSED live E2E 2026-10-24** (scratch account) — F1–F4, F6, F7 all verified against real Proton Drive. 54/54 Rust tests, sidecar smoke + event-loop tests green. E2E bugs found & fixed: telemetry-on-stdout, F7 stale-base race (server 409 → parked → event-path keep-both), guard cascade, CLI per-root resolution, event-stream polling (sidecar now polls /events/{cursor} every ~30s).
 - [x] M2 — GPUI shell: **done 2026-10-24** (tray app). **Rewritten 2026-10-29** as a single-window Linux desktop app (sidebar + Overview/Activity/Conflicts/Settings, login screen, sign-out modal) when macOS support was dropped; `gpui-tray` removed.
-- [x] M3.1 — FUSE placeholders: **done 2026-10-29** — read-only `pds mount` with on-demand hydration; engine placeholder mode (`placeholders: true` → VFS store, backing dir `.pds-vfs-backing/`, no materialization); real-kernel E2E in the VM (3 MB file read through the mount, EROFS on writes). M3.2 (write-through, pins, LRU eviction) next.
+- [x] M3.1 — FUSE placeholders: **done 2026-10-29** — `pds mount` with on-demand hydration; engine placeholder mode (`placeholders: true` → VFS store, backing dir `.pds-vfs-backing/`, no materialization); real-kernel E2E in the VM (3 MB file read through the mount).
+- [x] M3.2 — FUSE write-through: **done 2026-10-29** — `create`→upload on close, `mkdir`/`unlink`/`rmdir` mirror remotely; store write-queues drained by the engine main loop (reuses F7/retry/pause machinery); write overlay + `reconcile_overlay` keep pre-upload files visible without double-listing; snapshot-backed files stay RO (revision writes = M3.3). E2E covers create→upload→read-back→mkdir→nested upload→unlink→trash. Pins + LRU eviction next (same milestone).
 - [ ] M4 — Hardening
 
 ## Linux development (OrbStack VM)
@@ -61,6 +62,13 @@ Notes:
 - **fuser 0.18 API**: trait methods take `&self` (not `&mut self`); `readdir` offset is `u64` (1 = "after entry 0"); `ReplyDirectory::add(ino, offset, kind, name)` returns `true` when the buffer is full; `ReplyStatfs::statfs` takes 8 args (blocks, bfree, bavail, files, ffree, bsize, namelen, frsize); errors are `fuser::Errno::ENOENT`-style constants; `Config` is `#[non_exhaustive]` — mutate `cfg.mount_options` after `Config::default()`, no struct literal.
 - `editions = 2024`: `gen` is a reserved keyword — don't name struct fields or locals `gen`.
 - Panic in a fuser session thread is swallowed (session thread dies, callers get ENOENT/EIO). Wrap suspect methods with `std::panic::catch_unwind` + `eprintln` when debugging; a custom panic hook also works.
+
+## fuser / FUSE gotchas (learned in M3.2)
+
+- **Inodes the kernel holds must keep resolving.** After `create` replies with an overlay inode, the kernel caches that dentry (attr TTL). If the engine's snapshot then covers the path and the overlay drops its inode mapping, a later `open(overlay_ino)` fails ENOENT. Fix: overlay keeps a `ino → rel` alias (`retire`, not `remove`) so cached dentries resolve; only unlink drops the alias.
+- **`write` trait signature (fuser 0.18)** takes 10 params: `_req, ino, fh, offset, data, WriteFlags, OpenFlags, Option<LockOwner>, reply` — easy to under-declare; the compiler error names the trait signature.
+- **RW mounts need the flag dropped at the kernel level.** `MountOption::RO` blocks `open(O_CREAT)` before the fs code runs (fs-level EROFS is never asked). Mount RW and enforce per-file RO in `open`/`setattr` instead.
+- **The test's tracing filter ignores RUST_LOG** when `with_env_filter("literal")` is hardcoded — read `RUST_LOG` with a fallback or VFS debug logs never show up in `cargo test -- --nocapture`.
 
 ## Standing instructions from the user
 
