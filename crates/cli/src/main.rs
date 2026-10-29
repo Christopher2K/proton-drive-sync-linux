@@ -1,8 +1,8 @@
 //! `pds` — headless proton-drive-sync CLI (M1).
 //!
 //! All Drive traffic goes through the spawned Node.js sidecar; `sync` runs
-//! the engine against a local folder (full materialization in M1 — VFS
-//! placeholders arrive in M3/M4, see SPEC.md).
+//! the engine against a local folder (full materialization). `mount` (M3)
+//! serves a read-only placeholder view with on-demand hydration instead.
 
 mod control;
 mod spawn;
@@ -10,7 +10,7 @@ mod spawn;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use clap::{Parser, Subcommand};
 use pds_core::{Engine, EngineConfig, STATE_DIR};
 use pds_sidecar_client::{Notification, SidecarApi};
@@ -65,6 +65,14 @@ enum Cmd {
         #[arg(long)]
         root: Option<PathBuf>,
     },
+    /// Mount a read-only placeholder view of a running sync root (M3).
+    /// Files hydrate through the engine on open. Requires /dev/fuse.
+    Mount {
+        /// Sync root whose state DB backs the mount.
+        folder: PathBuf,
+        /// Mountpoint (created if missing).
+        mountpoint: PathBuf,
+    },
 }
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
@@ -85,6 +93,10 @@ async fn main() -> Result<()> {
         Cmd::Sync { folder } => sync(folder, cli.sidecar_cmd.as_deref()).await,
         Cmd::Pause { root } => control::send_simple("pause", root.as_deref()).await,
         Cmd::Resume { root } => control::send_simple("resume", root.as_deref()).await,
+        Cmd::Mount {
+            folder,
+            mountpoint,
+        } => mount(folder, mountpoint, cli.sidecar_cmd.as_deref()).await,
     }
 }
 
@@ -166,6 +178,7 @@ async fn sync(folder: PathBuf, sidecar_cmd: Option<&str>) -> Result<()> {
             db_path: root.join(STATE_DIR).join("state.db"),
             root: root.clone(),
             retry_base: pds_core::RETRY_BASE_DEFAULT,
+            placeholders: false,
         },
     )?;
 
@@ -188,4 +201,68 @@ async fn sync(folder: PathBuf, sidecar_cmd: Option<&str>) -> Result<()> {
             Ok(())
         }
     }
+}
+
+/// `pds mount`: placeholder VFS over a running (or standalone) sync root.
+///
+/// The mount spawns its own engine in placeholder mode against the folder's
+/// state DB — the same sidecar session, so hydrations authenticate as the
+/// logged-in user. Ctrl-C unmounts and exits.
+async fn mount(folder: PathBuf, mountpoint: PathBuf, sidecar_cmd: Option<&str>) -> Result<()> {
+    let root = folder.canonicalize().with_context(|| {
+        format!("sync folder {}", folder.display())
+    })?;
+    if !root.is_dir() {
+        bail!("{} is not a directory", root.display());
+    }
+    if !mountpoint.exists() {
+        std::fs::create_dir_all(&mountpoint)
+            .with_context(|| format!("create mountpoint {}", mountpoint.display()))?;
+    }
+
+    let (mut client, _child) = spawn::spawn_sidecar(sidecar_cmd)?;
+    let st = client.auth_status().await.context("auth.status")?;
+    if !st.logged_in {
+        bail!("not logged in — run `pds login` first");
+    }
+    info!(root = %root.display(), mount = %mountpoint.display(), "mounting placeholder VFS");
+
+    let notifications = client.take_notifications();
+    let (engine, handle) = Engine::new(
+        Arc::new(client),
+        notifications,
+        EngineConfig {
+            db_path: root.join(STATE_DIR).join("state.db"),
+            root: root.clone(),
+            retry_base: pds_core::RETRY_BASE_DEFAULT,
+            placeholders: true,
+        },
+    )?;
+    let store = handle
+        .store()
+        .cloned()
+        .context("engine did not provide a VFS store")?;
+
+    let _control = control::serve(&root, handle.clone()).await?;
+    let engine_task = tokio::spawn(engine.run());
+
+    // FUSE session on its own thread; unmounts when the handle drops.
+    let fs = pds_vfs_linux::PdsFs::new(store, root.join(STATE_DIR));
+    let mut cfg = fuser::Config::default();
+    cfg.mount_options = vec![
+        fuser::MountOption::RO,
+        fuser::MountOption::FSName("proton-drive-sync".into()),
+        fuser::MountOption::Subtype("pds".into()),
+    ];
+    let session = fuser::spawn_mount(fs, &mountpoint, &cfg)
+        .map_err(|e| anyhow!("FUSE mount at {}: {e}", mountpoint.display()))?;
+    println!("mounted {} — Ctrl-C to unmount", mountpoint.display());
+
+    tokio::signal::ctrl_c().await.context("ctrl-c")?;
+    info!("unmounting");
+    drop(session);
+    handle.shutdown().await.ok();
+    engine_task.abort();
+    control::deregister_root(&root);
+    Ok(())
 }

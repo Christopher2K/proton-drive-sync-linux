@@ -135,6 +135,7 @@ async fn run(
                 db_path: db_path.clone(),
                 root: root.clone(),
                 retry_base: RETRY_BASE_DEFAULT,
+                placeholders: false,
             },
         )?;
         let _ = updates.send(AppUpdate::EngineStarted { email });

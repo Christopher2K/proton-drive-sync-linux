@@ -60,8 +60,10 @@ Pause: freezes upload + download queues mid-transfer (block-level resume), stops
 
 - All remote items visible in the sync root at ~0 bytes locally.
 - **Hydration:** on file open (FUSE read), content is fetched on demand.
-- **Pin/unpin:** context action to force-keep offline or release local copy.
-- **Eviction:** LRU cache with a configurable size cap (default 10 GB). Never evicts pinned, dirty (un-uploaded), or open files.
+- **Pin/unpin:** context action to force-keep offline or release local copy. *(planned — M3.2)*
+- **Eviction:** LRU cache with a configurable size cap (default 10 GB). Never evicts pinned, dirty (un-uploaded), or open files. *(planned — M3.2)*
+
+M3 progress (2026-10-29): read-only placeholder FUSE mount with on-demand hydration works end-to-end (`pds mount`, `pds-vfs-linux` crate). Write-through uploads, pins, and LRU eviction are the next slice.
 
 ### F6 — Remote → local reconciliation
 
@@ -86,7 +88,7 @@ One main window: sidebar navigation (**Overview / Activity / Conflicts / Setting
 - **M0 — Spike:** headless Node script proving auth + list/upload/download/trash + event stream via the SDK. *Go/no-go gate.* ✅ 2026-10-23.
 - **M1 — Headless sync engine (CLI):** local folder ↔ Drive, F2/F3/F4/F7 with real files (no VFS yet), SQLite state. ✅ 2026-10-24 (live E2E).
 - **M2 — GPUI desktop shell (Linux):** single-window app; login, overview, activity, conflicts, settings, sign-out. ✅ 2026-10-29 (rewritten from the v0.1 tray shell when the project went Linux-only).
-- **M3 — Linux VFS:** FUSE mount, placeholders, hydration, pins, LRU eviction (F5). ← **next**
+- **M3 — Linux VFS:** FUSE mount, placeholders, hydration (M3.1 ✅ 2026-10-29 — read-only mount, `pds mount`, E2E-proven in the VM); write-through, pins, LRU eviction next.
 - **M4 — Hardening:** conflict soak tests, backoff/rate-limit validation, SDK upgrade rehearsal for the crypto migration.
 
 ## 8. Key risks
@@ -98,5 +100,6 @@ One main window: sidebar navigation (**Overview / Activity / Conflicts / Setting
 
 ## 9. Open questions
 
-- FUSE mountpoint UX for M3: present placeholders inside the real sync root (bind mount) vs. a parallel mount the root points at.
+- FUSE mountpoint UX: M3.1 ships the **parallel mount** (`pds mount <folder> <mountpoint>`); whether to also bind-mount into the real root is deferred until desktop-app UX decides where users look for files.
+- FUSE write-through (M3.2): should placeholder-mode uploads bypass the watcher loop (direct `upsert_local_file` from the FUSE write path) or flow through it (backing file write + watcher event)? Direct is faster; through-the-watcher reuses the dedup/conflict machinery.
 - Exact mass-deletion guard thresholds after real-world usage data.

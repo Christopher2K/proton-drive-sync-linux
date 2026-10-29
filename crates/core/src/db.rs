@@ -429,6 +429,18 @@ impl Db {
         Ok(rows)
     }
 
+    /// Every row, unordered (VFS snapshot publication).
+    pub fn all_nodes(&self) -> rusqlite::Result<Vec<NodeRow>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT local_path,node_uid,parent_uid,name,kind,size,sha1,mtime,sync_state,pinned,synced_sha1 FROM nodes",
+        )?;
+        let rows = stmt
+            .query_map([], Self::row_from)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
     // ---- tombstones ----
 
     pub fn add_tombstone(&self, t: &Tombstone) -> rusqlite::Result<()> {

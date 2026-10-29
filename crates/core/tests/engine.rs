@@ -54,6 +54,7 @@ async fn start_with_client(
             root: root.clone(),
             db_path: db_path.clone(),
             retry_base,
+            placeholders: false,
         },
     )
     .unwrap();
@@ -139,6 +140,7 @@ async fn first_run_uploads_local_only_files() {
             root: root.clone(),
             db_path: root.join(STATE_DIR).join("state.db"),
             retry_base: pds_core::RETRY_BASE_DEFAULT,
+            placeholders: false,
         },
     )
     .unwrap();

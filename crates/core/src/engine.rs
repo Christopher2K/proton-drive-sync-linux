@@ -31,6 +31,7 @@ use tracing::{debug, info, warn};
 use crate::conflict::conflict_name;
 use crate::db::{Db, NodeRow, SyncState, Tombstone};
 use crate::guard::DeleteGuard;
+use crate::store::{Store, VNode};
 
 /// Name of the engine-private directory inside the sync root (DB, socket).
 pub const STATE_DIR: &str = ".pds";
@@ -86,7 +87,6 @@ pub enum Command {
     Shutdown,
     Status(oneshot::Sender<EngineStatus>),
 }
-
 /// What kind of user-visible thing happened (activity feed, SPEC.md §6).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ActivityKind {
@@ -124,9 +124,17 @@ pub struct ActivityItem {
 pub struct EngineHandle {
     tx: mpsc::Sender<Command>,
     activity_tx: broadcast::Sender<ActivityItem>,
+    /// Placeholder-mode store (VFS hydrate queue + snapshots). `None` in
+    /// materialized mode.
+    store: Option<Store>,
 }
 
 impl EngineHandle {
+    /// The engine↔VFS store, when the engine runs in placeholder mode.
+    pub fn store(&self) -> Option<&Store> {
+        self.store.as_ref()
+    }
+
     pub async fn pause(&self) -> Result<()> {
         self.tx.send(Command::Pause).await.context("engine gone")
     }
@@ -162,6 +170,10 @@ pub struct EngineConfig {
     /// Base of the exponential upload retry backoff (normally
     /// `RETRY_BASE_DEFAULT`; tests shrink it).
     pub retry_base: Duration,
+    /// Placeholder mode (M3): synced files are NOT materialized in `root`;
+    /// a FUSE filesystem serves them with on-demand hydration via
+    /// [`EngineHandle::store`]. Default `false` (proven materialized mode).
+    pub placeholders: bool,
 }
 
 /// Outcome of a finished transfer relevant to the caller.
@@ -217,6 +229,13 @@ pub struct Engine<S: SidecarApi> {
     sidecar: Arc<S>,
     db: Db,
     root: PathBuf,
+    /// Placeholder mode (M3): serve synced files via the VFS store instead
+    /// of materializing them in `root`.
+    placeholders: bool,
+    /// Engine ↔ VFS shared store; `Some` iff `placeholders`.
+    store: Option<Store>,
+    /// Hydrated file contents live here, outside the FUSE-visible root.
+    backing_dir: PathBuf,
     notifications: mpsc::Receiver<Notification>,
     backlog: VecDeque<Notification>,
     cmd_rx: mpsc::Receiver<Command>,
@@ -257,10 +276,21 @@ impl<S: SidecarApi + 'static> Engine<S> {
         let db = Db::open(&config.db_path)?;
         let (tx, cmd_rx) = mpsc::channel(64);
         let (activity_tx, _) = broadcast::channel(256);
+        let placeholders = config.placeholders;
+        // The engine and the handle share one store (engine owns a clone).
+        let vfs_store = if placeholders {
+            Some(Store::new())
+        } else {
+            None
+        };
+        let store = vfs_store.clone();
         let engine = Self {
             sidecar,
             db,
-            root: config.root,
+            root: config.root.clone(),
+            placeholders,
+            store,
+            backing_dir: config.root.join(".pds-vfs-backing"),
             notifications,
             backlog: VecDeque::new(),
             cmd_rx,
@@ -276,7 +306,14 @@ impl<S: SidecarApi + 'static> Engine<S> {
             started: AtomicBool::new(false),
             activity_tx: activity_tx.clone(),
         };
-        Ok((engine, EngineHandle { tx, activity_tx }))
+        Ok((
+            engine,
+            EngineHandle {
+                tx,
+                activity_tx,
+                store: vfs_store,
+            },
+        ))
     }
 
     /// Run until shutdown. Consumes the engine.
@@ -305,7 +342,15 @@ impl<S: SidecarApi + 'static> Engine<S> {
         let (fs_tx, mut fs_rx) = mpsc::channel::<Vec<DebouncedEvent>>(256);
         let debouncer = self.start_watcher(fs_tx)?;
 
-        // 4. Main loop.
+        // 4. Placeholder mode: publish the tree snapshot the FUSE filesystem
+        // serves, then keep it fresh from the main loop (M3).
+        if let Some(store) = &self.store
+            && let Err(e) = self.publish_vfs_snapshot(store)
+        {
+            warn!(error = %e, "initial VFS snapshot failed");
+        }
+
+        // 5. Main loop.
         let result = self.main_loop(&mut fs_rx).await;
 
         drop(debouncer);
@@ -355,6 +400,14 @@ impl<S: SidecarApi + 'static> Engine<S> {
                 self.handle_notification(n).await?;
                 continue;
             }
+            // Placeholder mode: download requested files (M3 hydration).
+            if self.store.is_some() {
+                let store = self.store.clone().expect("store checked above");
+                if let Some(rel) = store.next_hydrate_request() {
+                    self.hydrate_one(&store, &rel).await;
+                    continue;
+                }
+            }
             // F4: when running, pump queued work (tombstones → uploads → events).
             if self.state == EngineState::Running && self.pump_work().await? {
                 continue;
@@ -380,6 +433,12 @@ impl<S: SidecarApi + 'static> Engine<S> {
                         self.handle_fs_batch(events).await?;
                     }
                 }
+                _ = async {
+                    match &self.store {
+                        Some(store) => store.notify.notified().await,
+                        None => std::future::pending::<()>().await,
+                    }
+                } => {}
                 () = async move {
                     match wake {
                         Some(t) => tokio::time::sleep_until(t.into()).await,
@@ -399,6 +458,17 @@ impl<S: SidecarApi + 'static> Engine<S> {
     /// Never deletes anything, in either direction.
     async fn initial_sync(&mut self, root: &Node) -> Result<()> {
         self.enumerate_remote(root).await?;
+
+        if self.placeholders {
+            // M3: nothing to download — the VFS serves placeholders; files
+            // hydrate on open. Local-only files still upload (first-run
+            // rule: an empty folder never deletes anything).
+            let local_only = self.scan_local_only().await?;
+            for rel in local_only {
+                self.upsert_local_file(&rel).await?;
+            }
+            return Ok(());
+        }
 
         // Materialize: download every remote file that is missing or changed.
         let files = self.remote_files_needing_download()?;
@@ -437,9 +507,12 @@ impl<S: SidecarApi + 'static> Engine<S> {
                 };
                 self.upsert_from_node(&child, &rel, SyncState::Synced)?;
                 if child.is_folder() {
-                    let abs = to_abs(&self.root, &rel);
-                    if !abs.exists() {
-                        std::fs::create_dir_all(&abs)?;
+                    if !self.placeholders {
+                        // Placeholder mode: the FUSE mount *is* the tree.
+                        let abs = to_abs(&self.root, &rel);
+                        if !abs.exists() {
+                            std::fs::create_dir_all(&abs)?;
+                        }
                     }
                     stack.push((child, rel));
                 }
@@ -1151,14 +1224,22 @@ impl<S: SidecarApi + 'static> Engine<S> {
             EventKind::TreeRefresh => {
                 let root = self.sidecar.get_root().await?;
                 self.enumerate_remote(&root).await?;
-                let files = self.remote_files_needing_download()?;
-                for (rel, uid) in files {
-                    self.download_file(&uid, &rel).await?;
+                if !self.placeholders {
+                    let files = self.remote_files_needing_download()?;
+                    for (rel, uid) in files {
+                        self.download_file(&uid, &rel).await?;
+                    }
                 }
             }
         }
         // Persist the resume token after applying (protocol.md F6).
         self.db.set_event_cursor(&ev.scope_id, &ev.event_id)?;
+        // Keep the VFS tree in step with applied events (M3).
+        if let Some(store) = &self.store
+            && let Err(e) = self.publish_vfs_snapshot(store)
+        {
+            warn!(error = %e, "post-event VFS snapshot failed");
+        }
         Ok(())
     }
 
@@ -1175,7 +1256,7 @@ impl<S: SidecarApi + 'static> Engine<S> {
         let abs = to_abs(&self.root, &rel);
 
         if node.is_folder() {
-            if !abs.exists() {
+            if !self.placeholders && !abs.exists() {
                 std::fs::create_dir_all(&abs)?;
             }
             self.upsert_from_node(&node, &rel, SyncState::Synced)?;
@@ -1208,6 +1289,12 @@ impl<S: SidecarApi + 'static> Engine<S> {
             && row.sha1 == node.sha1
         {
             return Ok(()); // already current
+        }
+        if self.placeholders {
+            // M3: register the new remote version; hydrate only if the
+            // content was already open (fresh bytes for a live reader).
+            self.upsert_from_node(&node, &rel, SyncState::Synced)?;
+            return Ok(());
         }
         if let Some(dir) = abs.parent() {
             std::fs::create_dir_all(dir)?;
@@ -1256,6 +1343,13 @@ impl<S: SidecarApi + 'static> Engine<S> {
         } else {
             std::fs::remove_file(&abs).ok();
         }
+        // Placeholder mode: drop the hydrated backing copy too.
+        if self.placeholders
+            && let Some(store) = &self.store
+        {
+            store.clear_backing(&row.local_path);
+            std::fs::remove_file(to_abs(&self.backing_dir, &row.local_path)).ok();
+        }
         self.remove_node_recursive(&row.local_path)?;
         Ok(())
     }
@@ -1263,6 +1357,80 @@ impl<S: SidecarApi + 'static> Engine<S> {
     // ------------------------------------------------------------------
     // Transfers
     // ------------------------------------------------------------------
+
+    /// Publish the current DB state as the VFS tree snapshot (M3). Files
+    /// with a backing file on disk are flagged `content_ready`.
+    fn publish_vfs_snapshot(&self, store: &Store) -> Result<()> {
+        let rows = self.db.all_nodes()?;
+        let mut by_path = HashMap::with_capacity(rows.len());
+        for row in rows {
+            let Some(name) = row.local_path.rsplit('/').next().map(str::to_string) else {
+                continue;
+            };
+            let parent = row
+                .local_path
+                .rsplit_once('/')
+                .map(|(p, _)| p.to_string())
+                .unwrap_or_default();
+            by_path.insert(
+                row.local_path.clone(),
+                VNode {
+                    rel: row.local_path.clone(),
+                    parent,
+                    name,
+                    is_dir: !row.is_file(),
+                    size: row.size.unwrap_or(0).max(0) as u64,
+                    mtime: row.mtime.unwrap_or(0),
+                    content_ready: to_abs(&self.backing_dir, &row.local_path).is_file(),
+                },
+            );
+        }
+        store.publish_snapshot(by_path);
+        Ok(())
+    }
+
+    /// Hydrate one requested placeholder: download to the backing dir,
+    /// register the backing file, refresh the snapshot. Failures just
+    /// unblock the waiting reader (it retries with EIO → new open).
+    async fn hydrate_one(&mut self, store: &Store, rel: &str) {
+        let Some(row) = self.db.node_by_path(rel).ok().flatten() else {
+            store.finish_hydrate(rel, false);
+            return;
+        };
+        match self.download_to_backing(&row.node_uid, rel).await {
+            Ok(()) => {
+                store.set_backing(rel, to_abs(&self.backing_dir, rel));
+                if let Err(e) = self.publish_vfs_snapshot(store) {
+                    warn!(path = %rel, error = %e, "post-hydrate snapshot failed");
+                }
+                info!(path = %rel, "hydrated on demand");
+            }
+            Err(e) => {
+                warn!(path = %rel, error = %e, "hydration failed");
+            }
+        }
+        store.finish_hydrate(rel, true);
+    }
+
+    /// Download a node into the backing dir (placeholder mode). Same atomic
+    /// tmp+rename pattern as [`Engine::download_file`], different target.
+    async fn download_to_backing(&mut self, uid: &str, rel: &str) -> Result<()> {
+        let abs = to_abs(&self.backing_dir, rel);
+        if abs.is_file() {
+            return Ok(()); // already hydrated (lost wake-up)
+        }
+        if let Some(dir) = abs.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        let tmp = to_abs(&self.backing_dir, &format!("{rel}.pds-part"));
+        let sidecar = Arc::clone(&self.sidecar);
+        let outcome = self
+            .run_transfer("download", Some(rel), sidecar.download(uid, &tmp))
+            .await?;
+        let _ = outcome;
+        std::fs::rename(&tmp, &abs)?;
+        Ok(())
+    }
 
     /// Download `uid` to `rel` and mark the row synced.
     async fn download_file(&mut self, uid: &str, rel: &str) -> Result<()> {

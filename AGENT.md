@@ -25,7 +25,7 @@ A **Linux** desktop app that syncs Proton Drive into a local folder. **Read `SPE
 - [x] M0 — Spike: **PASSED 2026-10-23** against a real account — fork auth, key unlock, SDK bootstrap, list, upload, verified download, trash, event cursor (FastForward). Go decision confirmed.
 - [x] M1 — Headless sync engine: **PASSED live E2E 2026-10-24** (scratch account) — F1–F4, F6, F7 all verified against real Proton Drive. 54/54 Rust tests, sidecar smoke + event-loop tests green. E2E bugs found & fixed: telemetry-on-stdout, F7 stale-base race (server 409 → parked → event-path keep-both), guard cascade, CLI per-root resolution, event-stream polling (sidecar now polls /events/{cursor} every ~30s).
 - [x] M2 — GPUI shell: **done 2026-10-24** (tray app). **Rewritten 2026-10-29** as a single-window Linux desktop app (sidebar + Overview/Activity/Conflicts/Settings, login screen, sign-out modal) when macOS support was dropped; `gpui-tray` removed.
-- [ ] M3 — Linux FUSE VFS ← **next**
+- [x] M3.1 — FUSE placeholders: **done 2026-10-29** — read-only `pds mount` with on-demand hydration; engine placeholder mode (`placeholders: true` → VFS store, backing dir `.pds-vfs-backing/`, no materialization); real-kernel E2E in the VM (3 MB file read through the mount, EROFS on writes). M3.2 (write-through, pins, LRU eviction) next.
 - [ ] M4 — Hardening
 
 ## Linux development (OrbStack VM)
@@ -54,6 +54,14 @@ Notes:
 
   Rendering works with Mesa lavapipe (`VK_ICD_FILENAMES` unset — pointing it at a wrong filename *disables* software Vulkan).
 
+## fuser / FUSE gotchas (learned in M3.1)
+
+- **A `Filesystem` method that never replies wedges the kernel caller** (not just that request): `read_dir` hangs with no error, no panic. Every path must consume `reply` exactly once.
+- **A reply with the wrong data can fail silently at the mount level.** The M3.1 bug: `Tree::node("")` returned `None` for the root (`""` is not in `by_path`), so root `getattr` answered ENOENT; the kernel then failed *all* `read_dir` on the mountpoint with ENOENT while `mount | grep` still showed the fs present and `init`/`getattr` logs looked healthy. Test the root-inode path explicitly.
+- **fuser 0.18 API**: trait methods take `&self` (not `&mut self`); `readdir` offset is `u64` (1 = "after entry 0"); `ReplyDirectory::add(ino, offset, kind, name)` returns `true` when the buffer is full; `ReplyStatfs::statfs` takes 8 args (blocks, bfree, bavail, files, ffree, bsize, namelen, frsize); errors are `fuser::Errno::ENOENT`-style constants; `Config` is `#[non_exhaustive]` — mutate `cfg.mount_options` after `Config::default()`, no struct literal.
+- `editions = 2024`: `gen` is a reserved keyword — don't name struct fields or locals `gen`.
+- Panic in a fuser session thread is swallowed (session thread dies, callers get ENOENT/EIO). Wrap suspect methods with `std::panic::catch_unwind` + `eprintln` when debugging; a custom panic hook also works.
+
 ## Standing instructions from the user
 
 - **Auto-approve subagent permission prompts** (user's directive, 2026-10-23): when Herdr subagents block on permission dialogs, approve them without asking, as long as the request is research/build-scoped and non-destructive.
@@ -77,8 +85,9 @@ proton-drive-sync/
 ├── AGENT.md           # This file
 ├── crates/
 │   ├── app/           # GPUI Linux desktop app (single window)
-│   ├── cli/           # `pds` — headless engine + status/pause/resume control
-│   ├── core/          # Sync engine, state DB, queues, trash guards
+│   ├── cli/           # `pds` — headless engine + status/pause/resume/mount
+│   ├── core/          # Sync engine, state DB, queues, trash guards, VFS store
+│   ├── vfs-linux/     # FUSE placeholder filesystem (fuser; M3)
 │   └── sidecar-client/ # Sidecar spawn + JSON-RPC protocol (+ MockSidecar for tests)
 ├── sidecar/           # Node.js + official Proton Drive SDK
 └── packaging/linux/   # .desktop entry, icon, install script
