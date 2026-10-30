@@ -45,21 +45,21 @@ contents:
     dst: /usr/share/applications/proton-drive-sync.desktop
   - src: ./staging/share/icons/hicolor/scalable/apps/proton-drive-sync.svg
     dst: /usr/share/icons/hicolor/scalable/apps/proton-drive-sync.svg
-  - src: ./staging/share/icons/hicolor/scalable/apps/proton-drive-sync.svg
-    dst: /usr/share/icons/hicolor/scalable/apps/proton-drive-sync.svg
   - src: ./LICENSE
     dst: /usr/share/doc/proton-drive-sync/LICENSE
 
 # The sidecar needs node + npx on PATH (>= 20 per sidecar/package.json).
-# FUSE is only required for `pds mount` placeholders.
-deb:
-  depends:
-    - nodejs (>= 20)
-    - npm
-  recommends:
-    - fuse3
-rpm:
-  depends:
-    - nodejs >= 20
-  recommends:
-    - fuse3
+# FUSE is only required for `pds mount` placeholders. Dependency version
+# syntax differs between deb and rpm, so versioned deps live under
+# overrides (top-level deb:/rpm: sections don't take depends/recommends).
+recommends:
+  - fuse3
+overrides:
+  deb:
+    depends:
+      - nodejs (>= 20)
+      - npm
+  rpm:
+    depends:
+      - nodejs >= 20
+      - npm
