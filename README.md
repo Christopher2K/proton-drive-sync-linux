@@ -1,5 +1,9 @@
 # proton-drive-sync
 
+> **Experimental, unofficial, and used at your own risk.** Not affiliated with
+> Proton. Built for my own personal use case; I am not responsible for any data
+> loss. See [Read this first](#read-this-first-important).
+
 A **Linux** desktop app that syncs a folder with [Proton Drive](https://proton.me/drive) — files you drop into `~/ProtonDrive` upload automatically, remote changes appear locally, and deletions are conservative (remote deletes go to Trash, with a mass-delete guard).
 
 - **Product spec:** [SPEC.md](SPEC.md) — source of truth
@@ -7,7 +11,24 @@ A **Linux** desktop app that syncs a folder with [Proton Drive](https://proton.m
 
 Stack: Rust + GPUI (native Linux desktop UI) · Node.js sidecar running the official [Proton Drive SDK](https://github.com/ProtonDriveApps/sdk) · SQLite state. (macOS and Windows were supported in an earlier iteration and have been dropped.)
 
-> This is a third-party application not officially supported by Proton.
+## Read this first (important)
+
+- **Experimental.** This project is a work in progress and is **not** ready for
+  production or for data you cannot afford to lose. Expect bugs, sync edge
+  cases, and breaking changes.
+- **Not affiliated with Proton.** This is an independent, third-party project.
+  It is not endorsed by, supported by, or connected to Proton AG in any way,
+  and it is not an official Proton product.
+- **Personal project.** I built this for my own personal use case. With Proton
+  Drive now having an [official SDK](https://github.com/ProtonDriveApps/sdk), I
+  wanted to build a Linux desktop sync client on top of it for fun and for my
+  own workflow. Your needs may differ.
+- **Use at your own risk.** I am **not responsible for any data loss** or
+  corruption caused by using this software. Keep independent backups of
+  anything important before pointing this at a folder.
+
+If any of that is a dealbreaker, please use the official Proton Drive apps
+instead.
 
 ## Features (M1/M2, materialized folder)
 
