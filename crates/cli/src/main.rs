@@ -2,7 +2,7 @@
 //!
 //! All Drive traffic goes through the spawned Node.js sidecar; `sync` runs
 //! the engine against a local folder (full materialization). `mount` (M3)
-//! serves a read-only placeholder view with on-demand hydration instead.
+//! serves a placeholder view with on-demand hydration and RW writes instead.
 
 mod control;
 mod spawn;
@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Parser, Subcommand};
-use pds_core::{Engine, EngineConfig, STATE_DIR};
+use pds_core::{Engine, EngineConfig, STATE_DIR, VFS_BACKING_DIR};
 use pds_sidecar_client::{Notification, SidecarApi};
 use tracing::info;
 
@@ -65,8 +65,9 @@ enum Cmd {
         #[arg(long)]
         root: Option<PathBuf>,
     },
-    /// Mount a read-only placeholder view of a running sync root (M3).
-    /// Files hydrate through the engine on open. Requires /dev/fuse.
+    /// Mount a placeholder view of a running sync root (M3).
+    /// Files hydrate through the engine on open; creates/edits upload
+    /// through it. Requires /dev/fuse.
     Mount {
         /// Sync root whose state DB backs the mount.
         folder: PathBuf,
@@ -267,7 +268,7 @@ async fn mount(folder: PathBuf, mountpoint: PathBuf, sidecar_cmd: Option<&str>) 
     let engine_task = tokio::spawn(engine.run());
 
     // FUSE session on its own thread; unmounts when the handle drops.
-    let fs = pds_vfs_linux::PdsFs::new(store, root.join(STATE_DIR), root.join(".pds-vfs-backing"));
+    let fs = pds_vfs_linux::PdsFs::new(store, root.join(STATE_DIR), root.join(VFS_BACKING_DIR));
     let mut cfg = fuser::Config::default();
     // Writable mount: the fs enforces read-only per file (snapshot-backed
     // content is RO; new files created through the mount upload on close).

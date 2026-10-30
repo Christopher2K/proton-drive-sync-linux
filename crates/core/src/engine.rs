@@ -35,6 +35,9 @@ use crate::store::{Store, VNode};
 
 /// Name of the engine-private directory inside the sync root (DB, socket).
 pub const STATE_DIR: &str = ".pds";
+/// Backing store for the FUSE placeholder VFS, inside the root but invisible
+/// to the sync pipeline (M3): never watched, never uploaded, never trashed.
+pub const VFS_BACKING_DIR: &str = ".pds-vfs-backing";
 const META_INITIAL_SYNC_DONE: &str = "initial_sync_done";
 
 /// First backoff delay after a retryable upload failure (F2).
@@ -656,7 +659,7 @@ impl<S: SidecarApi + 'static> Engine<S> {
                 let Some(rel) = to_rel(&self.root, &path) else {
                     continue;
                 };
-                if rel == STATE_DIR || rel.starts_with(&format!("{STATE_DIR}/")) {
+                if is_internal_path(&rel) {
                     continue;
                 }
                 if path.is_dir() {
@@ -689,7 +692,7 @@ impl<S: SidecarApi + 'static> Engine<S> {
             let Some(rel) = to_rel(&self.root, &path) else {
                 continue;
             };
-            if rel.is_empty() || rel == STATE_DIR || rel.starts_with(&format!("{STATE_DIR}/")) {
+            if rel.is_empty() || is_internal_path(&rel) {
                 continue;
             }
             if !seen.insert(rel.clone()) {
@@ -739,7 +742,7 @@ impl<S: SidecarApi + 'static> Engine<S> {
         };
         for entry in entries.flatten() {
             let child_rel = format!("{rel}/{}", entry.file_name().to_string_lossy());
-            if child_rel == STATE_DIR || child_rel.starts_with(&format!("{STATE_DIR}/")) {
+            if is_internal_path(&child_rel) {
                 continue;
             }
             if is_temp_file(&child_rel) || !seen.insert(child_rel.clone()) {
@@ -1537,7 +1540,11 @@ impl<S: SidecarApi + 'static> Engine<S> {
                 store.clear_backing(&rel);
                 continue;
             };
-            if row.pinned || row.sync_state != SyncState::Synced || store.is_open(&rel) {
+            if row.pinned
+                || row.sync_state != SyncState::Synced
+                || store.is_open(&rel)
+                || store.is_uploading(&rel)
+            {
                 continue;
             }
             let size = row.size.unwrap_or(0).max(0) as u64;
@@ -2074,6 +2081,17 @@ fn local_content_diverged(row: &NodeRow, abs: &Path) -> bool {
 /// downloads via `{path}.pdstmp-{transferId}` + rename — so its temps match
 /// neither a `.pds-part` suffix check nor our names exactly. Ignore both on
 /// create AND delete events (they are rename artifacts, never user content).
+/// Paths the sync pipeline must ignore: engine state, and the VFS backing
+/// dir whose contents mirror remote files (placeholder mode). Without the
+/// backing-dir filter, hydration/eviction/revision writes would re-enter
+/// the watcher as "local changes" of themselves.
+fn is_internal_path(rel: &str) -> bool {
+    rel == STATE_DIR
+        || rel.starts_with(&format!("{STATE_DIR}/"))
+        || rel == VFS_BACKING_DIR
+        || rel.starts_with(&format!("{VFS_BACKING_DIR}/"))
+}
+
 fn is_temp_file(rel: &str) -> bool {
     let name = rel.rsplit('/').next().unwrap_or(rel);
     name.contains(".pds-part") || name.contains(".pdstmp-")

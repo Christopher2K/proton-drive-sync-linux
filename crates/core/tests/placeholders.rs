@@ -249,6 +249,80 @@ async fn pinned_file_survives_eviction() {
     let _ = engine.await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn backing_dir_events_never_enter_the_sync_pipeline() {
+    // Regression (found in M3.3): the watcher and the initial scan saw
+    // `.pds-vfs-backing/` and treated hydration as a local change —
+    // uploading files into a phantom remote `.pds-vfs-backing` folder.
+    let fx = start_with_cap(None).await;
+    wait_for(|| fx.store.snapshot().by_path.contains_key("hello.txt")).await;
+
+    // Hydrate through the normal path; the backing write must NOT produce
+    // a pending DB row or a remote upload under `.pds-vfs-backing/…`.
+    fx.store.begin_hydrate("hello.txt");
+    wait_for(|| {
+        fx.store
+            .backing_path("hello.txt")
+            .map(|p| p.is_file())
+            .unwrap_or(false)
+    })
+    .await;
+
+    // Give the debounced watcher (500 ms) ample time to misfire.
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    let uploaded = fx.mock.uploaded_names();
+    assert!(
+        uploaded
+            .iter()
+            .all(|n| !n.contains(".pds-vfs-backing")),
+        "backing-dir files leaked into the upload pipeline: {uploaded:?}"
+    );
+    fx.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn evicted_placeholder_rehydrates_on_request() {
+    // Eviction (backing file deleted by the engine) must likewise never
+    // trip the delete path — the placeholder stays in the snapshot.
+    let fx = start_with_cap(Some(1)).await;
+    wait_for(|| fx.store.snapshot().by_path.contains_key("hello.txt")).await;
+    fx.handle.pin("hello.txt").await.unwrap();
+    wait_for(|| {
+        fx.store
+            .backing_path("hello.txt")
+            .map(|p| p.is_file())
+            .unwrap_or(false)
+    })
+    .await;
+    fx.handle.unpin("hello.txt").await.unwrap();
+
+    // Trigger a hydration pass that evicts hello.txt.
+    fx.mock.remote_create_file("root", "c.txt", b"cccc");
+    wait_for(|| fx.store.snapshot().by_path.contains_key("c.txt")).await;
+    fx.store.begin_hydrate("c.txt");
+    wait_for(|| fx.store.backing_path("hello.txt").is_none()).await;
+
+    // No trashes, no phantom uploads, and the snapshot still lists it.
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    assert!(fx.mock.trashed_uids().is_empty(), "eviction must not trash");
+    assert!(
+        fx.store.snapshot().by_path.contains_key("hello.txt"),
+        "evicted file must remain a placeholder"
+    );
+    // Rehydration restores content.
+    fx.store.begin_hydrate("hello.txt");
+    wait_for(|| {
+        fx.store
+            .backing_path("hello.txt")
+            .map(|p| p.is_file())
+            .unwrap_or(false)
+    })
+    .await;
+    fx.shutdown().await;
+}
+
 // Keep imports honest even if a test is skipped.
 #[allow(dead_code)]
 fn _t(_: HashMap<String, String>) {}

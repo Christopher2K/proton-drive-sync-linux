@@ -60,11 +60,12 @@ Pause: freezes upload + download queues mid-transfer (block-level resume), stops
 
 - All remote items visible in the sync root at ~0 bytes locally.
 - **Hydration:** on file open (FUSE read), content is fetched on demand.
-- **Write-through (M3.2 ✅ 2026-10-29):** files created through the mount upload on close (`release`/`fsync`); `mkdir`/`unlink`/`rmdir` mirror remotely (trash path). Backing content lives in `.pds-vfs-backing/`; uploads reuse the standard engine machinery (F7 collision check, retries, pause buffering). Snapshot-backed files stay read-only until revision writes (M3.3); the mount itself is RW.
+- **Write-through (M3.2 ✅ 2026-10-29):** files created through the mount upload on close (`release`/`fsync`); `mkdir`/`unlink`/`rmdir` mirror remotely (trash path). Backing content lives in `.pds-vfs-backing/`; uploads reuse the standard engine machinery (F7 collision check, retries, pause buffering). The mount itself is RW.
+- **Revision writes (M3.3 ✅ 2026-10-29):** snapshot-backed files open RW through the mount; the open waits (bounded) for hydration, edits land on the backing file, and `release`/`fsync` upload the revision against the existing `node_uid` (F7 `check_remote_head` guards stale heads). `O_TRUNC` (e.g. `fs::write`) works: fuser does not negotiate `ATOMIC_O_TRUNC`, so truncation arrives as `setattr(size, fh)` and defers to the open handle's `release` — one upload per write sequence, no empty intermediate. `truncate(2)` outside a handle queues the upload directly.
 - **Pin/unpin (M3.2 ✅ 2026-10-29):** `pds pin <folder> <path>` marks the row pinned in the DB and hydrates it immediately; folder paths pin recursively. Pinned files are never evicted.
 - **Eviction (M3.2 ✅ 2026-10-29):** LRU cache with a configurable size cap (`EngineConfig::eviction_cap`, default 10 GiB in `pds mount`). Never evicts pinned, dirty (un-uploaded), or open files, nor the file that just hydrated. Runs on the engine's idle path after hydrations; the snapshot flips `content_ready` back so the placeholder reappears immediately.
 
-M3 progress (2026-10-29): placeholder mount, hydration, write-through, pins, and LRU eviction all work end-to-end (engine tests + real-kernel FUSE E2E in the VM). M3 remainder: in-place revision writes through the mount (M3.3).
+M3 progress (2026-10-29): placeholder mount, hydration, write-through, pins, LRU eviction, and in-place revision writes all work end-to-end (engine tests + real-kernel FUSE E2E in the VM). M3 is complete; M4 (hardening) next.
 
 ### F6 — Remote → local reconciliation
 
@@ -89,7 +90,7 @@ One main window: sidebar navigation (**Overview / Activity / Conflicts / Setting
 - **M0 — Spike:** headless Node script proving auth + list/upload/download/trash + event stream via the SDK. *Go/no-go gate.* ✅ 2026-10-23.
 - **M1 — Headless sync engine (CLI):** local folder ↔ Drive, F2/F3/F4/F7 with real files (no VFS yet), SQLite state. ✅ 2026-10-24 (live E2E).
 - **M2 — GPUI desktop shell (Linux):** single-window app; login, overview, activity, conflicts, settings, sign-out. ✅ 2026-10-29 (rewritten from the v0.1 tray shell when the project went Linux-only).
-- **M3 — Linux VFS:** FUSE mount, placeholders, hydration (M3.1 ✅ 2026-10-29), write-through + pins + LRU eviction (M3.2 ✅ 2026-10-29, E2E-proven in the VM); revision writes next (M3.3).
+- **M3 — Linux VFS:** FUSE mount, placeholders, hydration (M3.1 ✅ 2026-10-29), write-through + pins + LRU eviction (M3.2 ✅ 2026-10-29, E2E-proven in the VM), revision writes (M3.3 ✅ 2026-10-29).
 - **M4 — Hardening:** conflict soak tests, backoff/rate-limit validation, SDK upgrade rehearsal for the crypto migration.
 
 ## 8. Key risks

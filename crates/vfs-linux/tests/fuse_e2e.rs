@@ -38,7 +38,9 @@ async fn fuse_mount_serves_placeholders_and_hydrates() {
 
     let (client, mock) = MockSidecar::new().connect();
     let mut client = client;
-    mock.remote_create_file("root", "hello.txt", b"hello drive");
+    // hello.txt already comes seeded by the mock ("hello drive"); only
+    // big.bin needs creating. A second hello.txt here would desync
+    // `find_uid` from the node the engine revises.
     mock.remote_create_file("root", "big.bin", &big);
     let notifications = client.take_notifications();
 
@@ -122,11 +124,14 @@ async fn fuse_mount_serves_placeholders_and_hydrates() {
     assert!(!root.join("big.bin").exists());
     assert!(root.join(".pds-vfs-backing").join("big.bin").is_file());
 
-    // 5. Snapshot-backed files stay read-only in M3.2 (revision writes are
-    // a later slice)…
-    let err = std::fs::write(mnt.join("hello.txt"), b"nope")
-        .expect_err("write to a hydrated file must fail with EROFS");
-    assert_eq!(err.raw_os_error(), Some(30)); // EROFS
+    // 5. Revision writes are allowed on hydrated/snapshot-backed files
+    // since M3.3 (checked below); a plain read-only handle still refuses
+    // nothing — instead verify a write handle revises in place later. For
+    // now assert hydration actually landed (prerequisite for revisions).
+    assert!(
+        store.backing_path("hello.txt").map(|p| p.is_file()) == Some(true),
+        "hello.txt hydrated by the earlier read"
+    );
 
     // 6. Write-through: create a file through the mount, upload fires.
     std::fs::write(mnt.join("notes.txt"), b"written via fuse").unwrap();
@@ -162,6 +167,56 @@ async fn fuse_mount_serves_placeholders_and_hydrates() {
         std::fs::read(mnt.join("notes.txt")).unwrap(),
         b"written via fuse"
     );
+
+    // 6b. Revision write (M3.3): open the hydrated big.bin for write and
+    // overwrite its head. The remote content must end up matching the
+    // backing file (same node_uid — a revision, not a new file).
+    let uid_big = mock.find_uid("root", "big.bin").expect("big.bin uid");
+    let mut rev = std::fs::OpenOptions::new()
+        .write(true)
+        .open(mnt.join("big.bin"))
+        .expect("revision write open");
+    use std::io::Write as _;
+    rev.write_all(b"REVISED").unwrap();
+    drop(rev);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let head = mock
+            .file_content(&uid_big)
+            .map(|c| c[..7.min(c.len())].to_vec());
+        if head.as_deref() == Some(&b"REVISED"[..]) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "revision upload never landed remotely: root children {:?}, uploads {:?}",
+            mock.child_names("root"),
+            mock.uploaded_names(),
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    // Same node, exactly one revision upload for big.bin so far.
+    assert_eq!(mock.upload_attempts("big.bin"), 1);
+    // The truncate-free revision preserved the tail bytes.
+    let remote = mock.file_content(&uid_big).unwrap();
+    assert_eq!(&remote[..7], b"REVISED");
+    assert_eq!(remote.len(), big.len());
+
+    // 6c. O_TRUNC rewrite: `fs::write` opens with O_TRUNC → setattr(size=0)
+    // then writes fresh content; remote must converge to the new content.
+    std::fs::write(mnt.join("hello.txt"), b"trunc+rewrite").unwrap();
+    let uid_hello = mock.find_uid("root", "hello.txt").expect("hello.txt uid");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if mock.file_content(&uid_hello).as_deref() == Some(&b"trunc+rewrite"[..]) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "O_TRUNC rewrite never landed remotely"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 
     // 7. mkdir + nested create upload the folder chain too.
     std::fs::create_dir(mnt.join("docs")).unwrap();

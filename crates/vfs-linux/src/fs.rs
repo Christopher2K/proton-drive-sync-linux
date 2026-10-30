@@ -102,11 +102,15 @@ impl Overlay {
     }
 }
 
-/// Per-open state of a write handle.
+/// Per-open state of a write handle (fh ≥ 1). `overlay` marks files
+/// created through the mount (no snapshot row yet); revision handles on
+/// snapshot-backed files are LRU/open-tracked like read handles.
 #[derive(Debug)]
 struct WriteHandle {
+    rel: String,
     file: File,
     dirty: bool,
+    overlay: bool,
 }
 
 impl PdsFs {
@@ -177,6 +181,27 @@ impl PdsFs {
     /// content goes through the store's registered path).
     fn open_backing(&self, rel: &str) -> Option<File> {
         File::open(to_abs(&self.backing_dir, rel)).ok()
+    }
+
+    /// Open `rel`'s backing file read-write, waiting (bounded) for the
+    /// engine to hydrate it first. Creates the parent dirs so an unlinked-
+    /// then-recreated path still works.
+    fn open_backing_rw(&self, rel: &str) -> Option<File> {
+        let abs = to_abs(&self.backing_dir, rel);
+        let deadline = std::time::Instant::now() + HYDRATE_WAIT;
+        loop {
+            if let Some(dir) = abs.parent() {
+                std::fs::create_dir_all(dir).ok();
+            }
+            if let Ok(f) = std::fs::OpenOptions::new().read(true).write(true).open(&abs) {
+                return Some(f);
+            }
+            if std::time::Instant::now() >= deadline {
+                warn!(path = %rel, "revision open: hydration wait expired");
+                return None;
+            }
+            std::thread::sleep(HYDRATE_POLL);
+        }
     }
 
     /// Now as unix seconds (write timestamps).
@@ -449,12 +474,37 @@ impl fuser::Filesystem for PdsFs {
             return reply.opened(FileHandle(0), FopenFlags::empty());
         }
         use fuser::OpenAccMode;
-        if flags.acc_mode() != OpenAccMode::O_RDONLY && self.overlay_entry(&rel).is_none() {
-            // Existing hydrated/snapshot files stay read-only (M3.3 adds
-            // in-place revision writes; ephemeral write files are RW).
-            return reply.error(Errno::EROFS);
+        let writable = flags.acc_mode() != OpenAccMode::O_RDONLY;
+        if writable && self.overlay_entry(&rel).is_none() {
+            // Revision write (M3.3): the file must be hydrated before the
+            // handle can serve bytes — same bounded wait as read().
+            if !content_ready {
+                self.store.begin_hydrate(&rel);
+            }
+            // Open the backing file RW now; if hydration is still pending
+            // the fd points at nothing yet — wait here (bounded) so writes
+            // land on real content.
+            let Some(file) = self.open_backing_rw(&rel) else {
+                return reply.error(Errno::EIO);
+            };
+            let fh = self
+                .next_fh
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.handles.lock().expect("handles mutex").insert(
+                fh,
+                WriteHandle {
+                    rel: rel.clone(),
+                    file,
+                    dirty: false,
+                    overlay: false,
+                },
+            );
+            self.store.record_access(&rel);
+            // Revision handles keep the file evict-protected too.
+            self.store.add_open_handle(&rel);
+            return reply.opened(FileHandle(fh), FopenFlags::empty());
         }
-        // Kick the engine early; the bounded wait happens in read().
+        // Read open (or overlay file, which needs no hydration).
         if !content_ready && self.overlay_entry(&rel).is_none() {
             self.store.begin_hydrate(&rel);
         } else {
@@ -468,6 +518,7 @@ impl fuser::Filesystem for PdsFs {
         }
         reply.opened(FileHandle(0), FopenFlags::empty());
     }
+
 
     fn read(
         &self,
@@ -512,7 +563,7 @@ impl fuser::Filesystem for PdsFs {
     fn write(
         &self,
         _req: &Request,
-        ino: INodeNo,
+        _ino: INodeNo,
         fh: FileHandle,
         offset: u64,
         data: &[u8],
@@ -525,6 +576,7 @@ impl fuser::Filesystem for PdsFs {
         let Some(handle) = handles.get(&fh.0) else {
             return reply.error(Errno::EIO);
         };
+        let handle_rel = handle.rel.clone();
         let mut file = handle.file.try_clone().expect("file clone");
         drop(handles);
         if file.seek(SeekFrom::Start(offset)).is_err() {
@@ -535,15 +587,16 @@ impl fuser::Filesystem for PdsFs {
                 if let Some(h) = self.handles.lock().expect("handles mutex").get_mut(&fh.0) {
                     h.dirty = true;
                 }
-                // Keep the overlay size current for getattr while open.
+                // Keep the overlay size current for getattr while open
+                // (overlay files only; revision files keep snapshot size
+                // until the engine's post-upload snapshot).
                 if let Ok(meta) = file.metadata()
-                    && let Some(rel) = self.rel_of_any(ino)
                     && let Some(entry) = self
                         .overlay
                         .lock()
                         .expect("overlay mutex")
                         .by_rel
-                        .get_mut(&rel)
+                        .get_mut(&handle_rel)
                 {
                     entry.size = entry.size.max(meta.len());
                 }
@@ -585,7 +638,7 @@ impl fuser::Filesystem for PdsFs {
     ) {
         debug!(fh = fh.0, "vfs: release");
         // fh 0 = read open (tracked for eviction protection); fh ≥ 1 =
-        // write handle created by `create`.
+        // write handle from `create` (overlay) or a revision open.
         if fh.0 == 0 {
             if let Some(rel) = self.rel_of_any(ino) {
                 self.store.remove_open_handle(&rel);
@@ -593,15 +646,22 @@ impl fuser::Filesystem for PdsFs {
             return reply.ok();
         }
         let handle = self.handles.lock().expect("handles mutex").remove(&fh.0);
-        if let Some(h) = handle
-            && h.dirty
-        {
+        let Some(h) = handle else {
+            return reply.ok();
+        };
+        // The handle knows its path authoritatively (ino may already have
+        // been recycled by an unlink during the handle's lifetime).
+        let rel = h.rel.clone();
+        let overlay = h.overlay;
+        if h.dirty {
             let size = h.file.metadata().map(|m| m.len()).unwrap_or(0);
             h.file.sync_all().ok();
             drop(h);
-            if let Some(rel) = self.rel_of_any(ino) {
-                self.finalize_write(&rel, size);
-            }
+            self.finalize_write(&rel, size);
+        }
+        if !overlay {
+            // Revision handles are open-tracked; drop the protection.
+            self.store.remove_open_handle(&rel);
         }
         reply.ok();
     }
@@ -609,7 +669,7 @@ impl fuser::Filesystem for PdsFs {
     fn fsync(
         &self,
         _req: &Request,
-        ino: INodeNo,
+        _ino: INodeNo,
         fh: FileHandle,
         _datasync: bool,
         reply: ReplyEmpty,
@@ -619,8 +679,8 @@ impl fuser::Filesystem for PdsFs {
             .lock()
             .expect("handles mutex")
             .get(&fh.0)
-            .map(|h| (h.dirty, h.file.metadata().map(|m| m.len()).unwrap_or(0)));
-        if let Some((dirty, size)) = upload {
+            .map(|h| (h.dirty, h.rel.clone(), h.file.metadata().map(|m| m.len()).unwrap_or(0)));
+        if let Some((dirty, rel, size)) = upload {
             if let Some(handle) = self.handles.lock().expect("handles mutex").get(&fh.0) {
                 handle.file.sync_all().ok();
             }
@@ -628,9 +688,7 @@ impl fuser::Filesystem for PdsFs {
                 if let Some(h) = self.handles.lock().expect("handles mutex").get_mut(&fh.0) {
                     h.dirty = false;
                 }
-                if let Some(rel) = self.rel_of_any(ino) {
-                    self.finalize_write(&rel, size);
-                }
+                self.finalize_write(&rel, size);
             }
         }
         reply.ok();
@@ -701,10 +759,15 @@ impl fuser::Filesystem for PdsFs {
                 is_dir: false,
             },
         );
-        self.handles
-            .lock()
-            .expect("handles mutex")
-            .insert(fh, WriteHandle { file, dirty: false });
+        self.handles.lock().expect("handles mutex").insert(
+            fh,
+            WriteHandle {
+                rel,
+                file,
+                dirty: false,
+                overlay: true,
+            },
+        );
         let fopen = FopenFlags::empty();
         reply.created(
             &TTL,
@@ -856,7 +919,7 @@ impl fuser::Filesystem for PdsFs {
         _atime: Option<fuser::TimeOrNow>,
         mtime: Option<fuser::TimeOrNow>,
         _ctime: Option<std::time::SystemTime>,
-        _fh: Option<FileHandle>,
+        fh: Option<FileHandle>,
         _crtime: Option<std::time::SystemTime>,
         _chgtime: Option<std::time::SystemTime>,
         _bkuptime: Option<std::time::SystemTime>,
@@ -869,23 +932,58 @@ impl fuser::Filesystem for PdsFs {
         let Some((is_dir, mut cur_size, mut cur_mtime, _ready)) = self.node_meta(&rel) else {
             return reply.error(Errno::ENOENT);
         };
-        // truncate(2) on a write-created file: resize the backing file.
+        // truncate(2): resize the backing file. Overlay files created this
+        // session are trivially writable; snapshot-backed files truncate in
+        // place (M3.3 revision) — hydration must land first, and the
+        // truncation marks the content dirty for the next upload.
         if let Some(new_size) = size {
             if is_dir {
                 return reply.error(Errno::EISDIR);
             }
-            if self.overlay_entry(&rel).is_none() {
-                // Snapshot files are read-only in M3.2.
-                return reply.error(Errno::EROFS);
+            let overlay = self.overlay_entry(&rel).is_some();
+            if !overlay && self.store.backing_path(&rel).is_none() {
+                // Placeholder content: hydrate first (bounded wait) so the
+                // truncate lands on real content, not a missing file.
+                if self.wait_for_backing(&rel).is_none() {
+                    return reply.error(Errno::EIO);
+                }
+                self.store.record_access(&rel);
             }
             let abs = to_abs(&self.backing_dir, &rel);
-            if let Ok(f) = std::fs::OpenOptions::new().write(true).open(&abs)
-                && let Err(e) = f.set_len(new_size)
-            {
-                warn!(error = %e, path = %rel, "truncate failed");
+            if let Ok(f) = std::fs::OpenOptions::new().write(true).open(&abs) {
+                if let Err(e) = f.set_len(new_size) {
+                    warn!(error = %e, path = %rel, "truncate failed");
+                    return reply.error(Errno::EIO);
+                }
+                f.sync_all().ok();
+            } else {
+                warn!(path = %rel, "truncate: backing file unopenable");
                 return reply.error(Errno::EIO);
             }
             cur_size = new_size;
+            if let Some(fh) = fh
+                && self
+                    .handles
+                    .lock()
+                    .expect("handles mutex")
+                    .get_mut(&fh.0)
+                    .is_some_and(|h| {
+                        h.dirty = true;
+                        h.rel == rel
+                    })
+            {
+                // Truncation through an open write handle: defer the upload
+                // to release/fsync — one revision for the whole write
+                // sequence, no empty intermediate (open(O_TRUNC) pattern).
+            } else if overlay {
+                // Overlay (write-created) files carry no row yet; the create
+                // path already queued the write.
+                self.store.record_write(&rel);
+            } else {
+                // Truncate outside a handle (truncate(2)): queue the revision
+                // upload directly (re-hash-deduped by the store).
+                self.store.record_write(&rel);
+            }
         }
         if let Some(t) = mtime {
             cur_mtime = match t {
