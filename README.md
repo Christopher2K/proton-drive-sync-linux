@@ -73,6 +73,30 @@ PREFIX=$HOME/.local packaging/linux/install.sh
 
 This installs the `proton-drive-sync` binary, the `pds` CLI, the sidecar (with vendored npm deps), a `.desktop` entry, and an icon. The app then appears in your application menu.
 
+## Install (Nix)
+
+On Nix-based Linux systems (NixOS or any distro with Nix), build and install straight from this repository:
+
+```sh
+# try the app without installing (apps: proton-drive-sync, pds)
+nix run .#proton-drive-sync
+
+# install the app + CLI + sidecar into a profile
+nix profile install .#default
+```
+
+Or from a remote machine directly:
+
+```sh
+nix profile install github:Christopher2K/proton-drive-sync-linux
+```
+
+The flake exposes `packages.proton-drive-sync` (app + CLI + sidecar, wrapped so
+the binaries find their sidecar in the Nix store), `packages.sidecar`, and a
+`nix develop` shell mirroring `devenv.nix`. Only Linux systems are supported —
+the GPUI shell does not build on macOS. The Rust tests run via
+`nix flake check` (the FUSE e2e test self-skips without `/dev/fuse`).
+
 ## CLI companion
 
 `pds sync` runs the engine headless; `pds status|pause|resume` control a running engine; `pds conflicts` lists the conflict inbox. `pds mount <folder> <mountpoint>` serves a **placeholder view** of a sync root (requires `/dev/fuse`): files hydrate from Drive on first open, files/folders you create through the mount upload to Drive on close, and edits to existing files upload as new revisions of the same Drive file (M3). Hydrated content is an LRU cache capped at 10 GiB — `pds pin <folder> <path>` keeps a file (or folder, recursively) offline-safe, `pds unpin` releases it. See `pds --help`.
