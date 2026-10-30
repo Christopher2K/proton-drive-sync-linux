@@ -1,6 +1,6 @@
 [package]
 name = "pds-core"
-version = "0.1.0"
+version.workspace = true
 edition.workspace = true
 license.workspace = true
 description = "Sync engine, state DB, queues, and trash guards for proton-drive-sync"

@@ -1,0 +1,65 @@
+# nfpm packaging config — .deb and .rpm for the Linux desktop app + CLI.
+#
+# Consumed by .github/workflows/release.yml, which stages the install tree in
+# ./staging (binaries, vendored sidecar, desktop entry, icon) at the
+# repository root and invokes nfpm from there:
+#
+#   PDS_VERSION=0.1.0 PDS_ARCH=amd64 nfpm package \
+#     --config packaging/nfpm.yaml --packager deb --target dist/
+#
+# Content paths resolve relative to nfpm's working directory (repo root).
+# Arch follows nfpm's amd64/arm64 naming; nfpm maps it per packager
+# (deb: amd64/arm64, rpm: x86_64/aarch64).
+name: proton-drive-sync
+arch: ${PDS_ARCH}
+platform: linux
+version: ${PDS_VERSION}
+release: "1"
+section: net
+priority: optional
+maintainer: Christopher N. Katoyi Kaba <me@christopher2k.dev>
+description: >
+  Sync a local folder with Proton Drive (unofficial).
+  Native Linux desktop app (GPUI) and headless `pds` CLI; all Drive API
+  traffic goes through a bundled Node.js sidecar running the official
+  Proton Drive SDK. Third-party application, not officially supported
+  by Proton.
+homepage: https://github.com/Christopher2K/proton-drive-sync-linux
+license: MIT
+
+contents:
+  # Binaries (FHS layout: /usr/bin, sidecar under /usr/share — the app's
+  # discovery path `<exe dir>/../share/proton-drive-sync/sidecar` resolves
+  # to /usr/share/proton-drive-sync/sidecar).
+  - src: ./staging/bin/proton-drive-sync
+    dst: /usr/bin/proton-drive-sync
+  - src: ./staging/bin/pds
+    dst: /usr/bin/pds
+
+  # Node sidecar with its complete (patched) dependency tree vendored; it
+  # runs from TypeScript via tsx, so devDependencies are runtime deps here.
+  - src: ./staging/share/proton-drive-sync/sidecar
+    dst: /usr/share/proton-drive-sync/sidecar
+
+  - src: ./staging/share/applications/proton-drive-sync.desktop
+    dst: /usr/share/applications/proton-drive-sync.desktop
+  - src: ./staging/share/icons/hicolor/scalable/apps/proton-drive-sync.svg
+    dst: /usr/share/icons/hicolor/scalable/apps/proton-drive-sync.svg
+  - src: ./staging/share/icons/hicolor/scalable/apps/proton-drive-sync.svg
+    dst: /usr/share/icons/hicolor/scalable/apps/proton-drive-sync.svg
+  - src: ./LICENSE
+    dst: /usr/share/doc/proton-drive-sync/LICENSE
+
+# The sidecar needs node + npx on PATH (>= 20 per sidecar/package.json).
+# FUSE is only required for `pds mount` placeholders.
+deb:
+  depends:
+    - nodejs (>= 20)
+    - npm
+  recommends:
+    - fuse3
+rpm:
+  depends:
+    - nodejs >= 20
+  recommends:
+    - fuse3

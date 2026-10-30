@@ -40,9 +40,15 @@ in
     [
       cmake
       git
+      # Release/CI tooling: git-cliff generates CHANGELOG.md from conventional
+      # commits (scripts/release.sh); actionlint + shellcheck validate the
+      # workflows and release scripts.
+      actionlint
+      git-cliff
       nodejs_22
       openssl
       pkg-config
+      shellcheck
       sqlite
       zstd
     ]

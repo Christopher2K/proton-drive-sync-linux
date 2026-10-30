@@ -123,5 +123,14 @@ proton-drive-sync/
   ad-hoc apt/brew installs.
 - Rust: edition 2024, `cargo clippy -- -D warnings` clean, `tokio` for async.
 - Sidecar: TypeScript, strict mode, ESM. SDK version pinned exactly in `package.json`.
-- Commit messages: conventional commits (`feat:`, `fix:`, `chore:` …).
+- Commit messages: conventional commits (`feat:`, `fix:`, `chore:` …) — they
+  drive the changelog (`cliff.toml`), so keep scopes meaningful.
+- Releases: single workspace version (`[workspace.package]` in `Cargo.toml`;
+  crates inherit). Cut releases only via `scripts/release.sh <major|minor|patch>`
+  — it syncs the sidecar `package.json`/`APP_VERSION` (Proton compliance
+  string) and the Nix derivations, regenerates `CHANGELOG.md` (git-cliff),
+  and tags. `scripts/check-versions.sh` runs in CI to catch drift. Pushing a
+  `v*` tag triggers `.github/workflows/release.yml` (tarball + deb + rpm).
+  `actionlint` + `shellcheck` are in the devenv — run them after touching
+  workflows or release scripts.
 - When a milestone is completed, check it off above and note any spec deviations in `SPEC.md` §9.

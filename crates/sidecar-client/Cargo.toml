@@ -1,6 +1,6 @@
 [package]
 name = "pds-sidecar-client"
-version = "0.1.0"
+version.workspace = true
 edition.workspace = true
 license.workspace = true
 description = "Async JSON-RPC 2.0 client for the proton-drive-sync Node.js sidecar (NDJSON over stdio)"

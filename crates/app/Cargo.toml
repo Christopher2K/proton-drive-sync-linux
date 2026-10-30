@@ -1,6 +1,6 @@
 [package]
 name = "pds-app"
-version = "0.1.0"
+version.workspace = true
 edition.workspace = true
 license.workspace = true
 description = "Menu-bar desktop shell for proton-drive-sync (unofficial)"

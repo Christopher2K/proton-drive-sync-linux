@@ -38,28 +38,39 @@ pub fn spawn_sidecar(cmd: Option<&str>) -> Result<(SidecarClient, Child)> {
 /// Where to find the sidecar when no explicit command is given, in order:
 ///
 /// 1. `$PDS_SIDECAR_DIR`
-/// 2. `<exe dir>/sidecar`, then `<exe dir>/../sidecar` (installed layouts:
-///    `bin/proton-drive-sync` with a sibling `sidecar/`, or a flat install)
-/// 3. `$XDG_DATA_HOME/proton-drive-sync/sidecar` (default install location)
-/// 4. `./sidecar` (development: running from the repository root)
+/// 2. `<exe dir>/sidecar`, then `<exe dir>/../sidecar` (flat layouts)
+/// 3. `<exe dir>/../share/proton-drive-sync/sidecar` (system installs:
+///    `packaging/linux/install.sh` puts binaries in `$PREFIX/bin` and the
+///    sidecar in `$PREFIX/share/proton-drive-sync/sidecar`)
+/// 4. `$XDG_DATA_HOME/proton-drive-sync/sidecar` (user-local data dir)
+/// 5. `./sidecar` (development: running from the repository root)
 ///
 /// A directory counts if it can be launched: has `dist/index.js` or
 /// `src/index.ts` (plus `node_modules` for the TypeScript entry).
 pub fn discover_sidecar_dir() -> Option<PathBuf> {
+    let exe_dir = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(Path::to_path_buf));
+    candidate_dirs(exe_dir.as_deref())
+        .into_iter()
+        .find(|dir| is_launchable(dir))
+}
+
+/// Discovery candidates given the directory of the running executable
+/// (`None` when it cannot be determined). Split out for testing.
+fn candidate_dirs(exe_dir: Option<&Path>) -> Vec<PathBuf> {
     let mut candidates: Vec<PathBuf> = Vec::new();
     if let Ok(dir) = std::env::var("PDS_SIDECAR_DIR") {
         candidates.push(PathBuf::from(dir));
     }
-    if let Ok(exe) = std::env::current_exe()
-        && let Some(dir) = exe.parent()
-    {
+    if let Some(dir) = exe_dir {
         candidates.push(dir.join("sidecar"));
         candidates.push(dir.join("../sidecar"));
+        candidates.push(dir.join("../share/proton-drive-sync/sidecar"));
     }
     candidates.push(xdg_data_dir().join("sidecar"));
     candidates.push(PathBuf::from("sidecar"));
-
-    candidates.into_iter().find(|dir| is_launchable(dir))
+    candidates
 }
 
 fn is_launchable(dir: &Path) -> bool {
@@ -143,5 +154,31 @@ mod tests {
         let (program, args) = split_cmd("npx tsx src/index.ts").unwrap();
         assert_eq!(program, "npx");
         assert_eq!(args, vec!["tsx", "src/index.ts"]);
+    }
+
+    #[test]
+    fn discovery_covers_installed_layouts() {
+        // System install: bin/proton-drive-sync + share/proton-drive-sync/sidecar
+        let prefix = Path::new("/usr/local");
+        let dirs = candidate_dirs(Some(&prefix.join("bin")));
+        assert!(dirs.contains(&prefix.join("bin/sidecar")));
+        // join does not normalize "..", so the candidate carries it literally;
+        // the filesystem resolves it when the sidecar is probed.
+        assert!(dirs.contains(&prefix.join("bin/../share/proton-drive-sync/sidecar")));
+
+        // A launchable share-dir sidecar wins over the CWD fallback.
+        let tmp = std::env::temp_dir().join(format!("pds-disc-{}", std::process::id()));
+        let share = tmp.join("prefix/share/proton-drive-sync/sidecar");
+        write(&share.join("dist/index.js"));
+        // Resolve through `../` requires the bin dir to exist (real installs
+        // always have it).
+        std::fs::create_dir_all(tmp.join("prefix/bin")).unwrap();
+        let found = candidate_dirs(Some(&tmp.join("prefix/bin")))
+            .into_iter()
+            .find(|dir| is_launchable(dir))
+            .expect("share layout must be discoverable");
+        assert_eq!(found.canonicalize().unwrap(), share.canonicalize().unwrap());
+
+        std::fs::remove_dir_all(&tmp).ok();
     }
 }

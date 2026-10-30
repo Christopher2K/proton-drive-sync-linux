@@ -1,0 +1,172 @@
+name: Release
+
+# Triggered by pushing a v* tag (scripts/release.sh creates it). Builds the
+# release binaries on ubuntu-22.04 (glibc 2.35 floor: Ubuntu 22.04+, Debian
+# 12+, Fedora 36+), vendors the sidecar, and publishes tarball, .deb, .rpm
+# and checksums to a GitHub Release. An existing tag can be rebuilt via
+# workflow_dispatch (input: tag).
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing v* tag to (re)build"
+        required: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  NFPM_VERSION: "2.48.0"
+
+jobs:
+  build:
+    name: build (${{ matrix.arch }})
+    runs-on: ${{ matrix.runs-on }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runs-on: ubuntu-22.04
+            nfpm_arch: x86_64
+          - arch: arm64
+            runs-on: ubuntu-22.04-arm
+            nfpm_arch: arm64
+    env:
+      TAG: ${{ inputs.tag || github.ref_name }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      # GPUI (blade/ash, wayland/x11, fontconfig) build deps. Nix packages
+      # cannot be used here: the release must link the runner's older glibc,
+      # so native -dev packages are installed instead. fuser needs no libfuse
+      # at build time (pure Rust); fuse3 is a runtime-only dependency.
+      - name: Install build prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake libasound2-dev libdbus-1-dev libfontconfig1-dev \
+            libgbm-dev libgl-dev libgtk-3-dev libudev-dev \
+            libvulkan-dev libwayland-dev libxkbcommon-dev libxkbcommon-x11-dev \
+            libxcb1-dev libxrandr-dev libxi-dev libxcursor-dev
+
+      - name: Install Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      # Install the exact pinned toolchain (compiler parity with devenv).
+      - name: Install Rust toolchain
+        run: |
+          toolchain="$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml | head -1)"
+          rustup toolchain install "$toolchain" --profile minimal
+          rustup default "$toolchain"
+
+      - name: Parse version from the tag
+        id: meta
+        run: |
+          version="${TAG#v}"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "releasing $TAG (version $version)"
+
+      - name: Build release binaries
+        env:
+          version: ${{ steps.meta.outputs.version }}
+        run: |
+          cargo build --locked --release -p pds-app -p pds-cli
+
+          # Smoke: the app binary must report the tagged version (exits
+          # before any GUI init, so no display is needed).
+          built="$(target/release/proton-drive-sync --version)"
+          echo "built: $built"
+          grep -q "$version" <<<"$built" || {
+            echo "::error::binary version '$built' does not match tag $TAG"
+            exit 1
+          }
+
+      - name: Vendor the sidecar
+        run: |
+          cd sidecar
+          npm ci --no-audit --no-fund
+          npx patch-package
+          npm run typecheck
+
+      - name: Stage the install tree
+        run: |
+          mkdir -p staging/bin \
+                   staging/share/proton-drive-sync \
+                   staging/share/applications \
+                   staging/share/icons/hicolor/scalable/apps
+          install -m755 target/release/proton-drive-sync staging/bin/
+          install -m755 target/release/pds staging/bin/
+          cp -R sidecar staging/share/proton-drive-sync/sidecar
+          rm -f staging/share/proton-drive-sync/sidecar/package-lock.json
+          install -m644 packaging/linux/proton-drive-sync.desktop \
+            staging/share/applications/proton-drive-sync.desktop
+          install -m644 packaging/linux/icon.svg \
+            staging/share/icons/hicolor/scalable/apps/proton-drive-sync.svg
+
+      - name: Build the tarball
+        env:
+          version: ${{ steps.meta.outputs.version }}
+          arch: ${{ matrix.arch }}
+        run: |
+          dir="proton-drive-sync-${version}-${arch}"
+          mkdir -p dist
+          cp -R staging "$dir"
+          cp README.md LICENSE packaging/linux/install.sh "$dir/"
+          tar -a -c -f "dist/${dir}.tar.xz" "$dir"
+
+      - name: Build .deb and .rpm (nfpm)
+        env:
+          version: ${{ steps.meta.outputs.version }}
+          arch: ${{ matrix.arch }}
+        run: |
+          curl -fsSL -o /tmp/nfpm.tar.gz \
+            "https://github.com/goreleaser/nfpm/releases/download/v${NFPM_VERSION}/nfpm_${NFPM_VERSION}_Linux_${{ matrix.nfpm_arch }}.tar.gz"
+          tar -xzf /tmp/nfpm.tar.gz -C /tmp nfpm
+          mkdir -p dist
+          PDS_VERSION="$version" PDS_ARCH="$arch" /tmp/nfpm package \
+            --config packaging/nfpm.yaml --packager deb --target dist/
+          PDS_VERSION="$version" PDS_ARCH="$arch" /tmp/nfpm package \
+            --config packaging/nfpm.yaml --packager rpm --target dist/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.arch }}
+          path: dist/
+          if-no-files-found: error
+
+  release:
+    name: GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums
+        run: |
+          cd dist
+          sha256sum ./* > checksums.txt
+
+      - name: Publish
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.tag || github.ref_name }}
+          files: dist/*
+          generate_release_notes: true
