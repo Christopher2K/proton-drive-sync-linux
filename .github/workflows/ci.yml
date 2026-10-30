@@ -16,7 +16,8 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
-  # Keep the debug target small on the 14 GB runner disk.
+  # Keep the debug target small on the 14 GB runner disk. Changing these
+  # invalidates the cached target, so keep them stable.
   CARGO_PROFILE_DEV_DEBUG: 0
   CARGO_PROFILE_TEST_DEBUG: 0
 
@@ -24,9 +25,9 @@ jobs:
   tests:
     name: devenv tests
     runs-on: ubuntu-24.04
-    # First run builds GPUI from scratch; later runs are much faster with the
-    # Cargo cache below.
-    timeout-minutes: 60
+    # A from-scratch build is ~3 min on the 4-core runner; the FUSE e2e test
+    # self-bounds at ~3 min worst case. 15 min leaves ample headroom.
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v5
 
@@ -50,7 +51,8 @@ jobs:
 
       # The toolchain only exists inside the devenv shell, so use a plain
       # target/registry cache keyed on the lockfiles instead of rust-cache.
-      - name: Cache Cargo artifacts
+      - name: Restore Cargo cache
+        id: cargo-cache
         uses: actions/cache@v4
         with:
           path: |
@@ -61,7 +63,22 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-
 
-      # Builds the same devenv shell developers use, then runs enterTest:
-      # cargo tests for the workspace plus sidecar typecheck/tests.
+      # Build first and save the cache before running tests, so a failing test
+      # cannot throw away the compiled artifacts.
+      - name: Build test binaries
+        run: devenv shell -- cargo test --locked --workspace --all-targets --no-run
+
+      - name: Save Cargo cache
+        if: steps.cargo-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock', 'devenv.lock', 'rust-toolchain.toml') }}
+
+      # Runs the same enterTest as `devenv test` locally: cargo tests plus
+      # sidecar typecheck/tests.
       - name: Run tests
         run: devenv test
