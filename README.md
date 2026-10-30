@@ -20,13 +20,32 @@ Stack: Rust + GPUI (native Linux desktop UI) · Node.js sidecar running the offi
 
 On-demand placeholder files (open a file → it hydrates) are planned for M3 via FUSE; today the sync root is a fully materialized folder.
 
-## Build (Linux)
+## Development environment (devenv)
 
-Dependencies (Ubuntu 24.04): `build-essential pkg-config libssl-dev libdbus-1-dev libgtk-3-dev libudev-dev cmake` plus [rustup](https://rustup.rs), Node.js ≥ 20, and a GPU stack for GPUI (Vulkan/Mesa; under a Wayland or X11 session this is already present).
+The Rust toolchain (pinned in `rust-toolchain.toml`), Node.js, and every native
+library GPUI/FUSE need are declared in `devenv.nix` and locked in
+`devenv.lock`, so local development and CI build against the same environment.
+
+Install [Nix](https://nixos.org/download) and [devenv](https://devenv.sh/getting-started/)
+once, then from the repository root:
+
+```sh
+devenv shell        # enter the environment
+# or, with direnv installed: direnv allow
+```
+
+`devenv test` builds the environment and runs the full test suite. FUSE tests
+additionally need the host's setuid `fusermount3` (package `fuse3`), which Nix
+cannot provide; the shell points `fuser` at the host binary automatically.
+
+## Build (Linux)
 
 ```sh
 cargo build --release -p pds-app -p pds-cli
 ```
+
+A GPU stack for GPUI (Vulkan/Mesa; under a Wayland or X11 session this is
+already present) is not part of devenv — it is host-specific.
 
 Run from the repository root (dev mode — the sidecar is found relative to the repo):
 
@@ -61,7 +80,8 @@ This installs the `proton-drive-sync` binary, the `pds` CLI, the sidecar (with v
 ## Testing
 
 ```sh
-cargo test --workspace
+devenv test                     # Rust workspace + sidecar typecheck/tests
+devenv shell -- cargo test --workspace   # Rust only, inside the env
 ```
 
 Notes for VM development (OrbStack et al.): inotify over shared folders is unreliable — run the engine tests on VM-native disk. See [AGENT.md](AGENT.md) for details.

@@ -1,0 +1,67 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  # Keep the debug target small on the 14 GB runner disk.
+  CARGO_PROFILE_DEV_DEBUG: 0
+  CARGO_PROFILE_TEST_DEBUG: 0
+
+jobs:
+  tests:
+    name: devenv tests
+    runs-on: ubuntu-24.04
+    # First run builds GPUI from scratch; later runs are much faster with the
+    # Cargo cache below.
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+
+      # Nix packages cannot be setuid, so the FUSE e2e test uses the host's
+      # privileged fusermount3. Everything else comes from devenv.
+      - name: Install FUSE helper
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends fuse3
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@v31
+
+      - name: Configure devenv binary cache
+        uses: cachix/cachix-action@v16
+        with:
+          name: devenv
+
+      - name: Install devenv
+        run: nix profile add nixpkgs#devenv
+
+      # The toolchain only exists inside the devenv shell, so use a plain
+      # target/registry cache keyed on the lockfiles instead of rust-cache.
+      - name: Cache Cargo artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock', 'devenv.lock', 'rust-toolchain.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      # Builds the same devenv shell developers use, then runs enterTest:
+      # cargo tests for the workspace plus sidecar typecheck/tests.
+      - name: Run tests
+        run: devenv test

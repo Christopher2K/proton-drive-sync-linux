@@ -6,6 +6,12 @@
 node_modules/
 sidecar/dist/
 
+# devenv / direnv
+.devenv*
+devenv.local.nix
+devenv.local.yaml
+.direnv
+
 # OS
 .DS_Store
 
