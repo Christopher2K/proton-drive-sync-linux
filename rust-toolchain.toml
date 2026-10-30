@@ -1,0 +1,6 @@
+[toolchain]
+# Single source of truth for the Rust version used by devenv and by plain
+# rustup checkouts. Bump this together with Cargo.lock.
+channel = "1.99.1"
+components = ["clippy", "rustfmt"]
+profile = "minimal"

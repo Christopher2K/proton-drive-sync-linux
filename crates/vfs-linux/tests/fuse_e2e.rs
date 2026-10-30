@@ -3,12 +3,20 @@
 //! Boots the engine in placeholder mode, mounts PdsFs at a temp dir, then
 //! from a plain std::fs client: lists the dir, stats a placeholder, reads
 //! the whole file (forcing hydration), and checks the visible root stayed
-//! clean. Run in the VM where /dev/fuse exists:
+//! clean.
+//!
+//! Needs a real kernel FUSE setup: `/dev/fuse` plus a setuid fusermount3
+//! (Nix store binaries cannot be setuid; devenv points fuser at the host's
+//! helper via `FUSERMOUNT_PATH`). On hosts without one — e.g. GitHub-hosted
+//! runners — the test skips itself instead of hanging until the CI timeout.
 //!
 //! ```sh
 //! cargo test -p pds-vfs-linux --test fuse_e2e -- --nocapture
 //! ```
 
+use std::io::Write as _;
+use std::process::{Command, Stdio};
+use std::sync::mpsc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -17,9 +25,72 @@ use pds_core::{Engine, EngineConfig, STATE_DIR};
 use pds_sidecar_client::MockSidecar;
 use pds_vfs_linux::PdsFs;
 
+/// Bounds the whole test: if anything wedges (typically std::fs blocked in
+/// the kernel FUSE queue, which no in-test timeout can interrupt), kill the
+/// process so the suite fails in minutes instead of eating the CI timeout.
+/// Disarmed when dropped at the end of a passing test.
+struct Watchdog {
+    disarm: mpsc::Sender<()>,
+}
+
+impl Watchdog {
+    fn arm(secs: u64) -> Self {
+        let (tx, rx) = mpsc::channel::<()>();
+        std::thread::spawn(move || {
+            if rx.recv_timeout(Duration::from_secs(secs)).is_err() {
+                eprintln!(
+                    "fuse_e2e: exceeded {secs}s — IO through the mount is stuck; \
+                     failing fast instead of hanging"
+                );
+                std::process::exit(101);
+            }
+        });
+        Watchdog { disarm: tx }
+    }
+}
+
+impl Drop for Watchdog {
+    fn drop(&mut self) {
+        let _ = self.disarm.send(());
+    }
+}
+
+/// Real-kernel FUSE needs /dev/fuse and a setuid fusermount3. Returns why
+/// this host cannot run the test, or None if it can.
+fn fuse_unavailable_reason() -> Option<String> {
+    if std::fs::metadata("/dev/fuse").is_err() {
+        return Some("/dev/fuse does not exist on this host".into());
+    }
+    let helper =
+        std::env::var("FUSERMOUNT_PATH").unwrap_or_else(|_| "fusermount3".to_string());
+    match Command::new(&helper)
+        .arg("--version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+    {
+        Ok(status) if status.success() => None,
+        Ok(status) => {
+            Some(format!("{helper} ran but exited with {status} (setuid bit missing?)"))
+        }
+        Err(e) => Some(format!("{helper} is not runnable: {e}")),
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial_test::serial]
 async fn fuse_mount_serves_placeholders_and_hydrates() {
+    let _watchdog = Watchdog::arm(180);
+
+    if let Some(reason) = fuse_unavailable_reason() {
+        println!("skipping fuse_mount_serves_placeholders_and_hydrates: {reason}");
+        println!(
+            "hint: real-kernel FUSE tests need /dev/fuse and a setuid fusermount3 \
+             (e.g. the Linux dev VM); see crates/vfs-linux/tests/fuse_e2e.rs"
+        );
+        return;
+    }
+
     let _ = tracing_subscriber::fmt()
         .with_env_filter(std::env::var("RUST_LOG").unwrap_or_else(|_| {
             "pds_core=debug,pds_sidecar_client=debug".to_string()
@@ -176,7 +247,6 @@ async fn fuse_mount_serves_placeholders_and_hydrates() {
         .write(true)
         .open(mnt.join("big.bin"))
         .expect("revision write open");
-    use std::io::Write as _;
     rev.write_all(b"REVISED").unwrap();
     drop(rev);
     let deadline = Instant::now() + Duration::from_secs(30);

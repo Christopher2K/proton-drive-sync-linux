@@ -38,9 +38,14 @@ The host Mac is not a build target anymore — `pds-app` does not compile on mac
 ```sh
 ssh pds-linux@orb
 cd /Users/christopher/Developer/proton-drive-sync   # repo is shared into the VM
-export PATH=$HOME/.cargo/bin:$PATH CARGO_TARGET_DIR=$HOME/pds-target
+devenv shell                                      # same env as CI (devenv.nix/lock)
+export CARGO_TARGET_DIR=$HOME/pds-target          # keep the VM-local build cache
 cargo check --workspace --all-targets && cargo test --workspace
 ```
+
+`devenv test` runs the whole suite (workspace tests + sidecar typecheck/tests)
+in the pinned environment; install Nix/devenv in the VM once, then it matches
+CI exactly.
 
 Notes:
 
@@ -113,6 +118,9 @@ proton-drive-sync/
 
 ## Conventions
 
+- Dev environment: `devenv.nix` (pinned by `devenv.lock`) is the source of truth for
+  toolchains and native deps; CI runs `devenv test`. Add new libraries there, not as
+  ad-hoc apt/brew installs.
 - Rust: edition 2024, `cargo clippy -- -D warnings` clean, `tokio` for async.
 - Sidecar: TypeScript, strict mode, ESM. SDK version pinned exactly in `package.json`.
 - Commit messages: conventional commits (`feat:`, `fix:`, `chore:` …).
