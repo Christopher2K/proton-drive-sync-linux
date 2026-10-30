@@ -43,7 +43,7 @@ Login (browser session-fork, 2FA supported) → sync root (default `~/ProtonDriv
 
 ### F2 — Upload on new/changed file
 
-Filesystem watcher reports create/close-write → hash → upload via sidecar (SDK handles block splitting/encryption) → SQLite mapping updated. Debounce rapid writes; retry with exponential backoff; resumable block uploads for large files.
+Filesystem watcher reports create/close-write → hash → upload via sidecar (SDK handles block splitting/encryption) → SQLite mapping updated. Debounce rapid writes; retry with exponential backoff; resumable block uploads for large files. **M4 ✅:** exponential schedule verified (`base·2ⁿ` capped at 5 min, unit-tested); a server `Retry-After` hint (rate-limit 1003 → `transfer.error.retryAfter`) is honored in place of the computed schedule; explicit resume drops pending backoffs ("try now"); a terminally errored node heals on a fresh local edit.
 
 ### F3 — Trash on local delete (conservative)
 
@@ -91,7 +91,7 @@ One main window: sidebar navigation (**Overview / Activity / Conflicts / Setting
 - **M1 — Headless sync engine (CLI):** local folder ↔ Drive, F2/F3/F4/F7 with real files (no VFS yet), SQLite state. ✅ 2026-10-24 (live E2E).
 - **M2 — GPUI desktop shell (Linux):** single-window app; login, overview, activity, conflicts, settings, sign-out. ✅ 2026-10-29 (rewritten from the v0.1 tray shell when the project went Linux-only).
 - **M3 — Linux VFS:** FUSE mount, placeholders, hydration (M3.1 ✅ 2026-10-29), write-through + pins + LRU eviction (M3.2 ✅ 2026-10-29, E2E-proven in the VM), revision writes (M3.3 ✅ 2026-10-29).
-- **M4 — Hardening:** conflict soak tests, backoff/rate-limit validation, SDK upgrade rehearsal for the crypto migration.
+- **M4 — Hardening:** conflict soak tests, backoff/rate-limit validation, SDK upgrade rehearsal (M4 ✅ 2026-10-30 — see `docs/sdk-upgrade-rehearsal.md`; soak found + fixed the F7 remote-delete race, crash-interrupted transfers now recover on startup).
 
 ## 8. Key risks
 

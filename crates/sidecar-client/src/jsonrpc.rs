@@ -6,6 +6,7 @@
 use std::collections::HashMap;
 use std::io;
 use std::sync::Arc;
+use std::time::Duration;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde_json::Value;
@@ -236,6 +237,10 @@ fn parse_notification(method: &str, params: Value) -> Notification {
                 .get("retryable")
                 .and_then(Value::as_bool)
                 .unwrap_or(false),
+            retry_after: params
+                .get("retryAfter")
+                .and_then(Value::as_f64)
+                .map(|s| Duration::from_secs_f64(s.max(0.0))),
         },
         "drive.event" => match serde_json::from_value::<crate::types::DriveEvent>(params.clone()) {
             Ok(ev) => Notification::DriveEvent(Box::new(ev)),

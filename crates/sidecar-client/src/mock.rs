@@ -10,6 +10,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
@@ -32,6 +33,10 @@ struct MockNode {
     trashed: bool,
 }
 
+/// Scripted upload failures for a node uid: `(code, message, retryable,
+/// retry_after)` tuples, popped one per `drive.upload` attempt.
+type ScriptedFailures = VecDeque<(i64, String, bool, Option<Duration>)>;
+
 #[derive(Debug)]
 struct State {
     nodes: HashMap<String, MockNode>,
@@ -43,7 +48,7 @@ struct State {
     calls: Vec<(String, Vec<String>)>,
     /// Scripted `transfer.error`s for revision uploads, per node uid; popped
     /// one per `drive.upload` attempt (content is NOT applied on failure).
-    upload_failures: HashMap<String, VecDeque<(i64, String, bool)>>,
+    upload_failures: HashMap<String, ScriptedFailures>,
     /// Outbound notification queue (drained by the server task).
     outbox: mpsc::UnboundedSender<String>,
 }
@@ -215,16 +220,36 @@ impl MockHandle {
     }
 
     /// Script failures for the next `n` revision-upload attempts of
-    /// `node_uid`: each entry is `(code, message, retryable)` as sent in the
-    /// `transfer.error` notification. The upload attempt IS logged (so
-    /// `upload_attempts` counts it) but content is not applied.
+    /// `node_uid`: each entry is `(code, message, retryable, retry_after)`
+    /// as sent in the `transfer.error` notification. The upload attempt IS
+    /// logged (so `upload_attempts` counts it) but content is not applied.
     pub fn inject_upload_failures(&self, node_uid: &str, failures: &[(i64, &str, bool)]) {
+        self.inject_upload_failures_full(
+            node_uid,
+            &failures.iter().map(|(c, m, r)| (*c, *m, *r, None)).collect::<Vec<_>>(),
+        );
+    }
+
+    /// Like [`MockSidecar::inject_upload_failures`] with a server
+    /// `retryAfter` hint (seconds) per failure.
+    pub fn inject_upload_failures_full(
+        &self,
+        node_uid: &str,
+        failures: &[(i64, &str, bool, Option<u64>)],
+    ) {
         let mut st = self.state.lock().unwrap();
         st.upload_failures.insert(
             node_uid.to_string(),
             failures
                 .iter()
-                .map(|(c, m, r)| (*c, (*m).to_string(), *r))
+                .map(|(c, m, r, ra)| {
+                    (
+                        *c,
+                        (*m).to_string(),
+                        *r,
+                        ra.map(std::time::Duration::from_secs),
+                    )
+                })
                 .collect(),
         );
     }
@@ -538,15 +563,21 @@ impl MockSidecar {
                 // respond with the transfer id, then a transfer.error —
                 // content is NOT applied, like a server-side rejection.
                 if let Some(existing) = &node_uid
-                    && let Some((code, message, retryable)) = st
+                    && let Some((code, message, retryable, retry_after)) = st
                         .upload_failures
                         .get_mut(existing)
                         .and_then(VecDeque::pop_front)
                 {
+                    let mut failure = json!({
+                        "transferId": transfer_id, "code": code, "message": message, "retryable": retryable,
+                    });
+                    if let Some(secs) = retry_after {
+                        failure["retryAfter"] = json!(secs.as_secs_f64());
+                    }
                     let err = json!({
                         "jsonrpc": "2.0",
                         "method": "transfer.error",
-                        "params": {"transferId": transfer_id, "code": code, "message": message, "retryable": retryable},
+                        "params": failure,
                     })
                     .to_string();
                     return vec![ok(json!({"transferId": transfer_id})), err];

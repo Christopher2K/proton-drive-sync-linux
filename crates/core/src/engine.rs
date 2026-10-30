@@ -141,12 +141,30 @@ pub struct EngineHandle {
     /// Placeholder-mode store (VFS hydrate queue + snapshots). `None` in
     /// materialized mode.
     store: Option<Store>,
+    /// Flips once the engine attached its filesystem watcher (M4): local
+    /// writes made before this are invisible to the sync (no inotify yet).
+    /// Tests and embedding UIs synchronize on it before writing files.
+    watcher_ready: Arc<AtomicBool>,
 }
 
 impl EngineHandle {
     /// The engine↔VFS store, when the engine runs in placeholder mode.
     pub fn store(&self) -> Option<&Store> {
         self.store.as_ref()
+    }
+
+    /// Wait (bounded) until the engine's filesystem watcher is attached.
+    /// Local writes made before this may never be seen (F2) — inotify
+    /// only covers files that exist when the watcher attaches.
+    pub async fn wait_for_watcher(&self, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            if self.watcher_ready.load(Ordering::SeqCst) {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        false
     }
 
     pub async fn pause(&self) -> Result<()> {
@@ -236,6 +254,9 @@ enum TransferFailure {
         code: i64,
         message: String,
         retryable: bool,
+        /// Server-driven rate-limit hint (`retryAfter`), honored over the
+        /// computed backoff when present.
+        retry_after: Option<Duration>,
     },
     /// Local abort: shutdown mid-transfer or the sidecar stream died.
     Aborted(anyhow::Error),
@@ -248,6 +269,7 @@ impl std::fmt::Display for TransferFailure {
                 code,
                 message,
                 retryable,
+                ..
             } => write!(
                 f,
                 "transfer error {code}: {message} (retryable={retryable})"
@@ -311,6 +333,10 @@ pub struct Engine<S: SidecarApi> {
     shutting_down: bool,
     /// Set once `run()` has been entered.
     started: AtomicBool,
+    /// Set once the filesystem watcher is attached (M4): local writes made
+    /// before this are invisible to the engine (no inotify coverage yet).
+    /// Shared with the `EngineHandle` so tests/UIs can synchronize on it.
+    watcher_ready: Arc<AtomicBool>,
     /// Activity feed broadcast (UI); sends are no-ops without receivers.
     activity_tx: broadcast::Sender<ActivityItem>,
 }
@@ -333,6 +359,7 @@ impl<S: SidecarApi + 'static> Engine<S> {
             None
         };
         let store = vfs_store.clone();
+        let watcher_ready = Arc::new(AtomicBool::new(false));
         let engine = Self {
             sidecar,
             db,
@@ -355,6 +382,7 @@ impl<S: SidecarApi + 'static> Engine<S> {
             pending_pins: VecDeque::new(),
             shutting_down: false,
             started: AtomicBool::new(false),
+            watcher_ready: watcher_ready.clone(),
             activity_tx: activity_tx.clone(),
         };
         Ok((
@@ -363,6 +391,7 @@ impl<S: SidecarApi + 'static> Engine<S> {
                 tx,
                 activity_tx,
                 store: vfs_store,
+                watcher_ready: watcher_ready.clone(),
             },
         ))
     }
@@ -389,9 +418,20 @@ impl<S: SidecarApi + 'static> Engine<S> {
             .await
             .context("drive.events.start")?;
 
+        // 3. Crash recovery (M4): transfers interrupted by a previous run
+        // leave rows stuck in `Uploading` (never drained: upload_one
+        // requires Dirty) and `.pds-part` temps in the backing dir.
+        if let Err(e) = self.recover_interrupted_transfers() {
+            warn!(error = %e, "interrupted-transfer recovery failed");
+        }
+
         // 3. Filesystem watcher with ~500 ms debounce (F2).
         let (fs_tx, mut fs_rx) = mpsc::channel::<Vec<DebouncedEvent>>(256);
         let debouncer = self.start_watcher(fs_tx)?;
+        // Only now are local writes guaranteed to be seen (F2); tests
+        // synchronize on this.
+        self.watcher_ready
+            .store(true, std::sync::atomic::Ordering::SeqCst);
 
         // 4. Placeholder mode: publish the tree snapshot the FUSE filesystem
         // serves, then keep it fresh from the main loop (M3).
@@ -409,6 +449,72 @@ impl<S: SidecarApi + 'static> Engine<S> {
             let _ = self.sidecar.events_stop(scope).await;
         }
         result
+    }
+
+    /// Recover transfers a previous run left interrupted (M4 hardening):
+    ///
+    /// - Rows stuck in `Uploading` go back to `Dirty` so the normal drain
+    ///   re-uploads them through the full machinery (F7 precondition,
+    ///   retries, pause buffering). A crash AFTER the transfer landed
+    ///   remotely but before bookkeeping re-runs `check_remote_head`,
+    ///   which keeps BOTH versions instead of silently superseding.
+    /// - Stale `*.pds-part` transfer temps (upload scratch in the visible
+    ///   root, hydration scratch in the backing dir) are deleted; a
+    ///   half-written temp has no consistent content to resume from.
+    ///
+    /// In placeholder mode recovered rows upload from the backing dir via
+    /// `content_root`, same as any other dirty file.
+    fn recover_interrupted_transfers(&mut self) -> Result<()> {
+        let stuck = self.db.nodes_with_state(SyncState::Uploading)?;
+        for row in stuck {
+            // The file must still exist locally; if the user (or a crash
+            // during a VFS unlink) removed it, the delete path owns the
+            // row — tombstone it like a local delete.
+            let abs = to_abs(
+                content_root(self.placeholders, &self.root, &self.backing_dir),
+                &row.local_path,
+            );
+            if !abs.is_file() {
+                warn!(path = %row.local_path, "recovering upload whose file vanished; queuing delete");
+                self.db.add_tombstone(&Tombstone {
+                    local_path: row.local_path.clone(),
+                    node_uid: row.node_uid.clone(),
+                    deleted_at: now_unix(),
+                })?;
+                self.db.remove_node(&row.local_path)?;
+                // Pre-approved: this completes a delete that already
+                // happened locally — it must not trip the mass-deletion
+                // guard like a fresh user deletion wave would.
+                self.approved_tombstones.insert(row.local_path.clone());
+                continue;
+            }
+            warn!(path = %row.local_path, "recovering upload interrupted by a previous run");
+            self.db.set_sync_state(&row.local_path, SyncState::Dirty)?;
+        }
+        // Sweep transfer temps: ours are `*.pds-part` in both content
+        // roots (is_temp_file also matches the sidecar's `*.pdstmp-*`, but
+        // those die with their own transfer and are not ours to sweep).
+        // Temps of nested files (`docs/a.txt.pds-part`) live in subdirs.
+        for root_dir in [self.root.clone(), self.backing_dir.clone()] {
+            let mut stack = vec![root_dir];
+            while let Some(d) = stack.pop() {
+                let Ok(entries) = std::fs::read_dir(&d) else {
+                    continue;
+                };
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.is_dir() {
+                        stack.push(path);
+                        continue;
+                    }
+                    if path.to_string_lossy().ends_with(".pds-part") {
+                        let _ = std::fs::remove_file(&path);
+                        debug!(path = %path.display(), "swept stale transfer temp");
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     fn start_watcher(
@@ -1058,7 +1164,7 @@ impl<S: SidecarApi + 'static> Engine<S> {
         row: &NodeRow,
         failure: TransferFailure,
     ) -> Result<()> {
-        let (code, message, retryable) = match failure {
+        let (code, message, retryable, retry_after) = match failure {
             TransferFailure::Aborted(e) => {
                 // Shutdown/transport teardown — leave dirty for next run.
                 if self.db.node_by_path(rel)?.is_some() {
@@ -1070,7 +1176,8 @@ impl<S: SidecarApi + 'static> Engine<S> {
                 code,
                 message,
                 retryable,
-            } => (code, message, retryable),
+                retry_after,
+            } => (code, message, retryable, retry_after),
         };
         if self.db.node_by_path(rel)?.is_none() {
             return Ok(()); // vanished mid-transfer; delete path owns it
@@ -1109,10 +1216,12 @@ impl<S: SidecarApi + 'static> Engine<S> {
             warn!(path = %rel, count, error = %message, "upload failed too many times; node marked errored");
             self.emit_activity(ActivityKind::UploadErrored, rel, Some(message));
         } else {
-            let backoff = retry_backoff(self.retry_base, count);
+            // Honor the server's Retry-After hint when present (M4);
+            // otherwise compute the exponential schedule (F2).
+            let backoff = retry_after.unwrap_or_else(|| retry_backoff(self.retry_base, count));
             self.retry_at
                 .insert(rel.to_string(), Instant::now() + backoff);
-            info!(path = %rel, count, backoff = ?backoff, "retryable upload error; backing off");
+            info!(path = %rel, count, backoff = ?backoff, server_hint = retry_after.is_some(), "retryable upload error; backing off");
         }
         Ok(())
     }
@@ -1414,7 +1523,12 @@ impl<S: SidecarApi + 'static> Engine<S> {
             return Ok(());
         };
         let abs = to_abs(&self.root, &row.local_path);
-        if row.sync_state != SyncState::Synced {
+        // F7 (M4 soak find): the row's state alone can LIE — a local write
+        // still inside the watcher's debounce window has not marked the row
+        // dirty yet. Hash the on-disk content before destroying anything.
+        let locally_unsynced = row.sync_state != SyncState::Synced
+            || local_content_diverged(&row, &abs);
+        if locally_unsynced {
             // Local unsynced changes → keep both (F7); the dirty row will
             // re-upload under an available name. Unpark it so the upload
             // path can re-key it (the remote uid is gone).
@@ -1772,10 +1886,20 @@ impl<S: SidecarApi + 'static> Engine<S> {
                         {
                             break Ok(TransferOutcome { node_uid });
                         }
-                        Some(Notification::TransferError { transfer_id: tid, code, message, retryable })
-                            if tid == transfer_id =>
+                        Some(Notification::TransferError {
+                            transfer_id: tid,
+                            code,
+                            message,
+                            retryable,
+                            retry_after,
+                        }) if tid == transfer_id =>
                         {
-                            break Err(TransferFailure::Remote { code, message, retryable });
+                            break Err(TransferFailure::Remote {
+                                code,
+                                message,
+                                retryable,
+                                retry_after,
+                            });
                         }
                         Some(other) => self.backlog.push_back(other),
                         None => break Err(TransferFailure::Aborted(anyhow!("sidecar closed during transfer"))),
@@ -2188,6 +2312,22 @@ mod tests {
             pinned: false,
             synced_sha1: sha1,
         }
+    }
+
+    #[test]
+    fn retry_backoff_doubles_and_caps() {
+        let base = Duration::from_secs(1);
+        assert_eq!(retry_backoff(base, 1), Duration::from_secs(1));
+        assert_eq!(retry_backoff(base, 2), Duration::from_secs(2));
+        assert_eq!(retry_backoff(base, 3), Duration::from_secs(4));
+        // 2^10 · base is far beyond the cap: clamp at RETRY_BACKOFF_MAX.
+        assert_eq!(retry_backoff(base, 11), RETRY_BACKOFF_MAX);
+        assert_eq!(retry_backoff(base, 500), RETRY_BACKOFF_MAX);
+        // Tiny bases scale up before hitting the cap.
+        assert_eq!(
+            retry_backoff(Duration::from_millis(20), 4),
+            Duration::from_millis(160)
+        );
     }
 
     #[test]

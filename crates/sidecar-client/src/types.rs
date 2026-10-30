@@ -1,5 +1,7 @@
 //! Types mirroring `docs/protocol.md` (Sidecar IPC protocol v1).
 
+use std::time::Duration;
+
 use serde::{Deserialize, Serialize};
 
 /// JSON-RPC error codes beyond the standard ones (protocol.md).
@@ -126,6 +128,9 @@ pub enum Notification {
         code: i64,
         message: String,
         retryable: bool,
+        /// Server-driven rate-limit hint (`retryAfter`, code 1003); `None`
+        /// when the server gave no hint.
+        retry_after: Option<Duration>,
     },
     /// `drive.event` (F6).
     DriveEvent(Box<DriveEvent>),

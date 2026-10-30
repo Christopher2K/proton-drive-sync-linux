@@ -61,7 +61,13 @@ async fn start_with_client(
     .unwrap();
     let db = Db::open(&db_path).unwrap();
     let engine = tokio::spawn(engine.run());
-    // Wait for initial sync to finish: hello.txt materialized locally.
+    // The fixture's wait (hello.txt materialized) can complete before the
+    // watcher attaches — tests that write files right after `start()` would
+    // then race inotify (M4 flake fix). Synchronize on the watcher.
+    assert!(
+        handle.wait_for_watcher(Duration::from_secs(10)).await,
+        "watcher never attached"
+    );
     wait_for(|| root.join("hello.txt").is_file()).await;
     Fixture {
         _dir: dir,
@@ -88,6 +94,14 @@ impl Fixture {
     async fn shutdown(self) {
         self.handle.shutdown().await.unwrap();
         let _ = self.engine.await;
+    }
+
+    /// Like [`Fixture::shutdown`], but keeps the temp dir on disk — for
+    /// restart tests where a second engine must see the SAME root+db.
+    async fn shutdown_keep_dir(self) {
+        self.handle.shutdown().await.unwrap();
+        let _ = self.engine.await;
+        std::mem::forget(self._dir); // leaked on purpose; OS cleans /tmp
     }
 }
 
@@ -224,9 +238,13 @@ async fn synced_delete_propagates_as_trash() {
 
     std::fs::remove_file(root.join("hello.txt")).unwrap();
     wait_for(|| fx.mock.trashed_uids().contains(&"node-hello".to_string())).await;
-    // Drained: no tombstone left, node row gone.
-    assert!(fx.db.tombstones().unwrap().is_empty());
-    assert!(fx.db.node_by_path("hello.txt").unwrap().is_none());
+    // Drained: no tombstone left, node row gone. The trash lands mid-drain,
+    // so wait for the bookkeeping to finish rather than asserting at once.
+    wait_for(|| {
+        fx.db.tombstones().unwrap().is_empty()
+            && fx.db.node_by_path("hello.txt").unwrap().is_none()
+    })
+    .await;
     fx.shutdown().await;
 }
 
@@ -827,6 +845,220 @@ async fn retryable_upload_error_backs_off_then_succeeds() {
         "backoff not respected: 4 attempts in {elapsed:?}"
     );
     assert_eq!(fx.handle.status().await.unwrap().errored_nodes, 0);
+    fx.shutdown().await;
+}
+
+// --- M4 hardening: crash recovery, Retry-After, resume-drops-backoff -----
+
+// A crash mid-upload leaves the row in `Uploading`; the next engine run must
+// recover it (→ Dirty → re-upload through the full machinery) instead of
+// leaving it stuck forever (never drained, never evicted).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn crashed_upload_recovers_on_restart() {
+    let fx = start().await;
+    std::fs::write(fx.root.join("hello.txt"), b"crashed mid-flight").unwrap();
+
+    // Simulate the crash: set the state the in-flight transfer would leave.
+    fx.db.set_sync_state("hello.txt", pds_core::SyncState::Uploading).unwrap();
+    let (root, db_path) = (fx.root.clone(), fx.root.join(STATE_DIR).join("state.db"));
+    fx.shutdown_keep_dir().await;
+
+    // New engine over the SAME root+db: recovery must requeue the upload.
+    let (client, mock) = MockSidecar::new().connect();
+    let mut client = client;
+    let notifications = client.take_notifications();
+    let (engine, handle) = Engine::new(
+        Arc::new(client),
+        notifications,
+        EngineConfig {
+            root: root.clone(),
+            db_path: db_path.clone(),
+            retry_base: pds_core::RETRY_BASE_DEFAULT,
+            placeholders: false,
+            eviction_cap: None,
+        },
+    )
+    .unwrap();
+    let engine = tokio::spawn(engine.run());
+    wait_for(|| mock.file_content("node-hello").as_deref() == Some(b"crashed mid-flight")).await;
+
+    // F7 safety net intact: the revision landed on the SAME node.
+    let db = Db::open(&db_path).unwrap();
+    let row = db.node_by_path("hello.txt").unwrap().unwrap();
+    assert_eq!(row.node_uid, "node-hello");
+    assert!(row.synced_sha1.is_some());
+    handle.shutdown().await.ok();
+    let _ = engine.await;
+}
+
+// A crash during an upload whose file has since been removed must tombstone
+// the row (delete path owns it), not resurrect a phantom upload.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn crashed_upload_with_vanished_file_tombstones() {
+    let fx = start().await;
+    fx.db.set_sync_state("hello.txt", pds_core::SyncState::Uploading).unwrap();
+    let (root, db_path) = (fx.root.clone(), fx.root.join(STATE_DIR).join("state.db"));
+    std::fs::remove_file(root.join("hello.txt")).unwrap();
+    fx.shutdown_keep_dir().await;
+
+    let (client, mock) = MockSidecar::new().connect();
+    let mut client = client;
+    let notifications = client.take_notifications();
+    let (engine, handle) = Engine::new(
+        Arc::new(client),
+        notifications,
+        EngineConfig {
+            root: root.clone(),
+            db_path: db_path.clone(),
+            retry_base: pds_core::RETRY_BASE_DEFAULT,
+            placeholders: false,
+            eviction_cap: None,
+        },
+    )
+    .unwrap();
+    let engine = tokio::spawn(engine.run());
+    let db = Db::open(&db_path).unwrap();
+
+    // The stale row is gone and the remote file lands in the trash.
+    wait_for(|| db.node_by_path("hello.txt").unwrap().is_none()).await;
+    wait_for(|| !mock.trashed_uids().is_empty()).await;
+    assert!(
+        mock.trashed_uids().iter().all(|u| u == "node-hello"),
+        "only the interrupted file may be trashed: {:?}",
+        mock.trashed_uids()
+    );
+    handle.shutdown().await.ok();
+    let _ = engine.await;
+}
+
+// Stale `*.pds-part` temps (crashed transfers) are swept at startup — in
+// the visible root AND nested subdirectories — and never re-uploaded.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn stale_transfer_temps_are_swept_on_startup() {
+    let fx = start().await;
+    let root = fx.root.clone();
+    std::fs::create_dir_all(root.join("docs")).unwrap();
+    std::fs::write(root.join("big.pds-part"), b"half-written").unwrap();
+    std::fs::write(root.join("docs").join("a.txt.pds-part"), b"half").unwrap();
+    fx.shutdown_keep_dir().await;
+
+    let (client, mock) = MockSidecar::new().connect();
+    let mut client = client;
+    let notifications = client.take_notifications();
+    let (engine, handle) = Engine::new(
+        Arc::new(client),
+        notifications,
+        EngineConfig {
+            root: root.clone(),
+            db_path: root.join(STATE_DIR).join("state.db"),
+            retry_base: pds_core::RETRY_BASE_DEFAULT,
+            placeholders: false,
+            eviction_cap: None,
+        },
+    )
+    .unwrap();
+    let engine = tokio::spawn(engine.run());
+    wait_for(|| root.join("hello.txt").is_file()).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    assert!(!root.join("big.pds-part").exists());
+    assert!(!root.join("docs").join("a.txt.pds-part").exists());
+    assert!(
+        !mock.uploaded_names().iter().any(|n| n.contains("pds-part")),
+        "swept temps must not enter the upload pipeline"
+    );
+    handle.shutdown().await.ok();
+    let _ = engine.await;
+}
+
+// A rate-limited upload with a server `retryAfter` hint honors the hint
+// (not the shorter computed backoff) before the next attempt.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn rate_limit_retry_after_hint_is_honored() {
+    let fx = start_with_retry_base(Duration::from_millis(20)).await;
+    // Hint 1 s ≫ computed backoff (20 ms). The engine must wait ≥ 1 s.
+    fx.mock
+        .inject_upload_failures_full("node-hello", &[(1003, "rate limited", true, Some(1))]);
+
+    let t0 = Instant::now();
+    std::fs::write(fx.root.join("hello.txt"), b"throttled").unwrap();
+    wait_for(|| fx.mock.upload_attempts("hello.txt") == 2).await;
+    let elapsed = t0.elapsed();
+    assert!(
+        elapsed >= Duration::from_millis(900),
+        "retryAfter hint ignored: 2nd attempt after only {elapsed:?}"
+    );
+    // Without the hint the whole 2-attempt exchange takes < 200 ms.
+    fx.shutdown().await;
+}
+
+// Explicit resume means "try now": a pending retry backoff is dropped even
+// when the backoff is far in the future (server hint or long schedule).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn resume_drops_pending_backoff() {
+    let fx = start_with_retry_base(Duration::from_millis(20)).await;
+    // First failure schedules a LONG backoff via the server hint.
+    fx.mock
+        .inject_upload_failures_full("node-hello", &[(1003, "rate limited", true, Some(60))]);
+    std::fs::write(fx.root.join("hello.txt"), b"v2").unwrap();
+    wait_for(|| fx.mock.upload_attempts("hello.txt") == 1).await;
+    // The attempt STARTS before the failure is processed (retry scheduled);
+    // resume only once the row came back Dirty, else the backoff would be
+    // (correctly) scheduled after our clear and the test would race.
+    wait_for(|| {
+        fx.db
+            .node_by_path("hello.txt")
+            .ok()
+            .flatten()
+            .map(|r| r.sync_state == pds_core::SyncState::Dirty)
+            .unwrap_or(false)
+    })
+    .await;
+
+    // Nothing further happens while the 60 s backoff runs…
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert_eq!(fx.mock.upload_attempts("hello.txt"), 1);
+
+    // …but an explicit resume is "try now".
+    fx.handle.resume().await.unwrap();
+    wait_for(|| fx.mock.upload_attempts("hello.txt") == 2).await;
+    assert!(
+        fx.mock.file_content("node-hello").as_deref() == Some(b"v2"),
+        "second attempt must succeed (failure script exhausted)"
+    );
+    fx.shutdown().await;
+}
+
+// A terminally errored node recovers when the user edits the file again:
+// the fresh local rewrite clears the error and re-uploads.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn fresh_edit_heals_errored_node() {
+    let fx = start().await;
+    // Exactly ONE failure: the fresh-edit retry must then succeed.
+    fx.mock
+        .inject_upload_failures("node-hello", &[(1099, "integrity check failed", false)]);
+    std::fs::write(fx.root.join("hello.txt"), b"broken").unwrap();
+    wait_for(|| {
+        futures::executor::block_on(fx.handle.status())
+            .map(|s| s.errored_nodes == 1)
+            .unwrap_or(false)
+    })
+    .await;
+
+    // The user fixes the file: fresh edit → error cleared → upload proceeds.
+    std::fs::write(fx.root.join("hello.txt"), b"fixed by user").unwrap();
+    wait_for(|| fx.mock.file_content("node-hello").as_deref() == Some(b"fixed by user")).await;
+    let st = fx.handle.status().await.unwrap();
+    assert_eq!(st.errored_nodes, 0);
+    let row = fx.db.node_by_path("hello.txt").unwrap().unwrap();
+    assert_eq!(row.sync_state, pds_core::SyncState::Synced);
+    assert_eq!(fx.db.upload_error("hello.txt").unwrap(), None);
     fx.shutdown().await;
 }
 

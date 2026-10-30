@@ -379,6 +379,11 @@ export class SidecarService {
       code: mapped.code,
       message: mapped.message,
       retryable: !t.abort.signal.aborted && isRetryable(e),
+      // Server-driven rate-limit hint (M4): surface Retry-After so the
+      // host can honor it instead of guessing a shorter backoff.
+      ...(typeof (mapped as any).data?.retryAfter === "number"
+        ? { retryAfter: (mapped as any).data.retryAfter }
+        : {}),
     });
   }
 
