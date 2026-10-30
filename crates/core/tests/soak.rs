@@ -87,6 +87,23 @@ fn conflict_entry(root: &std::path::Path, stem: &str) -> Option<std::fs::DirEntr
         })
 }
 
+/// Contents of every conflict copy of `stem` currently in `root`. Later
+/// rounds accumulate copies, so "the counterpart survived" means "some
+/// copy holds it" — read_dir order is hash-based and must not matter.
+fn conflict_contents(root: &std::path::Path, stem: &str) -> Vec<Vec<u8>> {
+    std::fs::read_dir(root)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|e| {
+            e.file_name()
+                .to_string_lossy()
+                .starts_with(&format!("{stem} (conflict "))
+        })
+        .map(|e| std::fs::read(e.path()).unwrap_or_default())
+        .collect()
+}
+
 /// The engine reached a quiescent state: nothing uploading/downloading,
 /// every row either synced, terminally errored, or parked as conflicted —
 /// and no row is dirty without either a retry pending or a terminal reason.
@@ -126,17 +143,18 @@ async fn soak_repeated_simultaneous_edits_keep_both() {
         let remote = format!("remote r{round}");
         std::fs::write(fx.root.join("hello.txt"), &local).unwrap();
         fx.mock.remote_update_file("node-hello", remote.as_bytes());
-        // Wait until BOTH survived: the file shows one version, a conflict
-        // copy (this round's or a re-keyed row) holds the other, and the
-        // node is not stuck dirty.
-        wait_for(|| {
-            let disk = std::fs::read(fx.root.join("hello.txt")).unwrap_or_default();
-            let conflict = conflict_entry(&fx.root, "hello")
-                .map(|e| std::fs::read(e.path()).unwrap_or_default())
-                .unwrap_or_default();
-            (disk == local.as_bytes() && conflict == remote.as_bytes())
-                || (disk == remote.as_bytes() && conflict == local.as_bytes())
-        })
+        // Wait until BOTH survived: the file shows one version, and some
+        // conflict copy (of this or an earlier round — copies accumulate)
+        // holds the other, and the node is not stuck dirty.
+        wait_for(
+            || {
+                let disk = std::fs::read(fx.root.join("hello.txt")).unwrap_or_default();
+                let copies = conflict_contents(&fx.root, "hello");
+                (disk == local.as_bytes() && copies.contains(&remote.clone().into_bytes()))
+                    || (disk == remote.as_bytes()
+                        && copies.contains(&local.clone().into_bytes()))
+            },
+        )
         .await;
         assert_quiescent(&fx).await;
     }
