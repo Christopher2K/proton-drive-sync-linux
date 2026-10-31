@@ -31,6 +31,7 @@ use tracing::{debug, info, warn};
 use crate::conflict::conflict_name;
 use crate::db::{Db, NodeRow, SyncState, Tombstone};
 use crate::guard::DeleteGuard;
+use crate::mode::SyncMode;
 use crate::store::{Store, VNode};
 
 /// Name of the engine-private directory inside the sync root (DB, socket).
@@ -39,6 +40,9 @@ pub const STATE_DIR: &str = ".pds";
 /// to the sync pipeline (M3): never watched, never uploaded, never trashed.
 pub const VFS_BACKING_DIR: &str = ".pds-vfs-backing";
 const META_INITIAL_SYNC_DONE: &str = "initial_sync_done";
+/// Set to "1" after a mirror-mode materialization pass ran; switching from
+/// placeholders to mirror later re-triggers materialization exactly once.
+const META_MATERIALIZED_FOR_MODE: &str = "materialized_for_mirror";
 
 /// First backoff delay after a retryable upload failure (F2).
 pub const RETRY_BASE_DEFAULT: Duration = Duration::from_secs(1);
@@ -81,6 +85,9 @@ pub struct EngineStatus {
     /// Dirty nodes parked after a 409 stale-base rejection; they heal via
     /// the next matching remote event (F7).
     pub conflicted_nodes: usize,
+    /// How local file content is stored (F5): placeholders (on demand) or
+    /// a full materialized mirror.
+    pub mode: crate::mode::SyncMode,
 }
 
 /// Control commands (CLI socket / UI).
@@ -225,15 +232,46 @@ pub struct EngineConfig {
     /// Base of the exponential upload retry backoff (normally
     /// `RETRY_BASE_DEFAULT`; tests shrink it).
     pub retry_base: Duration,
-    /// Placeholder mode (M3): synced files are NOT materialized in `root`;
+    /// Placeholder mode (F5): synced files are NOT materialized in `root`;
     /// a FUSE filesystem serves them with on-demand hydration via
-    /// [`EngineHandle::store`]. Default `false` (proven materialized mode).
+    /// [`EngineHandle::store`]. This is the caller's default for NEW roots
+    /// only — the persisted `sync_mode` setting (and `$PDS_SYNC_MODE`)
+    /// decides for existing ones. See [`SyncMode`](crate::mode::SyncMode).
     pub placeholders: bool,
     /// Backing-cache size cap for placeholder mode (M3.2 eviction). When
     /// hydrated content exceeds this, the least-recently-used files are
     /// dehydrated (backing content deleted; placeholder stays). `None`
     /// disables eviction (tests, explicit opt-out).
     pub eviction_cap: Option<u64>,
+    /// Where hydrated content lives. `None` = `<root>/.pds-vfs-backing`
+    /// (the `pds mount` layout: mountpoint separate from root). Some path
+    /// OUTSIDE the root = the desktop-app layout: the app mounts the FUSE
+    /// view AT the root, so engine state (including the backing cache) must
+    /// live elsewhere. External backing also enables the one-time local
+    /// layout conversion (mirror ⇄ placeholders) in [`Engine::new`].
+    pub backing_dir: Option<PathBuf>,
+    /// Watch the sync root for local writes (F2). Keep `true` except when
+    /// the root is itself the FUSE mountpoint: then every write already
+    /// arrives through the VFS store queues, and watching the mount would
+    /// double-upload write-through files.
+    pub watch_local_writes: bool,
+}
+
+impl Default for EngineConfig {
+    /// The classic materialized layout: state in `<root>/.pds`, backing in
+    /// `<root>/.pds-vfs-backing`, local writes watched. Tests and embedders
+    /// override individual fields.
+    fn default() -> Self {
+        Self {
+            root: PathBuf::new(),
+            db_path: PathBuf::new(),
+            retry_base: RETRY_BASE_DEFAULT,
+            placeholders: false,
+            eviction_cap: None,
+            backing_dir: None,
+            watch_local_writes: true,
+        }
+    }
 }
 
 /// Default backing-cache cap: 10 GiB (SPEC F5).
@@ -305,6 +343,13 @@ pub struct Engine<S: SidecarApi> {
     backing_dir: PathBuf,
     /// Backing-cache size cap (placeholder mode). `None` disables eviction.
     eviction_cap: Option<u64>,
+    /// The effective sync mode (F5), resolved once at construction
+    /// (`$PDS_SYNC_MODE` > persisted `sync_mode` > caller default). The DB
+    /// remains the source for FUTURE runs; this field answers "what mode am
+    /// I running in" including session env overrides.
+    mode: SyncMode,
+    /// Watch the sync root (F2). Off when the root IS the FUSE mountpoint.
+    watch_local_writes: bool,
     notifications: mpsc::Receiver<Notification>,
     backlog: VecDeque<Notification>,
     cmd_rx: mpsc::Receiver<Command>,
@@ -345,13 +390,47 @@ impl<S: SidecarApi + 'static> Engine<S> {
     pub fn new(
         sidecar: Arc<S>,
         notifications: mpsc::Receiver<Notification>,
-        config: EngineConfig,
+        mut config: EngineConfig,
     ) -> Result<(Self, EngineHandle)> {
         std::fs::create_dir_all(&config.root)?;
         let db = Db::open(&config.db_path)?;
         let (tx, cmd_rx) = mpsc::channel(64);
         let (activity_tx, _) = broadcast::channel(256);
-        let placeholders = config.placeholders;
+        // F5 mode resolution (single writer): `$PDS_SYNC_MODE` > persisted
+        // `sync_mode` > the caller's `placeholders` flag, which is only the
+        // default for NEW roots (stored on first use so later runs agree).
+        // Embedding apps pre-read the same value to pick the layout; both
+        // sides must resolve identically.
+        let placeholders = crate::mode::apply_mode_setting(
+            &db,
+            if config.placeholders {
+                SyncMode::Placeholders
+            } else {
+                SyncMode::Mirror
+            },
+            true,
+        )? == SyncMode::Placeholders;
+        config.placeholders = placeholders;
+        let mode = if placeholders {
+            SyncMode::Placeholders
+        } else {
+            SyncMode::Mirror
+        };
+        // Backing cache: explicit external path (desktop layout) or the
+        // classic in-root dir (`pds mount` layout).
+        let external_backing = config.backing_dir.clone();
+        let backing_dir = external_backing
+            .clone()
+            .unwrap_or_else(|| config.root.join(VFS_BACKING_DIR));
+        // One-time local layout conversion, only possible with an external
+        // backing cache (the desktop layout; see EngineConfig::backing_dir):
+        // adopting an old in-root mirror into placeholders, or materializing
+        // again after a switch back to mirror.
+        if let Some(ext) = &external_backing
+            && let Err(e) = convert_layout(&db, &config.root, ext, mode)
+        {
+            warn!(error = %e, "local layout conversion failed; continuing");
+        }
         // The engine and the handle share one store (engine owns a clone).
         let vfs_store = if placeholders {
             Some(Store::new())
@@ -366,8 +445,10 @@ impl<S: SidecarApi + 'static> Engine<S> {
             root: config.root.clone(),
             placeholders,
             store,
-            backing_dir: config.root.join(".pds-vfs-backing"),
+            backing_dir,
             eviction_cap: config.eviction_cap,
+            mode,
+            watch_local_writes: config.watch_local_writes,
             notifications,
             backlog: VecDeque::new(),
             cmd_rx,
@@ -396,10 +477,16 @@ impl<S: SidecarApi + 'static> Engine<S> {
         ))
     }
 
+    /// The effective sync mode (F5): placeholders (on demand) or a full
+    /// materialized mirror. Resolved once at construction (env > persisted
+    /// > caller default); the DB stays the source for future runs.
+    pub fn sync_mode(&self) -> SyncMode {
+        self.mode
+    }
+
     /// Run until shutdown. Consumes the engine.
     pub async fn run(mut self) -> Result<()> {
         self.started.store(true, Ordering::SeqCst);
-
         // 1. Initial sync (first run only; F1).
         let root_node = self.sidecar.get_root().await.context("drive.getRoot")?;
         self.scope_id = Some(root_node.tree_event_scope_id.clone());
@@ -409,7 +496,23 @@ impl<S: SidecarApi + 'static> Engine<S> {
             self.initial_sync(&root_node).await?;
             self.db.set_meta(META_INITIAL_SYNC_DONE, "1")?;
             info!("initial sync complete");
+        } else if !self.placeholders
+            && self.db.meta(META_MATERIALIZED_FOR_MODE)? != Some("1".into())
+        {
+            // The root synced in placeholder mode before and the user
+            // switched to mirror: materialize now (the conversion moved any
+            // hydrated copies back; fetch the rest). Cheap check per start.
+            info!("mirror mode: materializing files not yet on disk");
+            let files = self.remote_files_needing_download()?;
+            for (rel, uid) in files {
+                let abs = to_abs(&self.root, &rel);
+                if let Some(dir) = abs.parent() {
+                    std::fs::create_dir_all(dir)?;
+                }
+                self.download_file(&uid, &rel).await?;
+            }
         }
+        self.db.set_meta(META_MATERIALIZED_FOR_MODE, if self.placeholders { "0" } else { "1" })?;
 
         // 2. Resume the event stream from the persisted cursor (F6).
         let cursor = self.db.event_cursor(&root_node.tree_event_scope_id)?;
@@ -425,13 +528,28 @@ impl<S: SidecarApi + 'static> Engine<S> {
             warn!(error = %e, "interrupted-transfer recovery failed");
         }
 
-        // 3. Filesystem watcher with ~500 ms debounce (F2).
-        let (fs_tx, mut fs_rx) = mpsc::channel::<Vec<DebouncedEvent>>(256);
-        let debouncer = self.start_watcher(fs_tx)?;
-        // Only now are local writes guaranteed to be seen (F2); tests
-        // synchronize on this.
-        self.watcher_ready
-            .store(true, std::sync::atomic::Ordering::SeqCst);
+        // 3. Filesystem watcher with ~500 ms debounce (F2) — unless the
+        // root IS the FUSE mountpoint (desktop placeholder layout): writes
+        // then arrive through the VFS store queues, and watching the mount
+        // would surface backing-cache noise and double-upload write-through
+        // files. The inert channel never yields (its sender is leaked, not
+        // dropped — a closed receiver would spin the select loop).
+        let (debouncer, fs_rx) = if self.watch_local_writes {
+            let (fs_tx, fs_rx) = mpsc::channel::<Vec<DebouncedEvent>>(256);
+            let debouncer = self.start_watcher(fs_tx)?;
+            // Only now are local writes guaranteed to be seen (F2); tests
+            // synchronize on this.
+            self.watcher_ready
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            (Some(debouncer), fs_rx)
+        } else {
+            self.watcher_ready
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            let (_never, fs_rx) = mpsc::channel::<Vec<DebouncedEvent>>(1);
+            std::mem::forget(_never);
+            (None, fs_rx)
+        };
+        let mut fs_rx = fs_rx;
 
         // 4. Placeholder mode: publish the tree snapshot the FUSE filesystem
         // serves, then keep it fresh from the main loop (M3).
@@ -634,16 +752,21 @@ impl<S: SidecarApi + 'static> Engine<S> {
     // F1 — initial sync
     // ------------------------------------------------------------------
 
-    /// First-run enumeration + full materialization (M1 downloads everything;
-    /// VFS placeholders arrive in M3/M4). Also uploads local-only files.
-    /// Never deletes anything, in either direction.
+    /// First-run enumeration + materialization per the sync mode (F5):
+    /// placeholders register the tree without downloading; mirror downloads
+    /// everything. Both upload local-only files (first-run rule: a non-empty
+    /// local folder means "upload these", never "delete the remote ones";
+    /// an empty folder never deletes anything).
     async fn initial_sync(&mut self, root: &Node) -> Result<()> {
         self.enumerate_remote(root).await?;
 
         if self.placeholders {
             // M3: nothing to download — the VFS serves placeholders; files
             // hydrate on open. Local-only files still upload (first-run
-            // rule: an empty folder never deletes anything).
+            // rule: an empty folder never deletes anything). In the
+            // mount-at-root layout the app attaches FUSE only after this
+            // scan (it waits for the watcher-ready flag), so untracked
+            // local files are still visible on the real folder here.
             let local_only = self.scan_local_only().await?;
             for rel in local_only {
                 self.upsert_local_file(&rel).await?;
@@ -651,7 +774,7 @@ impl<S: SidecarApi + 'static> Engine<S> {
             return Ok(());
         }
 
-        // Materialize: download every remote file that is missing or changed.
+        // Mirror: materialize every remote file that is missing or changed.
         let files = self.remote_files_needing_download()?;
         for (rel, uid) in files {
             let abs = to_abs(&self.root, &rel);
@@ -725,6 +848,7 @@ impl<S: SidecarApi + 'static> Engine<S> {
 
     /// Remote files whose local copy is missing or content-different.
     /// Local files that differ get a keep-both conflict rename first (F7).
+    /// Mirror mode only (placeholder mode materializes nothing).
     fn remote_files_needing_download(&mut self) -> Result<Vec<(String, String)>> {
         let mut out = Vec::new();
         let rows = self.db.nodes_with_state(SyncState::Synced)?;
@@ -923,7 +1047,7 @@ impl<S: SidecarApi + 'static> Engine<S> {
                         None => available,
                     };
                     warn!(path = %rel, renamed = %new_rel, "remote name collision, keeping both");
-                    std::fs::rename(&abs, to_abs(&self.root, &new_rel))?;
+                    std::fs::rename(&abs, self.content_path(&new_rel))?;
                     return Box::pin(self.upsert_local_file(&new_rel)).await;
                 }
                 (parent_uid, None, None, false)
@@ -1051,12 +1175,12 @@ impl<S: SidecarApi + 'static> Engine<S> {
         node: &Node,
     ) -> Result<String> {
         let conflict_rel = self.fresh_conflict_rel(rel, row).await?;
-        let abs = to_abs(&self.root, &conflict_rel);
+        let abs = self.content_path(&conflict_rel);
         if let Some(dir) = abs.parent() {
             std::fs::create_dir_all(dir)?;
         }
         let tmp_rel = format!("{conflict_rel}.pds-part");
-        let tmp = to_abs(&self.root, &tmp_rel);
+        let tmp = self.content_path(&tmp_rel);
         let sidecar = Arc::clone(&self.sidecar);
         self.run_transfer(
             "download",
@@ -1089,7 +1213,7 @@ impl<S: SidecarApi + 'static> Engine<S> {
     /// Pick a conflict path next to `rel`: deduped against disk + DB
     /// locally, then (best effort) against remote sibling names.
     async fn fresh_conflict_rel(&self, rel: &str, row: &NodeRow) -> Result<String> {
-        let local = local_free_conflict_rel(&self.db, &self.root, rel)?;
+        let local = local_free_conflict_rel_in(&self.db, self.content_dir(), rel)?;
         // Remote collision: ask the Drive side for an available name.
         if let Some(parent) = row.parent_uid.clone() {
             let name = local.rsplit('/').next().unwrap_or(&local);
@@ -1100,7 +1224,7 @@ impl<S: SidecarApi + 'static> Engine<S> {
                     Some((dir, _)) => format!("{dir}/{available}"),
                     None => available,
                 };
-                if !to_abs(&self.root, &remote_rel).exists()
+                if !self.content_path(&remote_rel).exists()
                     && self.db.node_by_path(&remote_rel)?.is_none()
                 {
                     return Ok(remote_rel);
@@ -1423,6 +1547,8 @@ impl<S: SidecarApi + 'static> Engine<S> {
                         self.download_file(&uid, &rel).await?;
                     }
                 }
+                // Placeholder mode: nothing to download — the VFS serves
+                // the refreshed tree as placeholders (hydrate on open).
             }
         }
         // Persist the resume token after applying (protocol.md F6).
@@ -1458,16 +1584,18 @@ impl<S: SidecarApi + 'static> Engine<S> {
 
         // File: keep-both whenever the local copy carries content the remote
         // doesn't know about (F7): dirty/uploading rows, untracked files, or
-        // on-disk content diverging from the last synced hash.
+        // on-disk content diverging from the last synced hash. Divergence is
+        // judged against the CONTENT copy (backing dir in placeholder mode).
         if abs.is_file() {
             let diverged = match self.db.node_by_path(&rel)? {
                 Some(row) => {
-                    row.sync_state != SyncState::Synced || local_content_diverged(&row, &abs)
+                    row.sync_state != SyncState::Synced
+                        || local_content_diverged(&row, &self.content_path(&rel))
                 }
                 None => true, // untracked local file in the way
             };
             if diverged {
-                let conflicted = rename_for_conflict(&self.db, &self.root, &rel)?;
+                let conflicted = rename_for_conflict_in(&self.db, self.content_dir(), &rel)?;
                 warn!(path = %rel, conflict = %conflicted, "remote event vs local content: keeping both");
                 self.emit_activity(
                     ActivityKind::Conflict,
@@ -1522,12 +1650,12 @@ impl<S: SidecarApi + 'static> Engine<S> {
         let Some(row) = self.db.node_by_uid(uid)? else {
             return Ok(());
         };
-        let abs = to_abs(&self.root, &row.local_path);
+        let content_abs = self.content_path(&row.local_path);
         // F7 (M4 soak find): the row's state alone can LIE — a local write
         // still inside the watcher's debounce window has not marked the row
         // dirty yet. Hash the on-disk content before destroying anything.
         let locally_unsynced = row.sync_state != SyncState::Synced
-            || local_content_diverged(&row, &abs);
+            || local_content_diverged(&row, &content_abs);
         if locally_unsynced {
             // Local unsynced changes → keep both (F7); the dirty row will
             // re-upload under an available name. Unpark it so the upload
@@ -1536,17 +1664,27 @@ impl<S: SidecarApi + 'static> Engine<S> {
             info!(path = %row.local_path, "remote delete of dirty local node: keeping local copy");
             return Ok(());
         }
-        if abs.is_dir() {
-            std::fs::remove_dir_all(&abs).ok();
+        if content_abs.is_dir() {
+            std::fs::remove_dir_all(&content_abs).ok();
         } else {
-            std::fs::remove_file(&abs).ok();
+            std::fs::remove_file(&content_abs).ok();
         }
-        // Placeholder mode: drop the hydrated backing copy too.
-        if self.placeholders
-            && let Some(store) = &self.store
-        {
-            store.clear_backing(&row.local_path);
-            std::fs::remove_file(to_abs(&self.backing_dir, &row.local_path)).ok();
+        // Mirror mode also removes the visible copy. In placeholder mode
+        // the visible path may be the FUSE mount itself (desktop layout):
+        // unlinking through it would round-trip into the store as a fresh
+        // local delete of an already-deleted node. The placeholder vanishes
+        // on the next snapshot publish instead.
+        if self.placeholders {
+            if let Some(store) = &self.store {
+                store.clear_backing(&row.local_path);
+            }
+        } else {
+            let abs = to_abs(&self.root, &row.local_path);
+            if abs.is_dir() {
+                std::fs::remove_dir_all(&abs).ok();
+            } else {
+                std::fs::remove_file(&abs).ok();
+            }
         }
         self.remove_node_recursive(&row.local_path)?;
         Ok(())
@@ -1559,7 +1697,13 @@ impl<S: SidecarApi + 'static> Engine<S> {
     /// Where this engine reads local file content from (visible root, or
     /// backing dir in placeholder mode — see [`content_root`]).
     fn content_path(&self, rel: &str) -> PathBuf {
-        to_abs(content_root(self.placeholders, &self.root, &self.backing_dir), rel)
+        to_abs(self.content_dir(), rel)
+    }
+
+    /// The directory holding this engine's local file content (visible root
+    /// in mirror mode, backing dir in placeholder mode).
+    fn content_dir(&self) -> &Path {
+        content_root(self.placeholders, &self.root, &self.backing_dir)
     }
 
     /// Publish the current DB state as the VFS tree snapshot (M3). Files
@@ -1987,6 +2131,7 @@ impl<S: SidecarApi + 'static> Engine<S> {
                     queued_tombstones: self.db.tombstones().map(|v| v.len()).unwrap_or(0),
                     errored_nodes: self.db.count_errored().unwrap_or(0),
                     conflicted_nodes: self.db.count_remote_conflicted().unwrap_or(0),
+                    mode: self.sync_mode(),
                 });
             }
             Command::Shutdown => {}
@@ -2125,6 +2270,133 @@ fn content_root<'a>(placeholders: bool, root: &'a Path, backing_dir: &'a Path) -
     }
 }
 
+/// One-time-per-direction local layout conversion for the desktop app
+/// (external backing cache): mirror ⇄ placeholders without re-downloading
+/// anything.
+///
+/// - Switching TO placeholders: every tracked file materialized in the root
+///   moves into the backing cache and becomes a hydrated placeholder (its
+///   content is on disk, `content_ready`); untracked leftover files move
+///   into the backing cache too and register as dirty (pending upload), so
+///   nothing real is stranded under the future mount; empty tracked dirs
+///   are pruned.
+/// - Switching TO mirror: hydrated backing files move back into the root;
+///   placeholders without backing content get re-downloaded by the normal
+///   materialization pass (nothing is deleted or lost).
+///
+/// The `.layout-converted` marker records WHICH layout the conversion last
+/// produced, so switching back and forth re-runs the right pass (a
+/// direction-blind "ran once" marker would strand content on the second
+/// toggle). Conservative: files that fail to move stay where they are and
+/// the normal sync machinery reconciles them (a left-behind copy in the
+/// root re-uploads; a missing one re-downloads). Rows are left as-is:
+/// `Synced` rows whose content just moved stay hash-consistent (the bytes
+/// did not change).
+fn convert_layout(db: &Db, root: &Path, backing_dir: &Path, target: SyncMode) -> Result<()> {
+    let marker = backing_dir.join(LAYOUT_CONVERTED);
+    if SyncMode::from_meta_value(std::fs::read_to_string(&marker).ok().as_deref()) == Some(target)
+    {
+        return Ok(());
+    }
+    let to_placeholders = target == SyncMode::Placeholders;
+    std::fs::create_dir_all(backing_dir)?;
+    let rows = db.all_nodes()?;
+    let mut moved = 0usize;
+    for row in rows.iter().filter(|r| r.is_file()) {
+        let in_root = to_abs(root, &row.local_path);
+        let in_backing = to_abs(backing_dir, &row.local_path);
+        let (from, to) = if to_placeholders {
+            (in_root, in_backing)
+        } else {
+            (in_backing, in_root)
+        };
+        if !from.is_file() || to.exists() {
+            continue;
+        }
+        match crate::mode::move_file(&from, &to) {
+            Ok(()) => moved += 1,
+            Err(e) => warn!(path = %row.local_path, error = %e, "layout move failed"),
+        }
+    }
+    if to_placeholders {
+        // Adoption: files that never synced (failed uploads, pre-existing
+        // local content) would be stranded invisible under the mount. Move
+        // them into the backing cache and register them dirty (pending
+        // upload) — same representation `upsert_local_file` uses.
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(d) = stack.pop() {
+            let mut dirs = Vec::new();
+            let Ok(entries) = std::fs::read_dir(&d) else {
+                continue; // unreadable dir: leave it; never fail adoption
+            };
+            for entry in entries {
+                let Ok(entry) = entry else { continue };
+                let path = entry.path();
+                let Some(rel) = to_rel(root, &path) else {
+                    continue;
+                };
+                if is_internal_path(&rel) || is_temp_file(&rel) {
+                    // Temp files are swept by crash recovery (M4), never
+                    // uploaded or adopted.
+                    continue;
+                }
+                if path.is_dir() {
+                    dirs.push((rel, path));
+                } else if path.is_file() && db.node_by_path(&rel)?.is_none() {
+                    let dest = to_abs(backing_dir, &rel);
+                    match crate::mode::move_file(&path, &dest) {
+                        Ok(()) => {
+                            moved += 1;
+                            let (sha1, size) =
+                                sha1_file(&dest).unwrap_or_else(|_| (String::new(), 0));
+                            let mtime = std::fs::metadata(&dest)
+                                .and_then(|m| m.modified())
+                                .ok()
+                                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                                .map(|d| d.as_secs() as i64);
+                            let name =
+                                rel.rsplit('/').next().unwrap_or(&rel).to_string();
+                            db.upsert_node(&NodeRow {
+                                local_path: rel.clone(),
+                                node_uid: format!("pending:{rel}"),
+                                parent_uid: None,
+                                name,
+                                kind: pds_sidecar_client::NodeKind::File,
+                                size: Some(size as i64),
+                                sha1: Some(sha1),
+                                mtime,
+                                sync_state: SyncState::Dirty,
+                                pinned: false,
+                                synced_sha1: None,
+                            })?;
+                        }
+                        Err(e) => warn!(path = %rel, error = %e, "adoption move failed"),
+                    }
+                }
+            }
+            for (_rel, path) in dirs {
+                stack.push(path);
+            }
+        }
+        // Empty directories in the root would linger forever (placeholders
+        // mode never materializes dirs); prune the tracked empty ones.
+        for row in rows.iter().filter(|r| !r.is_file()) {
+            let abs = to_abs(root, &row.local_path);
+            std::fs::remove_dir(&abs).ok(); // fails while non-empty: fine
+        }
+    }
+    std::fs::write(&marker, target.as_meta_value())?;
+    if moved > 0 {
+        info!(files = moved, layout = target.as_meta_value(), "local layout converted");
+    }
+    Ok(())
+}
+
+/// Marker file inside the backing dir recording which layout the conversion
+/// last produced (`mirror`/`placeholders`); a repeat pass for the same
+/// layout is a no-op, the opposite direction re-runs the moves.
+const LAYOUT_CONVERTED: &str = ".layout-converted";
+
 /// Upload params for a dirty row: `pending:` uids upload as a NEW file under
 /// the parent; real uids upload as a new revision of the existing node.
 fn upload_params(row: &NodeRow, abs: &Path) -> UploadParams {
@@ -2233,14 +2505,15 @@ fn with_suffix_before_ext(name: &str, suffix: &str) -> String {
 
 /// The F7 conflict path next to `rel`, deduped against the local disk and
 /// the DB: `name (conflict YYYY-MM-DD HHmm).ext`, then `… (2).ext`, etc.
-/// Never overwrites an existing file or tracked row.
-fn local_free_conflict_rel(db: &Db, root: &Path, rel: &str) -> Result<String> {
-    local_free_conflict_rel_at(db, root, rel, chrono::Local::now())
+/// Never overwrites an existing file or tracked row. `base` is the content
+/// root whose namespace the candidate must not collide with.
+fn local_free_conflict_rel_in(db: &Db, base: &Path, rel: &str) -> Result<String> {
+    local_free_conflict_rel_at(db, base, rel, chrono::Local::now())
 }
 
 fn local_free_conflict_rel_at(
     db: &Db,
-    root: &Path,
+    base: &Path,
     rel: &str,
     at: chrono::DateTime<chrono::Local>,
 ) -> Result<String> {
@@ -2253,7 +2526,7 @@ fn local_free_conflict_rel_at(
     let mut candidate = stamped.clone();
     for i in 2.. {
         let rel_candidate = with_name(&candidate);
-        if !to_abs(root, &rel_candidate).exists() && db.node_by_path(&rel_candidate)?.is_none() {
+        if !to_abs(base, &rel_candidate).exists() && db.node_by_path(&rel_candidate)?.is_none() {
             return Ok(rel_candidate);
         }
         candidate = with_suffix_before_ext(&stamped, &format!(" ({i})"));
@@ -2264,17 +2537,19 @@ fn local_free_conflict_rel_at(
 /// Rename the local file at `rel` to its F7 conflict name (deduped — an
 /// existing conflict copy is never overwritten); returns the new relative
 /// path. Any tracked row is re-keyed to the new path as dirty (pending
-/// upload) so the renamed copy uploads under its conflict name.
-fn rename_for_conflict(db: &Db, root: &Path, rel: &str) -> Result<String> {
-    let abs = to_abs(root, rel);
-    let new_rel = local_free_conflict_rel(db, root, rel)?;
-    std::fs::rename(&abs, to_abs(root, &new_rel))?;
+/// upload) so the renamed copy uploads under its conflict name. `content`
+/// is where the file bytes live (visible root in mirror mode, backing dir
+/// in placeholder mode — a conflict copy is content, never a placeholder).
+fn rename_for_conflict_in(db: &Db, content: &Path, rel: &str) -> Result<String> {
+    let abs = to_abs(content, rel);
+    let new_rel = local_free_conflict_rel_in(db, content, rel)?;
+    std::fs::rename(&abs, to_abs(content, &new_rel))?;
     if let Some(mut row) = db.node_by_path(rel)? {
         // Free the old path for the incoming remote node, then track the
         // conflicted local copy under its new path as dirty (to-upload).
         // Refresh content hashes so the upload queue doesn't see staleness.
         db.remove_node(rel)?;
-        let new_abs = to_abs(root, &new_rel);
+        let new_abs = to_abs(content, &new_rel);
         row.local_path = new_rel.clone();
         row.name = new_rel.rsplit('/').next().unwrap_or(&new_rel).to_string();
         row.node_uid = format!("pending:{new_rel}");
@@ -2293,10 +2568,16 @@ fn rename_for_conflict(db: &Db, root: &Path, rel: &str) -> Result<String> {
     Ok(new_rel)
 }
 
+/// `rename_for_conflict_in` against the visible root (mirror mode).
+fn rename_for_conflict(db: &Db, root: &Path, rel: &str) -> Result<String> {
+    rename_for_conflict_in(db, root, rel)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::db::SyncState;
+    use crate::mode::META_SYNC_MODE;
 
     fn tracked_row(rel: &str, sha1: Option<String>) -> NodeRow {
         NodeRow {
@@ -2411,5 +2692,151 @@ mod tests {
         assert!(is_temp_file("x.txt.pdstmp-abc123"));
         assert!(!is_temp_file("x.txt"));
         assert!(!is_temp_file("docs/report.pds.txt"));
+    }
+
+    /// External-backing layout (the desktop app): switching a mirror root
+    /// to placeholders moves tracked AND untracked content into the backing
+    /// cache without losing anything.
+    #[test]
+    fn convert_layout_to_placeholders_moves_all_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root");
+        let backing = dir.path().join("backing");
+        std::fs::create_dir_all(root.join("docs")).unwrap();
+        std::fs::write(root.join("docs/a.txt"), b"tracked").unwrap();
+        std::fs::write(root.join("untracked.txt"), b"never synced").unwrap();
+
+        let db = Db::open_memory().unwrap();
+        let (sha1, _) = sha1_file(&root.join("docs/a.txt")).unwrap();
+        db.upsert_node(&tracked_row("docs/a.txt", Some(sha1))).unwrap();
+        db.upsert_node(&NodeRow {
+            kind: NodeKind::Folder,
+            ..tracked_row("docs", None)
+        })
+        .unwrap();
+
+        convert_layout(&db, &root, &backing, SyncMode::Placeholders).unwrap();
+
+        // Tracked + untracked files moved; the root shows neither.
+        assert_eq!(std::fs::read(backing.join("docs/a.txt")).unwrap(), b"tracked");
+        assert_eq!(
+            std::fs::read(backing.join("untracked.txt")).unwrap(),
+            b"never synced"
+        );
+        assert!(!root.join("docs/a.txt").exists());
+        assert!(!root.join("untracked.txt").exists());
+        // The empty tracked dir was pruned.
+        assert!(!root.join("docs").exists());
+
+        // The untracked file registered as a dirty pending upload.
+        let row = db.node_by_path("untracked.txt").unwrap().unwrap();
+        assert_eq!(row.sync_state, SyncState::Dirty);
+        assert!(row.node_uid.starts_with("pending:"));
+        // The tracked row stayed synced (bytes unchanged → hash-consistent).
+        let row = db.node_by_path("docs/a.txt").unwrap().unwrap();
+        assert_eq!(row.sync_state, SyncState::Synced);
+
+        // Idempotent: a repeat pass moves nothing and keeps the marker.
+        convert_layout(&db, &root, &backing, SyncMode::Placeholders).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(backing.join(LAYOUT_CONVERTED)).unwrap(),
+            "placeholders"
+        );
+        assert_eq!(std::fs::read(backing.join("docs/a.txt")).unwrap(), b"tracked");
+    }
+
+    /// Switching back to mirror moves hydrated content into the root.
+    #[test]
+    fn convert_layout_to_mirror_moves_content_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root");
+        let backing = dir.path().join("backing");
+        std::fs::create_dir_all(backing.join("docs")).unwrap();
+        std::fs::write(backing.join("docs/a.txt"), b"hydrated").unwrap();
+
+        let db = Db::open_memory().unwrap();
+        let (sha1, _) = sha1_file(&backing.join("docs/a.txt")).unwrap();
+        db.upsert_node(&tracked_row("docs/a.txt", Some(sha1))).unwrap();
+
+        convert_layout(&db, &root, &backing, SyncMode::Mirror).unwrap();
+
+        assert_eq!(std::fs::read(root.join("docs/a.txt")).unwrap(), b"hydrated");
+        assert!(!backing.join("docs/a.txt").exists());
+    }
+
+    /// Toggling modes back and forth must re-run the conversion each time
+    /// (the marker records WHICH layout it produced, not just that it ran).
+    #[test]
+    fn convert_layout_round_trip_follows_every_toggle() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root");
+        let backing = dir.path().join("backing");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("a.txt"), b"content a").unwrap();
+
+        let db = Db::open_memory().unwrap();
+        let (sha1, _) = sha1_file(&root.join("a.txt")).unwrap();
+        db.upsert_node(&tracked_row("a.txt", Some(sha1))).unwrap();
+
+        // mirror → placeholders: content moves into the backing cache.
+        convert_layout(&db, &root, &backing, SyncMode::Placeholders).unwrap();
+        assert_eq!(std::fs::read(backing.join("a.txt")).unwrap(), b"content a");
+        assert!(!root.join("a.txt").exists());
+
+        // placeholders → mirror: the SAME bytes move back (no re-download).
+        convert_layout(&db, &root, &backing, SyncMode::Mirror).unwrap();
+        assert_eq!(std::fs::read(root.join("a.txt")).unwrap(), b"content a");
+        assert!(!backing.join("a.txt").exists());
+
+        // …and once more into placeholders — the marker must not short-
+        // circuit this second crossing.
+        convert_layout(&db, &root, &backing, SyncMode::Placeholders).unwrap();
+        assert_eq!(std::fs::read(backing.join("a.txt")).unwrap(), b"content a");
+        assert!(!root.join("a.txt").exists());
+    }
+
+    /// The persisted `sync_mode` setting decides the effective mode for
+    /// existing roots — the caller's flag is only the first-run default.
+    #[tokio::test]
+    async fn mode_resolution_persisted_wins() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("state.db");
+        let db = Db::open(&db_path).unwrap();
+        db.set_meta(META_SYNC_MODE, SyncMode::Mirror.as_meta_value())
+            .unwrap();
+        drop(db);
+
+        let (client, _mock) = pds_sidecar_client::MockSidecar::new().connect();
+        let (_tx, rx) = tokio::sync::mpsc::channel(1);
+        let (engine, _handle) = Engine::new(
+            Arc::new(client),
+            rx,
+            EngineConfig {
+                root: dir.path().join("root"),
+                db_path,
+                placeholders: true, // ignored: persisted mirror wins
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(engine.sync_mode(), SyncMode::Mirror);
+
+        // First-run with no persisted value: the caller's default is stored.
+        let dir2 = tempfile::tempdir().unwrap();
+        let db_path2 = dir2.path().join("state.db");
+        let (client2, _mock2) = pds_sidecar_client::MockSidecar::new().connect();
+        let (_tx2, rx2) = tokio::sync::mpsc::channel(1);
+        let (engine2, _handle2) = Engine::new(
+            Arc::new(client2),
+            rx2,
+            EngineConfig {
+                root: dir2.path().join("root"),
+                db_path: db_path2,
+                placeholders: false, // new root defaults to mirror here
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(engine2.sync_mode(), SyncMode::Mirror);
     }
 }

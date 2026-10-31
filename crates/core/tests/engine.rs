@@ -56,6 +56,7 @@ async fn start_with_client(
             retry_base,
             placeholders: false,
             eviction_cap: None,
+            ..Default::default()
         },
     )
     .unwrap();
@@ -157,6 +158,7 @@ async fn first_run_uploads_local_only_files() {
             retry_base: pds_core::RETRY_BASE_DEFAULT,
             placeholders: false,
             eviction_cap: None,
+            ..Default::default()
         },
     )
     .unwrap();
@@ -877,6 +879,7 @@ async fn crashed_upload_recovers_on_restart() {
             retry_base: pds_core::RETRY_BASE_DEFAULT,
             placeholders: false,
             eviction_cap: None,
+            ..Default::default()
         },
     )
     .unwrap();
@@ -915,6 +918,7 @@ async fn crashed_upload_with_vanished_file_tombstones() {
             retry_base: pds_core::RETRY_BASE_DEFAULT,
             placeholders: false,
             eviction_cap: None,
+            ..Default::default()
         },
     )
     .unwrap();
@@ -957,6 +961,7 @@ async fn stale_transfer_temps_are_swept_on_startup() {
             retry_base: pds_core::RETRY_BASE_DEFAULT,
             placeholders: false,
             eviction_cap: None,
+            ..Default::default()
         },
     )
     .unwrap();

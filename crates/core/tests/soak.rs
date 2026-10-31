@@ -37,6 +37,7 @@ async fn start() -> Fixture {
             retry_base: Duration::from_millis(20),
             placeholders: false,
             eviction_cap: None,
+            ..Default::default()
         },
     )
     .unwrap();

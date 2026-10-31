@@ -47,6 +47,7 @@ async fn start_with_cap(eviction_cap: Option<u64>) -> Fixture {
             retry_base: pds_core::RETRY_BASE_DEFAULT,
             placeholders: true,
             eviction_cap,
+            ..Default::default()
         },
     )
     .unwrap();
@@ -80,6 +81,83 @@ impl Fixture {
         self.handle.shutdown().await.unwrap();
         let _ = self.engine.await;
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn external_backing_adopts_previously_materialized_content() {
+    init_logs();
+    // The desktop-app layout: engine state + backing cache OUTSIDE the root
+    // (the app mounts the placeholder view at the root itself). A root that
+    // was previously mirrored has real files in it; adopting it into
+    // placeholder mode must move them into the backing cache (no
+    // re-download) and mark them content-ready.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("sync");
+    let state_dir = dir.path().join("state");
+    let backing = state_dir.join("backing");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::create_dir_all(&state_dir).unwrap();
+    std::fs::write(root.join("hello.txt"), b"hello drive").unwrap();
+
+    // Pre-existing mirror state: the row is synced and the file bytes are
+    // on disk in the root.
+    let db_path = state_dir.join("state.db");
+    let db = pds_core::Db::open(&db_path).unwrap();
+    db.upsert_node(&pds_core::NodeRow {
+        local_path: "hello.txt".into(),
+        node_uid: "node-hello".into(),
+        parent_uid: Some("root".into()),
+        name: "hello.txt".into(),
+        kind: pds_sidecar_client::NodeKind::File,
+        size: Some(11),
+        sha1: None,
+        mtime: Some(1_700_000_000),
+        sync_state: pds_core::SyncState::Synced,
+        pinned: false,
+        synced_sha1: None,
+    })
+    .unwrap();
+    drop(db);
+
+    let (mut client, _mock) = MockSidecar::new().connect();
+    let notifications = client.take_notifications();
+    let (engine, handle) = Engine::new(
+        Arc::new(client),
+        notifications,
+        EngineConfig {
+            root: root.clone(),
+            db_path,
+            retry_base: pds_core::RETRY_BASE_DEFAULT,
+            placeholders: true,
+            eviction_cap: None,
+            backing_dir: Some(backing.clone()),
+            // The root IS the FUSE mountpoint in this layout.
+            watch_local_writes: false,
+        },
+    )
+    .unwrap();
+    let store = handle.store().cloned().expect("placeholder store");
+    let engine = tokio::spawn(engine.run());
+
+    // The previously materialized file moved into the backing cache, so
+    // the snapshot must show it hydrated from the start — no download.
+    wait_for(|| {
+        store
+            .snapshot()
+            .by_path
+            .get("hello.txt")
+            .is_some_and(|n| n.content_ready)
+    })
+    .await;
+    assert!(
+        !root.join("hello.txt").exists(),
+        "adoption leaves nothing materialized in the root"
+    );
+    assert_eq!(std::fs::read(backing.join("hello.txt")).unwrap(), b"hello drive");
+
+    handle.shutdown().await.unwrap();
+    let _ = engine.await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -212,6 +290,7 @@ async fn pinned_file_survives_eviction() {
             retry_base: pds_core::RETRY_BASE_DEFAULT,
             placeholders: true,
             eviction_cap: Some(1),
+            ..Default::default()
         },
     )
     .unwrap();
