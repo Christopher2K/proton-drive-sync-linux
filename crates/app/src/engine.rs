@@ -408,21 +408,6 @@ fn mount_placeholder_view(
     Ok(served)
 }
 
-#[cfg(test)]
-mod tests {
-    /// The probe must round-trip a REQUEST through a served session. This is
-    /// the M3.4 freeze as a test: mounting without serving made the old
-    /// probe pass (the mount exists) while every access to the real
-    /// mountpoint blocked in the kernel forever.
-    #[test]
-    fn fuse_probe_serves_requests() {
-        assert!(
-            super::fuse_available(),
-            "FUSE probe mounted but never answered a stat"
-        );
-    }
-}
-
 /// Sync-root layout: where the engine state and (in placeholder mode) the
 /// backing cache live. `prepare_layout` migrates legacy state out of the
 /// root; it never deletes anything.
@@ -442,6 +427,11 @@ struct RootLayout {
 /// adopts a legacy in-root state DB when present (verified copy, then the
 /// original is removed), and writes the root marker. Never deletes content.
 fn prepare_layout(root: &Path) -> Result<RootLayout> {
+    // First launch: the configured sync root may not exist yet. Create it
+    // before canonicalizing — otherwise startup fails with an obscure
+    // "No such file or directory" on `~/ProtonDrive`.
+    std::fs::create_dir_all(root)
+        .with_context(|| format!("create sync root {}", root.display()))?;
     let root = root
         .canonicalize()
         .with_context(|| format!("sync root {}", root.display()))?;
@@ -739,5 +729,20 @@ async fn await_login(
                 _ => {}
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// The probe must round-trip a REQUEST through a served session. This is
+    /// the M3.4 freeze as a test: mounting without serving made the old
+    /// probe pass (the mount exists) while every access to the real
+    /// mountpoint blocked in the kernel forever.
+    #[test]
+    fn fuse_probe_serves_requests() {
+        assert!(
+            super::fuse_available(),
+            "FUSE probe mounted but never answered a stat"
+        );
     }
 }

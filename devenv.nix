@@ -57,6 +57,12 @@ in
   env = {
     RUST_BACKTRACE = "1";
     SSL_CERT_FILE = "${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt";
+    # gpui/blade dlopen Vulkan and the other desktop libraries at runtime.
+    # NixOS does not expose libvulkan.so.1 on the default loader path, and the
+    # dev shell's generated LD_LIBRARY_PATH only covers wayland, so a plain
+    # `cargo run -p pds-app` panics with "libvulkan.so.1: cannot open shared
+    # object file". Make the full runtime library set visible.
+    LD_LIBRARY_PATH = lib.makeLibraryPath linuxPackages;
   };
 
   enterShell = ''

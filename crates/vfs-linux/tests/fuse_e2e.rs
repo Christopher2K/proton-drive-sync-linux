@@ -183,6 +183,23 @@ async fn fuse_mount_serves_placeholders_and_hydrates() {
     let meta = std::fs::metadata(mnt.join("big.bin")).unwrap();
     assert_eq!(meta.len(), big.len() as u64, "placeholder size");
 
+    // 2b. `listxattr` must answer both forms of the request (size query and
+    // supplied buffer). Replying with the size form to a buffer request
+    // makes the kernel return EIO — visible as `ls -l` errors on every file.
+    let xattr_path = std::ffi::CString::new(mnt.join("big.bin").to_string_lossy().as_bytes())
+        .expect("path has no NUL");
+    let size_query = unsafe { libc::llistxattr(xattr_path.as_ptr(), std::ptr::null_mut(), 0) };
+    assert_eq!(size_query, 0, "listxattr size query");
+    let mut xattr_buf = [0u8; 64];
+    let with_buffer = unsafe {
+        libc::llistxattr(
+            xattr_path.as_ptr(),
+            xattr_buf.as_mut_ptr().cast(),
+            xattr_buf.len(),
+        )
+    };
+    assert_eq!(with_buffer, 0, "listxattr with buffer");
+
     // 3. Read through the mount → hydration → correct content.
     let started = Instant::now();
     let got = std::fs::read(mnt.join("big.bin")).expect("read big.bin");
@@ -399,6 +416,16 @@ async fn fuse_mount_over_nonempty_root_shadows_and_preserves_leftovers() {
         .collect();
     assert!(names.iter().any(|n| n == "hello.txt"), "{names:?}");
     assert!(names.iter().any(|n| n == "Documents"), "{names:?}");
+    // The `.pds` proxy is advertised by readdir AND resolvable: lookup must
+    // answer for the state dir itself (same target as `getattr`), or `ls`
+    // shows a phantom entry that cannot be stated or entered.
+    let proxy_meta = std::fs::metadata(root.join(".pds")).expect("lookup .pds proxy");
+    assert!(proxy_meta.is_dir(), ".pds proxy is a directory");
+    assert_eq!(
+        std::fs::read_dir(root.join(".pds")).unwrap().count(),
+        0,
+        ".pds proxy is empty"
+    );
     // …and the leftover real content is shadowed, not merged.
     assert!(!names.iter().any(|n| n == "leftover.txt"), "{names:?}");
     assert!(!names.iter().any(|n| n == "old stuff"), "{names:?}");

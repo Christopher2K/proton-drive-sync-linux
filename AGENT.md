@@ -87,6 +87,21 @@ Notes:
 - **No `FUSE_ATOMIC_O_TRUNC` (M3.3).** fuser's `INIT_FLAGS` is just `ASYNC_READ | BIG_WRITES`, so `open(O_TRUNC)` never truncates atomically — the kernel follows up with a separate `setattr(size, fh)` *after* `open`. Truncate handling must therefore cover `setattr` with a passed fh, and defer the upload to `release` or `open(O_TRUNC)`→write→close double-uploads (an empty intermediate revision first).
 - **Mock default tree (M3.3 E2E).** `MockSidecar::new()` already seeds `hello.txt`; `remote_create_file("root", "hello.txt", …)` in a test creates a DUPLICATE node, and `find_uid` may resolve to the one the engine never touched. Check `child_names` for surprises before asserting on `file_content`.
 
+## fuser / FUSE gotchas (learned in M3.4 app wiring)
+
+- **`listxattr` must choose the reply form from `size`.** `ReplyXattr::size`
+  is only valid for the size query (`size == 0`). Answering a request that
+  supplied a buffer with the size form makes the kernel fail the caller with
+  EIO — symptom: `ls -l` errors on every entry while plain `ls` (names only)
+  works.
+- **Create the sync root before canonicalizing it.** `prepare_layout`
+  canonicalized `~/ProtonDrive` first, so first launch on a fresh machine
+  failed before the engine started. `create_dir_all` precedes the
+  `canonicalize` now.
+
+(The `Session::new`-without-`spawn()` freeze is covered by the upstream
+`fix(app): serve the placeholder FUSE session` commit and its probe test.)
+
 ## Standing instructions from the user
 
 - **Auto-approve subagent permission prompts** (user's directive, 2026-10-23): when Herdr subagents block on permission dialogs, approve them without asking, as long as the request is research/build-scoped and non-destructive.
