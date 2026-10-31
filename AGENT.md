@@ -69,6 +69,7 @@ Notes:
 - **Tests must synchronize on the watcher, not initial sync.** A fixture that returns when initial-sync materializes files can beat the watcher attach (step 3 of `run()`); any file written immediately after is invisible to inotify. That was the "rotating flake" hitting a different engine test each run under VM load. Fix: `EngineHandle::wait_for_watcher` (Arc<AtomicBool> flipped right after `start_watcher`).
 - **`apply_remote_delete` cannot trust `sync_state`** — a local write inside the 500 ms debounce window leaves the row `Synced` while the disk content is already new. Hash before deleting (same discipline as `apply_node_upsert`). Found by the soak battery.
 - **Attempt counting races failure bookkeeping**: `upload_attempts` increments when the transfer STARTS; the backoff is scheduled when the `transfer.error` is processed. Tests that act between the two (e.g. resume clearing backoffs) must wait for the row to come back Dirty first.
+- **Mass-delete guard tests must let the deletes land first.** The watcher's ~500 ms debounce can split a burst of removals into several batches under CI load; a guard-paused engine keeps recording tombstones but drains nothing, so a resume issued after the first batch approves only part of the set and the late ones legitimately re-trip the guard. Synchronize on "every delete accounted for" (`wait_for_deletes_accounted`: pending tombstones + trashed == total) before resuming — CI flake, 2026-10-31.
 
 ## fuser / FUSE gotchas (learned in M3.1)
 

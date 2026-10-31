@@ -91,6 +91,25 @@ async fn wait_for(cond: impl Fn() -> bool) {
     panic!("condition not met within 30 s");
 }
 
+/// Wait until every one of `total` local deletes is accounted for — already
+/// trashed remotely, or still pending as a tombstone.
+///
+/// The watcher delivers removes in debounced batches, so a burst of deletes
+/// can reach the engine as several batches under load. A guard-paused engine
+/// keeps recording them but drains nothing, so "the pending batch" is only
+/// final once nothing is in flight between the watcher and the DB. Without
+/// this wait, a resume can approve a partial batch and the late-arriving
+/// tombstones legitimately re-trip the guard (CI flake, 2026-10-31).
+async fn wait_for_deletes_accounted(fx: &Fixture, total: usize) {
+    wait_for(|| {
+        fx.db
+            .tombstones()
+            .map(|pending| pending.len() + fx.mock.trashed_uids().len() == total)
+            .unwrap_or(false)
+    })
+    .await;
+}
+
 impl Fixture {
     async fn shutdown(self) {
         self.handle.shutdown().await.unwrap();
@@ -307,7 +326,16 @@ async fn mass_delete_guard_auto_pauses_and_requires_resume() {
     // trips partway through. ONE explicit resume is the user's confirmation
     // (SPEC F3.3) and approves the whole pending batch (bug #2): it must
     // drain completely without re-tripping as the synced base shrinks.
-    for i in 0..25 {
+    //
+    // The removals arrive in two watcher batches (separated by the ~500 ms
+    // debounce) on purpose: that is the CI flake of 2026-10-31 — the guard
+    // paused on batch one and re-tripped on batch-two tombstones that landed
+    // after the resume. Keep the split so the multi-batch path stays covered.
+    for i in 0..12 {
+        std::fs::remove_file(root.join(format!("f{i:02}.txt"))).unwrap();
+    }
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    for i in 12..25 {
         std::fs::remove_file(root.join(format!("f{i:02}.txt"))).unwrap();
     }
 
@@ -327,6 +355,10 @@ async fn mass_delete_guard_auto_pauses_and_requires_resume() {
         // Guard must have stopped the cascade before all 25 went through.
         assert!(fx.mock.trashed_uids().len() < 25);
         assert!(!fx.db.tombstones().unwrap().is_empty());
+        // The removes may have arrived as several watcher batches; the guard
+        // paused after the first one. Wait until all 25 are known (pending
+        // tombstones + already trashed) so this resume covers the whole batch.
+        wait_for_deletes_accounted(&fx, 25).await;
         fx.handle.resume().await.unwrap();
         resumes += 1;
         tokio::time::sleep(Duration::from_millis(200)).await;
@@ -370,6 +402,9 @@ async fn mass_delete_guard_re_trips_on_new_deletes_beyond_approved_set() {
             .unwrap_or(false)
     })
     .await;
+    // Same batching caveat as above: wait until all 25 deletes are accounted
+    // for (pending or trashed) so the resume approves the whole batch.
+    wait_for_deletes_accounted(&fx, 25).await;
     fx.handle.resume().await.unwrap();
     wait_for(|| fx.mock.trashed_uids().len() == 25).await;
     assert!(fx.db.tombstones().unwrap().is_empty());
@@ -393,6 +428,8 @@ async fn mass_delete_guard_re_trips_on_new_deletes_beyond_approved_set() {
         "guard must re-trip before the new batch fully drains"
     );
     assert!(!fx.db.tombstones().unwrap().is_empty());
+    // Late watcher batches would re-trip again; absorb them before resuming.
+    wait_for_deletes_accounted(&fx, 30).await;
 
     // A second explicit resume approves the new batch and drains it.
     fx.handle.resume().await.unwrap();
