@@ -14,6 +14,7 @@
 //! cargo test -p pds-vfs-linux --test fuse_e2e -- --nocapture
 //! ```
 
+use std::collections::HashMap;
 use std::io::Write as _;
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
@@ -21,7 +22,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use fuser::{Config, MountOption};
-use pds_core::{Engine, EngineConfig, STATE_DIR};
+use pds_core::{Engine, EngineConfig, STATE_DIR, store::VNode};
 use pds_sidecar_client::MockSidecar;
 use pds_vfs_linux::PdsFs;
 
@@ -124,6 +125,7 @@ async fn fuse_mount_serves_placeholders_and_hydrates() {
             retry_base: pds_core::RETRY_BASE_DEFAULT,
             placeholders: true,
             eviction_cap: None,
+            ..Default::default()
         },
     )
     .unwrap();
@@ -326,4 +328,98 @@ async fn fuse_mount_serves_placeholders_and_hydrates() {
     handle.shutdown().await.ok();
     drop(session);
     let _ = engine_task.await;
+}
+
+/// Desktop-app regression (M3.4): the app mounts the placeholder view AT the
+/// sync root, which can still hold real leftover content (a previous mirror
+/// mode, an interrupted layout conversion). The mount must shadow those
+/// leftovers — never merge, upload, or delete them — and they must reappear
+/// untouched once the mount is gone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial_test::serial]
+async fn fuse_mount_over_nonempty_root_shadows_and_preserves_leftovers() {
+    let _watchdog = Watchdog::arm(120);
+
+    if let Some(reason) = fuse_unavailable_reason() {
+        println!(
+            "skipping fuse_mount_over_nonempty_root_shadows_and_preserves_leftovers: {reason}"
+        );
+        return;
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    // The mountpoint IS the sync root and it is NOT empty.
+    let root = dir.path().join("sync");
+    std::fs::create_dir_all(root.join("old stuff")).unwrap();
+    std::fs::write(root.join("leftover.txt"), b"local leftover").unwrap();
+    std::fs::write(root.join("old stuff").join("junk.bin"), b"junk").unwrap();
+
+    // A small remote tree, served engine-less (shadowing needs no engine).
+    let store = pds_core::Store::new();
+    let node = |rel: &str, is_dir: bool, size: u64| {
+        (
+            rel.to_string(),
+            VNode {
+                rel: rel.to_string(),
+                parent: String::new(),
+                name: rel.to_string(),
+                is_dir,
+                size,
+                mtime: 1_700_000_000,
+                content_ready: false,
+            },
+        )
+    };
+    store.publish_snapshot(HashMap::from([
+        node("hello.txt", false, 11),
+        node("Documents", true, 0),
+    ]));
+
+    let proxy = dir.path().join("proxy");
+    std::fs::create_dir_all(&proxy).unwrap();
+    let fs = PdsFs::new(store, proxy, dir.path().join("backing"));
+    let mut cfg = Config::default();
+    cfg.mount_options = vec![
+        MountOption::FSName("pds-e2e-nonempty".into()),
+        MountOption::Subtype("pds".into()),
+    ];
+    let root_for_thread = root.clone();
+    let session = tokio::task::spawn_blocking(move || {
+        fuser::spawn_mount(fs, &root_for_thread, &cfg).expect("FUSE mount over non-empty root")
+    })
+    .await
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // Through the mount: the remote tree is visible (plus the `.pds` proxy)…
+    let names: Vec<String> = std::fs::read_dir(&root)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    assert!(names.iter().any(|n| n == "hello.txt"), "{names:?}");
+    assert!(names.iter().any(|n| n == "Documents"), "{names:?}");
+    // …and the leftover real content is shadowed, not merged.
+    assert!(!names.iter().any(|n| n == "leftover.txt"), "{names:?}");
+    assert!(!names.iter().any(|n| n == "old stuff"), "{names:?}");
+    // Even a direct stat goes through the mount and misses.
+    assert!(std::fs::metadata(root.join("leftover.txt")).is_err());
+
+    drop(session);
+    // The unmount is async; wait for the real folder to reappear.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while std::fs::metadata(root.join("leftover.txt")).is_err() {
+        assert!(Instant::now() < deadline, "mount did not unmount");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    // Every leftover byte survived, untouched by the mount.
+    assert_eq!(
+        std::fs::read(root.join("leftover.txt")).unwrap(),
+        b"local leftover"
+    );
+    assert_eq!(
+        std::fs::read(root.join("old stuff").join("junk.bin")).unwrap(),
+        b"junk"
+    );
 }
