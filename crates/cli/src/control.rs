@@ -244,8 +244,13 @@ async fn serve_conn(stream: UnixStream, handle: EngineHandle) -> Result<()> {
             "resume" => handle.resume().await.map(|_| "ok: resumed".to_string()),
             "status" => handle.status().await.map(|s| {
                 format!(
-                    "{} (synced={}, dirty={}, tombstones={}, errored={})",
-                    s.state, s.synced_nodes, s.dirty_nodes, s.queued_tombstones, s.errored_nodes
+                    "{} mode={} (synced={}, dirty={}, tombstones={}, errored={})",
+                    s.state,
+                    s.mode.as_meta_value(),
+                    s.synced_nodes,
+                    s.dirty_nodes,
+                    s.queued_tombstones,
+                    s.errored_nodes
                 )
             }),
             other => Ok(format!("error: unknown command `{other}`")),

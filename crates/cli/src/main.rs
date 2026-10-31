@@ -197,8 +197,13 @@ async fn sync(folder: PathBuf, sidecar_cmd: Option<&str>) -> Result<()> {
             db_path: root.join(STATE_DIR).join("state.db"),
             root: root.clone(),
             retry_base: pds_core::RETRY_BASE_DEFAULT,
-            placeholders: false,
-            eviction_cap: None,
+            // Headless `sync` stays materialized by default; honor
+            // $PDS_SYNC_MODE / the persisted setting as overrides.
+            placeholders: pds_core::SyncMode::from_env()
+                .unwrap_or(pds_core::SyncMode::Mirror)
+                == pds_core::SyncMode::Placeholders,
+            eviction_cap: Some(pds_core::EVICTION_CAP_DEFAULT),
+            ..Default::default()
         },
     )?;
 
@@ -255,8 +260,13 @@ async fn mount(folder: PathBuf, mountpoint: PathBuf, sidecar_cmd: Option<&str>) 
             db_path: root.join(STATE_DIR).join("state.db"),
             root: root.clone(),
             retry_base: pds_core::RETRY_BASE_DEFAULT,
-            placeholders: true,
+            // The mount always serves placeholders (its whole purpose);
+            // honor an explicit $PDS_SYNC_MODE=mirror for testing.
+            placeholders: pds_core::SyncMode::from_env()
+                .unwrap_or(pds_core::SyncMode::Placeholders)
+                == pds_core::SyncMode::Placeholders,
             eviction_cap: Some(pds_core::EVICTION_CAP_DEFAULT),
+            ..Default::default()
         },
     )?;
     let store = handle
