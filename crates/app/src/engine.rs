@@ -293,10 +293,16 @@ async fn engine_session(
     exit
 }
 
-/// Cheap FUSE liveness probe: mount a throwaway placeholder filesystem at
-/// a temp dir, then unmount. Deciding mountability up front (rather than
-/// after the engine owns the notification stream) keeps the mirror
-/// fallback able to receive remote events.
+/// FUSE liveness probe: mount a throwaway placeholder filesystem at a temp
+/// dir, prove the session actually ANSWERS a request, then unmount. Deciding
+/// mountability up front (rather than after the engine owns the notification
+/// stream) keeps the mirror fallback able to receive remote events.
+///
+/// The request round-trip matters: `Session::new` only mounts and handshakes.
+/// A session nobody serves leaves a live mountpoint where every access blocks
+/// in the kernel until the mount is lazily unmounted — a wedged terminal and
+/// file manager. Serving happens on a background thread (`spawn`), and the
+/// probe asks that thread for the root's attributes with a deadline.
 fn fuse_available() -> bool {
     use std::sync::atomic::{AtomicU64, Ordering};
     static SEQ: AtomicU64 = AtomicU64::new(0);
@@ -319,15 +325,30 @@ fn fuse_available() -> bool {
     cfg.mount_options = vec![fuser::MountOption::FSName("pds-probe".into())];
     let ok = match fuser::Session::new(fs, &mnt, &cfg) {
         Ok(session) => {
-            drop(session);
-            let target = mnt.to_string_lossy().into_owned();
-            let _ = std::process::Command::new("fusermount3")
-                .args(["-uz", &target])
-                .status();
-            let _ = std::process::Command::new("fusermount")
-                .args(["-uz", &target])
-                .status();
-            true
+            match session.spawn() {
+                Ok(bg) => {
+                    // Ask the SERVED mount for the root's attributes. The
+                    // thread doing it can end up unkillable if the session
+                    // never answers, so the deadline lives here and the
+                    // lazy unmount below releases it.
+                    let (tx, rx) = std::sync::mpsc::channel();
+                    let target = mnt.clone();
+                    std::thread::spawn(move || {
+                        let _ = tx.send(std::fs::metadata(&target).is_ok());
+                    });
+                    let served = rx.recv_timeout(Duration::from_secs(5)).unwrap_or(false);
+                    drop(bg);
+                    let target = mnt.to_string_lossy().into_owned();
+                    let _ = std::process::Command::new("fusermount3")
+                        .args(["-uz", &target])
+                        .status();
+                    let _ = std::process::Command::new("fusermount")
+                        .args(["-uz", &target])
+                        .status();
+                    served
+                }
+                Err(_) => false,
+            }
         }
         Err(_) => false,
     };
@@ -335,11 +356,20 @@ fn fuse_available() -> bool {
     ok
 }
 
-/// Mount the FUSE placeholder view at the sync root.
+/// Mount the FUSE placeholder view at the sync root and SERVE it.
+///
+/// `Session::new` only mounts; the kernel's requests are answered by the
+/// session loop. Returning a live-but-unserved session is the M3.4 freeze:
+/// the mountpoint exists, every `stat`/`readdir`/`read` blocks in the kernel
+/// until the mount is lazily unmounted, and dropping the session is the only
+/// in-process release. So
+/// the session is spawned here — the background thread is the daemon — and
+/// the returned handle must be kept alive for as long as the mount should
+/// exist (dropping it unmounts).
 fn mount_placeholder_view(
     layout: &RootLayout,
     handle: &EngineHandle,
-) -> Result<fuser::Session<pds_vfs_linux::PdsFs>> {
+) -> Result<fuser::BackgroundSession> {
     let store = handle
         .store()
         .cloned()
@@ -358,7 +388,39 @@ fn mount_placeholder_view(
         fuser::MountOption::FSName("proton-drive-sync".into()),
         fuser::MountOption::Subtype("pds".into()),
     ];
-    Ok(fuser::Session::new(fs, &layout.root, &cfg)?)
+    let session = fuser::Session::new(fs, &layout.root, &cfg)?;
+    let served = session.spawn()?;
+    // Belt and braces: prove the daemon answers before the mount is used.
+    // A mounted-but-dead session must surface as an error the caller can
+    // report, never as a desktop where every access to the root hangs.
+    let (tx, rx) = std::sync::mpsc::channel();
+    let target = layout.root.clone();
+    std::thread::spawn(move || {
+        let _ = tx.send(std::fs::metadata(&target).is_ok());
+    });
+    if !rx.recv_timeout(Duration::from_secs(5)).unwrap_or(false) {
+        anyhow::bail!(
+            "the placeholder view mounted at {} but does not answer requests",
+            layout.root.display()
+        );
+    }
+    info!(mount = %layout.root.display(), "placeholder view mounted and serving");
+    Ok(served)
+}
+
+#[cfg(test)]
+mod tests {
+    /// The probe must round-trip a REQUEST through a served session. This is
+    /// the M3.4 freeze as a test: mounting without serving made the old
+    /// probe pass (the mount exists) while every access to the real
+    /// mountpoint blocked in the kernel forever.
+    #[test]
+    fn fuse_probe_serves_requests() {
+        assert!(
+            super::fuse_available(),
+            "FUSE probe mounted but never answered a stat"
+        );
+    }
 }
 
 /// Sync-root layout: where the engine state and (in placeholder mode) the
