@@ -4042,7 +4042,7 @@ dependencies = [
 
 [[package]]
 name = "pds-app"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -4059,7 +4059,7 @@ dependencies = [
 
 [[package]]
 name = "pds-cli"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -4076,7 +4076,7 @@ dependencies = [
 
 [[package]]
 name = "pds-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -4097,7 +4097,7 @@ dependencies = [
 
 [[package]]
 name = "pds-sidecar-client"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4112,7 +4112,7 @@ dependencies = [
 
 [[package]]
 name = "pds-vfs-linux"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "fuser",
  "libc",

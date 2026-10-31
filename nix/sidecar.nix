@@ -11,7 +11,7 @@
 # node_modules; the app spawns it with `npx tsx src/index.ts`.
 buildNpmPackage {
   pname = "proton-drive-sync-sidecar";
-  version = "0.1.0";
+  version = "0.2.0";
 
   src = "${self}/sidecar";
 

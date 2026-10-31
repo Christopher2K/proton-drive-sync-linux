@@ -5,6 +5,32 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## v0.2.0 - 2026-10-31
+
+
+### Added
+
+- Sync mode setting, external backing cache, and safe mirror<=>placeholders layout conversion (M3.4)
+- Placeholder mode by default — mount the FUSE view at the sync root (M3.4)
+- Mode-aware sync/mount defaults and mode= in status
+- Configurable cache cap — parse/resolve/persist helpers and live SetEvictionCap command (M3.5)
+- Settings cache-cap chips with live engine update (M3.5)
+- Pds mount --cache-cap and env/persisted resolution (M3.5)
+
+### Documentation
+
+- M3.4 — placeholder-by-default desktop app, sync mode setting
+- M3.5 — configurable backing-cache cap
+
+### Fixed
+
+- Stop release.sh from truncating the changelog history
+
+### Testing
+
+- FUSE e2e for mounting over a non-empty sync root
+- Live set_cache_cap applies immediately with on-the-spot eviction (M3.5)
+
 ## v0.1.0 - 2026-10-30
 
 
