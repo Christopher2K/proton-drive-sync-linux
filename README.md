@@ -4,7 +4,7 @@
 > Proton. Built for my own personal use case; I am not responsible for any data
 > loss. See [Read this first](#read-this-first-important).
 
-A **Linux** desktop app that syncs a folder with [Proton Drive](https://proton.me/drive) — files you drop into `~/ProtonDrive` upload automatically, remote changes appear locally, and deletions are conservative (remote deletes go to Trash, with a mass-delete guard).
+A **Linux** desktop app that syncs a folder with [Proton Drive](https://proton.me/drive) — the app defaults to **on-demand placeholders**: your whole Drive appears in `~/ProtonDrive` at ~0 bytes, files hydrate when opened, and a capped local cache keeps SSD usage near zero. Prefer everything offline? A Settings toggle switches the same folder to full **mirror** mode. Deletions stay conservative either way (remote deletes go to Trash, with a mass-delete guard).
 
 - **Product spec:** [SPEC.md](SPEC.md) — source of truth
 - **Agent notes:** [AGENT.md](AGENT.md)
@@ -30,16 +30,23 @@ Stack: Rust + GPUI (native Linux desktop UI) · Node.js sidecar running the offi
 If any of that is a dealbreaker, please use the official Proton Drive apps
 instead.
 
-## Features (M1/M2, materialized folder)
+## Features (M1–M4)
 
 - Browser-based Proton sign-in (session-fork; no password handling in the app)
+- **On-demand placeholders by default (F5):** the sync root is a FUSE view of
+  your Drive — every file visible at ~0 bytes, hydrating on open, with an
+  LRU-capped local cache (default 10 GiB). Nothing downloads until you use it.
+- **Settings → Sync mode:** switch the same folder between *On demand* and
+  *Mirror everything* at any time. Switching moves existing content (no
+  re-download) and never deletes from Drive.
 - Two-way sync of one local root (`~/ProtonDrive` by default) with your Drive
-- Upload on new/changed files, download on remote create/update, trash-on-delete
+- Upload on new/changed files; trash-on-delete
 - Mass-deletion guard: bulk deletes pause sync until you confirm
 - Pause / resume; conflict handling keeps both versions (`name (conflict …).ext`)
 - Native GPUI window: Overview, Activity, Conflicts, and Settings pages
 
-On-demand placeholder files (open a file → it hydrates) are planned for M3 via FUSE; today the sync root is a fully materialized folder.
+In **mirror** mode the sync root is a fully materialized folder instead (the
+pre-placeholder behavior, still available for `pds sync` via `PDS_SYNC_MODE`).
 
 ## Development environment (devenv)
 
@@ -79,6 +86,7 @@ Environment knobs:
 | Var | Meaning |
 |---|---|
 | `PDS_SYNC_ROOT` | Sync folder (default: `~/ProtonDrive`) |
+| `PDS_SYNC_MODE` | `placeholders` (on demand) or `mirror` (materialize everything); session-only override of the persisted Settings choice (never rewrites it) |
 | `PDS_SIDECAR_CMD` | Sidecar command override, e.g. `node sidecar/dist/index.js` |
 | `PDS_SIDECAR_DIR` | Sidecar directory override for auto-discovery |
 | `RUST_LOG` | Log filter (default `info,pds_core=debug`), logs go to stderr |

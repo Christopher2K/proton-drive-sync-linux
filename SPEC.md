@@ -2,7 +2,7 @@
 
 ## 1. Product summary
 
-A **Linux** desktop app that syncs a Proton Drive account into a local folder. Built in **Rust with a GPUI user interface**, driving the **official Proton Drive TypeScript SDK** running in an embedded Node.js sidecar. (macOS and Windows were dropped in v0.2; sync is currently a **materialized folder** — on-demand placeholders are the M3 goal, see §7.)
+A **Linux** desktop app that syncs a Proton Drive account into a local folder. Built in **Rust with a GPUI user interface**, driving the **official Proton Drive TypeScript SDK** running in an embedded Node.js sidecar. (macOS and Windows were dropped in v0.2; the desktop app defaults to **on-demand placeholders** — the sync root is a FUSE view that hydrates on open — with a full materialized mirror available in Settings, see F5.)
 
 ## 2. Goals / non-goals
 
@@ -27,7 +27,7 @@ Three components:
 |---|---|---|
 | **Host app (UI + orchestrator)** | Rust + GPUI (native Linux desktop window) | Single main window, owns state DB, sync engine, upload/download queues |
 | **SDK sidecar** | Node.js + `ProtonDriveApps/sdk` (client module) | All Drive traffic: auth session, listing, up/download, trash, event stream |
-| **VFS (M3, planned)** | Rust FUSE daemon (`fuser` crate) | Mount point presenting the remote tree; reads hydrate, writes queue uploads |
+| **VFS (M3 ✅)** | Rust FUSE daemon (`fuser` crate) | Placeholder view of the remote tree — mounted at the sync root by the desktop app, or at a separate mountpoint by `pds mount`; reads hydrate, writes queue uploads |
 
 - **IPC:** JSON-RPC over stdio between host ↔ Node sidecar.
 - **State:** SQLite in the host — node map (local path ↔ Drive node UID), pins, tombstones, transfer queue, eviction metadata, event cursor (resume token).
@@ -56,9 +56,11 @@ Filesystem watcher reports create/close-write → hash → upload via sidecar (S
 
 Pause: freezes upload + download queues mid-transfer (block-level resume), stops event application (cursor kept), watcher keeps buffering changes. Resume: drains tombstones (with guard), then uploads, then applies pending remote events.
 
-### F5 — On-demand placeholders (SSD bloat control; M3)
+### F5 — On-demand placeholders (SSD bloat control; M3, desktop default)
 
 - All remote items visible in the sync root at ~0 bytes locally.
+- **Desktop app (M3.4 ✅ 2026-10-30):** placeholder mode is the **default for new sync roots**. The app mounts the FUSE view **at the sync root itself** (`~/ProtonDrive` *is* the placeholder view), so users find files where they expect them. The engine's state (SQLite DB, backing cache) lives under `$XDG_DATA_HOME/proton-drive-sync/roots/<hash>/`, outside the root — a directory cannot serve both its real contents and a mount over it, and running the DB through the mount would risk corruption. The mount goes up only after the engine's initial sync (the first-run local scan must see the real folder). If FUSE is unavailable the app falls back to a materialized session and says so in Settings. A **Settings → Sync mode** toggle switches between *On demand* and *Mirror* (confirm dialog; the engine restarts into the new mode). Mode is persisted per root in the DB's `meta` table (`sync_mode`); `$PDS_SYNC_MODE` overrides for one session; roots with a legacy (pre-0.3) in-root state DB default to mirror so upgrades change nothing for existing users.
+- **Conversion:** switching modes moves existing content instead of re-transferring — mirror→placeholders moves every tracked file into the backing cache (hydrated, no download; untracked leftovers become dirty pending-uploads so nothing is stranded under the mount), placeholders→mirror moves hydrated files back into the root (never evicted content re-downloads via the normal materialization pass). Idempotent, crash-restartable, never deletes.
 - **Hydration:** on file open (FUSE read), content is fetched on demand.
 - **Write-through (M3.2 ✅ 2026-10-29):** files created through the mount upload on close (`release`/`fsync`); `mkdir`/`unlink`/`rmdir` mirror remotely (trash path). Backing content lives in `.pds-vfs-backing/`; uploads reuse the standard engine machinery (F7 collision check, retries, pause buffering). The mount itself is RW.
 - **Revision writes (M3.3 ✅ 2026-10-29):** snapshot-backed files open RW through the mount; the open waits (bounded) for hydration, edits land on the backing file, and `release`/`fsync` upload the revision against the existing `node_uid` (F7 `check_remote_head` guards stale heads). `O_TRUNC` (e.g. `fs::write`) works: fuser does not negotiate `ATOMIC_O_TRUNC`, so truncation arrives as `setattr(size, fh)` and defers to the open handle's `release` — one upload per write sequence, no empty intermediate. `truncate(2)` outside a handle queues the upload directly.
@@ -83,14 +85,14 @@ Keep-both: the losing version is renamed `name (conflict YYYY-MM-DD HHmm).ext`; 
 
 ## 6. UI outline (GPUI, Linux)
 
-One main window: sidebar navigation (**Overview / Activity / Conflicts / Settings**) · account + engine-state badge · big pause/resume toggle · activity/event log · conflicts + failed-uploads inbox (from the state DB) · settings for the sync root. Browser-based sign-in with the mandated disclosure; sign-out confirmation modal. Keyboard-first: actions bound in `crates/app/src/actions.rs`.
+One main window: sidebar navigation (**Overview / Activity / Conflicts / Settings**) · account + engine-state badge · big pause/resume toggle · activity/event log · conflicts + failed-uploads inbox (from the state DB) · settings for the sync root and the **sync mode** (on-demand placeholders ⇄ mirror, with a confirm dialog and one-time layout notices). Browser-based sign-in with the mandated disclosure; sign-out confirmation modal. Keyboard-first: actions bound in `crates/app/src/actions.rs`.
 
 ## 7. Milestones
 
 - **M0 — Spike:** headless Node script proving auth + list/upload/download/trash + event stream via the SDK. *Go/no-go gate.* ✅ 2026-10-23.
 - **M1 — Headless sync engine (CLI):** local folder ↔ Drive, F2/F3/F4/F7 with real files (no VFS yet), SQLite state. ✅ 2026-10-24 (live E2E).
 - **M2 — GPUI desktop shell (Linux):** single-window app; login, overview, activity, conflicts, settings, sign-out. ✅ 2026-10-29 (rewritten from the v0.1 tray shell when the project went Linux-only).
-- **M3 — Linux VFS:** FUSE mount, placeholders, hydration (M3.1 ✅ 2026-10-29), write-through + pins + LRU eviction (M3.2 ✅ 2026-10-29, E2E-proven in the VM), revision writes (M3.3 ✅ 2026-10-29).
+- **M3 — Linux VFS:** FUSE mount, placeholders, hydration (M3.1 ✅ 2026-10-29), write-through + pins + LRU eviction (M3.2 ✅ 2026-10-29, E2E-proven in the VM), revision writes (M3.3 ✅ 2026-10-29), desktop integration: placeholder mode as the app default, mount at the sync root, external engine state, mode setting + safe conversion (M3.4 ✅ 2026-10-30).
 - **M4 — Hardening:** conflict soak tests, backoff/rate-limit validation, SDK upgrade rehearsal (M4 ✅ 2026-10-30 — see `docs/sdk-upgrade-rehearsal.md`; soak found + fixed the F7 remote-delete race, crash-interrupted transfers now recover on startup).
 
 ## 8. Key risks
@@ -102,6 +104,6 @@ One main window: sidebar navigation (**Overview / Activity / Conflicts / Setting
 
 ## 9. Open questions
 
-- FUSE mountpoint UX: M3.1 ships the **parallel mount** (`pds mount <folder> <mountpoint>`); whether to also bind-mount into the real root is deferred until desktop-app UX decides where users look for files.
+- ~~FUSE mountpoint UX: M3.1 ships the **parallel mount** (`pds mount <folder> <mountpoint>`); whether to also bind-mount into the real root is deferred until desktop-app UX decides where users look for files.~~ **Resolved (M3.4):** the desktop app mounts the placeholder view **at the sync root** and keeps all engine state (SQLite, backing cache) in `$XDG_DATA_HOME/proton-drive-sync/roots/<hash>/` outside it; the parallel `pds mount` remains for CLI use.
 - ~~FUSE write-through (M3.2): direct vs through-the-watcher~~ **Resolved (M3.2):** neither — the VFS queues writes in the engine↔VFS `Store` (`record_write`/`record_mkdir`/`record_delete`) and the engine's main loop drains them through the same upload/delete machinery the watcher uses (F7 precondition, retries, pause buffering). No watcher noise from the backing dir; no duplicate dedup logic in the FUSE layer.
 - Exact mass-deletion guard thresholds after real-world usage data.
