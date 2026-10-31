@@ -146,9 +146,12 @@ proton-drive-sync/
 - Releases: single workspace version (`[workspace.package]` in `Cargo.toml`;
   crates inherit). Cut releases only via `scripts/release.sh <major|minor|patch>`
   — it syncs the sidecar `package.json`/`APP_VERSION` (Proton compliance
-  string) and the Nix derivations, regenerates `CHANGELOG.md` (git-cliff),
-  and tags. `scripts/check-versions.sh` runs in CI to catch drift. Pushing a
-  `v*` tag triggers `.github/workflows/release.yml` (tarball + deb + rpm).
-  `actionlint` + `shellcheck` are in the devenv — run them after touching
-  workflows or release scripts.
+  string) and the Nix derivations, regenerates `CHANGELOG.md` (git-cliff), and
+  opens a `release/vX.Y.Z` PR. `main` is protected: merge it by PR, never push
+  the bump directly. After the merge, `.github/workflows/tag-release.yml` tags
+  `vX.Y.Z` and dispatches `.github/workflows/release.yml` (tarball + deb + rpm);
+  tags pushed by CI do not fire `push: tags`, hence the explicit dispatch.
+  `scripts/check-versions.sh` runs in CI to catch drift. `actionlint` +
+  `shellcheck` are in the devenv — run them after touching workflows or
+  release scripts.
 - When a milestone is completed, check it off above and note any spec deviations in `SPEC.md` §9.

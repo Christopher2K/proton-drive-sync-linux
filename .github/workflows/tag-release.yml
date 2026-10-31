@@ -1,0 +1,70 @@
+name: Tag Release
+
+# Runs after every push to main. When the workspace version has no matching
+# `v*` tag yet — i.e. a release PR (scripts/release.sh) just merged — it tags
+# that commit and dispatches the release build.
+#
+# The dispatch is explicit because tags pushed with GITHUB_TOKEN do not fire
+# `on: push: tags` workflows (GitHub suppresses events caused by the token).
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: write
+
+concurrency:
+  group: tag-release
+  cancel-in-progress: false
+
+jobs:
+  tag:
+    name: tag and dispatch
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          # Tags are needed to tell an already-released version from a new one.
+          fetch-depth: 0
+
+      - name: Read the workspace version
+        id: version
+        run: |
+          version="$(sed -n '/^\[workspace\.package\]/,/^\[/ s/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n1)"
+          [ -n "$version" ] || {
+            echo "::error::could not read the workspace version from Cargo.toml"
+            exit 1
+          }
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Tag the release commit
+        id: tag
+        env:
+          version: ${{ steps.version.outputs.version }}
+        run: |
+          if git rev-parse -q --verify "refs/tags/v$version"; then
+            echo "::notice::v$version is already tagged — nothing to release"
+            echo "created=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "v$version" -m "v$version"
+          git push origin "v$version"
+
+          echo "::notice::tagged $GITHUB_SHA as v$version"
+          echo "created=true" >> "$GITHUB_OUTPUT"
+
+      # `--ref main` + `-f tag=`: release.yml checks out the tag itself, and
+      # avoids racing the just-pushed tag ref when resolving the dispatch.
+      - name: Dispatch the release build
+        if: steps.tag.outputs.created == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          version: ${{ steps.version.outputs.version }}
+        run: gh workflow run release.yml --ref main -f tag="v$version"

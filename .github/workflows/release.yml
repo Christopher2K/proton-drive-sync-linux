@@ -1,6 +1,7 @@
 name: Release
 
-# Triggered by pushing a v* tag (scripts/release.sh creates it). Builds the
+# Triggered by pushing a v* tag — created by .github/workflows/tag-release.yml
+# once a release PR (scripts/release.sh) merges, or by hand. Builds the
 # release binaries on ubuntu-22.04 (glibc 2.35 floor: Ubuntu 22.04+, Debian
 # 12+, Fedora 36+), vendors the sidecar, and publishes tarball, .deb, .rpm
 # and checksums to a GitHub Release. An existing tag can be rebuilt via
