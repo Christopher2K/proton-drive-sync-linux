@@ -18,6 +18,7 @@ devenv.local.yaml
 # Packaging output
 /dist/
 /staging/
+/result
 
 # Secrets / local state
 .env
