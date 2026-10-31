@@ -131,6 +131,7 @@ proton-drive-sync/
 │   ├── cli/           # `pds` — headless engine + status/pause/resume/mount
 │   ├── core/          # Sync engine, state DB, queues, trash guards, VFS store
 │   ├── vfs-linux/     # FUSE placeholder filesystem (fuser; M3)
+│   ├── xdg/           # XDG base-dir resolution shared by every crate
 │   └── sidecar-client/ # Sidecar spawn + JSON-RPC protocol (+ MockSidecar for tests)
 ├── sidecar/           # Node.js + official Proton Drive SDK
 └── packaging/linux/   # .desktop entry, icon, install script

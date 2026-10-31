@@ -52,18 +52,12 @@ impl Drop for ServerGuard {
 }
 
 fn socket_path() -> PathBuf {
-    if let Some(runtime) = std::env::var_os("XDG_RUNTIME_DIR") {
-        return PathBuf::from(runtime).join("proton-drive-sync.sock");
+    // A runtime dir is preferred (per-user, 0700, cleared at logout); the
+    // data dir is a per-user fallback for sessions that do not provide one.
+    match pds_xdg::runtime_dir() {
+        Some(runtime) => runtime.join("proton-drive-sync.sock"),
+        None => pds_xdg::app_data_dir().join("instance.sock"),
     }
-    let data = std::env::var_os("XDG_DATA_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            let home = std::env::var_os("HOME")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from("."));
-            home.join(".local/share")
-        });
-    data.join("proton-drive-sync/instance.sock")
 }
 
 /// Check for a running instance; become the primary if there is none.

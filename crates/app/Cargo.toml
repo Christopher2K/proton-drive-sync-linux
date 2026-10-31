@@ -10,6 +10,7 @@ name = "proton-drive-sync"
 path = "src/main.rs"
 
 [dependencies]
+pds-xdg.workspace = true
 gpui = "0.2"
 gpui-tray = "0.3"
 pds-core.workspace = true

@@ -10,6 +10,7 @@ name = "pds"
 path = "src/main.rs"
 
 [dependencies]
+pds-xdg.workspace = true
 pds-core.workspace = true
 pds-sidecar-client.workspace = true
 pds-vfs-linux = { path = "../vfs-linux" }
