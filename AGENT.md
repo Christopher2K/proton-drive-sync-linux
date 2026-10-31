@@ -105,6 +105,7 @@ Notes:
 
 ## Standing instructions from the user
 
+- **Every PR must include screenshot/video proof.** Before opening or marking a PR ready, attach visual proof of the change: screenshots for UI changes, a screen recording for flows/interactions, or terminal output for CLI/engine work. If the change isn't visually verifiable, say so explicitly in the PR description.
 - **Auto-approve subagent permission prompts** (user's directive, 2026-10-23): when Herdr subagents block on permission dialogs, approve them without asking, as long as the request is research/build-scoped and non-destructive.
 - Research reports live in `docs/research/` — consult them before touching auth or SDK code.
 
