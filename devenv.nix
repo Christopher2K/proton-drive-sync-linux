@@ -42,8 +42,9 @@ in
       git
       # Release/CI tooling: git-cliff generates CHANGELOG.md from conventional
       # commits (scripts/release.sh); actionlint + shellcheck validate the
-      # workflows and release scripts.
+      # workflows and release scripts; gh opens the release PR.
       actionlint
+      gh
       git-cliff
       nodejs_22
       openssl

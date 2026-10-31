@@ -134,18 +134,21 @@ pre-1.0: breaking changes bump the minor). One version is shared by the app,
 CLI, sidecar, and Nix packages — `scripts/check-versions.sh` enforces this in
 CI.
 
-To cut a release (inside the devenv shell, so `git-cliff` and `cargo` are
+To cut a release (inside the devenv shell, so `git-cliff`, `cargo` and `gh` are
 available):
 
 ```sh
 scripts/release.sh minor        # or: patch | major
-git push origin main vX.Y.Z     # review the diff first
 ```
 
 The script bumps every version site, regenerates `CHANGELOG.md` from
-conventional commits, and tags `vX.Y.Z`. Pushing the tag triggers the release
-workflow, which builds on Ubuntu 22.04 (binaries run on glibc ≥ 2.35) for
-amd64 and arm64 and publishes to [GitHub Releases](https://github.com/Christopher2K/proton-drive-sync-linux/releases):
+conventional commits, and opens a `release/vX.Y.Z` PR titled
+`chore(release: vX.Y.Z)` (review and squash-merge it like any other change —
+`main` is protected). Once the PR merges, the Tag Release workflow
+(`.github/workflows/tag-release.yml`) sees the new workspace version, tags
+`vX.Y.Z`, and dispatches the release workflow, which builds on Ubuntu 22.04
+(binaries run on glibc ≥ 2.35) for amd64 and arm64 and publishes to
+[GitHub Releases](https://github.com/Christopher2K/proton-drive-sync-linux/releases):
 
 - `proton-drive-sync-<version>-<arch>.tar.xz` — binaries + vendored sidecar +
   `install.sh`; untar and run `sudo install.sh` (or `PREFIX=$HOME/.local …`)

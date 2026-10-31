@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Cut a release: bump the version everywhere, generate the changelog, tag.
+# Cut a release: bump the version everywhere, generate the changelog, open a
+# release PR. Tagging happens after the PR merges (see tag-release.yml).
 #
 # Usage:
 #   scripts/release.sh <major|minor|patch>   (from the repository root)
@@ -9,11 +10,16 @@
 #   2. Computes the next version and rewrites every version site
 #      (workspace Cargo.toml, sidecar package.json + APP_VERSION, Nix).
 #   3. Regenerates CHANGELOG.md with git-cliff from conventional commits.
-#   4. Commits `chore(release: vX.Y.Z)` and tags `vX.Y.Z`; you push:
-#      `git push origin main vX.Y.Z`. The tag push triggers the release
-#      workflow (.github/workflows/release.yml).
+#   4. Commits `chore(release: vX.Y.Z)` on `release/vX.Y.Z`, pushes the branch
+#      and opens the PR (squash-merge it like any other change).
+#   5. After the merge, .github/workflows/tag-release.yml sees the new
+#      workspace version on main, tags `vX.Y.Z` and dispatches the release
+#      build (.github/workflows/release.yml: tarball, .deb, .rpm, GitHub
+#      Release).
 #
-# Requires: git, git-cliff + cargo (both in devenv).
+# Requires: git, cargo, git-cliff, gh (all in devenv; gh must be authenticated
+# — `gh auth status`). Without gh the branch is still pushed and the script
+# prints the URL for opening the PR by hand.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -48,7 +54,11 @@ esac
 git rev-parse -q --verify "refs/tags/v$next" >/dev/null \
   && { echo "release: tag v$next already exists" >&2; exit 1; }
 
-echo "release: $version -> $next"
+release_branch="release/v$next"
+git ls-remote --exit-code --heads origin "$release_branch" >/dev/null 2>&1 \
+  && { echo "release: branch $release_branch already exists on origin — delete it first" >&2; exit 1; }
+
+echo "release: $version -> $next ($release_branch)"
 
 # --- rewrite every version site ----------------------------------------------
 # sed -i is not portable across BSD/GNU; edit via a temp copy instead.
@@ -88,19 +98,56 @@ if [ -n "$previous_heading" ] \
   exit 1
 fi
 
-# --- commit + tag -------------------------------------------------------------
+# --- commit on a release branch ----------------------------------------------
+git switch -c "$release_branch"
 git add Cargo.toml Cargo.lock sidecar/package.json sidecar/src/config.ts \
   nix/package.nix nix/sidecar.nix CHANGELOG.md
 git commit -m "chore(release: v$next): bump version and changelog" --quiet
-git tag -a "v$next" -m "v$next"
+
+# --- push + open the PR -------------------------------------------------------
+git push -u origin "$release_branch" --quiet
+
+# The PR body is the changelog section git-cliff just wrote.
+release_notes="$(awk -v head="## v$next " '
+  index($0, head) == 1 { inside = 1; next }
+  inside && /^## v/ { exit }
+  inside { print }
+' CHANGELOG.md)"
+# Drop the section's leading blank lines so the PR body starts cleanly.
+release_notes="$(printf '%s\n' "$release_notes" | sed -e '/./,$!d')"
+
+pr_body="Release v$next.
+
+${release_notes}
+
+Merging this PR bumps the workspace version on \`main\`; the Tag Release
+workflow then tags \`v$next\` and dispatches the release build."
+
+if command -v gh >/dev/null 2>&1 && gh auth status >/dev/null 2>&1; then
+  pr_url="$(gh pr create --base main --head "$release_branch" \
+    --title "chore(release: v$next)" --body "$pr_body")"
+  echo
+  echo "release: PR opened — $pr_url"
+  echo "Squash-merge it. Tagging + the release build run automatically afterwards."
+else
+  repo_url="$(git remote get-url origin | sed -e 's|^git@[^:]*:|https://github.com/|' -e 's|\.git$||')"
+  echo
+  echo "release: branch pushed, but gh is unavailable or not authenticated."
+  echo "Open the PR yourself (base: main):"
+  echo
+  echo "    ${repo_url}/compare/main...${release_branch}?expand=1"
+  echo
+  echo "PR title: chore(release: v$next)"
+fi
 
 cat <<EOF
 
-release: done. Review the diff, then push:
+release: waiting on you to merge the PR. After it merges, tag-release.yml
+tags v$next and dispatches release.yml, which publishes the tarball, .deb,
+.rpm and the GitHub Release.
 
-    git push origin main v$next
+If you need to back out before merging:
 
-The v$next tag triggers the release workflow
-(.github/workflows/release.yml), which builds and publishes the tarball,
-.deb and .rpm artifacts and creates the GitHub Release.
+    git switch main && git branch -D $release_branch
+    git push origin --delete $release_branch
 EOF
