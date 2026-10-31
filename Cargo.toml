@@ -6,7 +6,7 @@ members = ["crates/*"]
 # Single product version for the whole app (app + CLI + sidecar always ship
 # together). Bump via `scripts/release.sh`, never by hand — the release script
 # keeps the sidecar and Nix versions in sync (scripts/check-versions.sh).
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 license = "MIT"
 
