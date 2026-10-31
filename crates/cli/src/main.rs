@@ -73,6 +73,12 @@ enum Cmd {
         folder: PathBuf,
         /// Mountpoint (created if missing).
         mountpoint: PathBuf,
+        /// Cap the local backing cache — bytes with an optional K/M/G/T
+        /// suffix (`500M`, `10G`, `2g`) or `unlimited` (no eviction).
+        /// Overrides $PDS_CACHE_CAP and the persisted Settings value for
+        /// this invocation only.
+        #[arg(long, value_name = "SIZE")]
+        cache_cap: Option<String>,
     },
     /// Keep a file's content in the mount's local cache (download now,
     /// never evicted). Path is relative to the sync root; folders pin
@@ -113,7 +119,8 @@ async fn main() -> Result<()> {
         Cmd::Mount {
             folder,
             mountpoint,
-        } => mount(folder, mountpoint, cli.sidecar_cmd.as_deref()).await,
+            cache_cap,
+        } => mount(folder, mountpoint, cache_cap, cli.sidecar_cmd.as_deref()).await,
         Cmd::Pin { folder, path } => control::send_pin("pin", &folder, &path).await,
         Cmd::Unpin { folder, path } => control::send_pin("unpin", &folder, &path).await,
     }
@@ -202,7 +209,14 @@ async fn sync(folder: PathBuf, sidecar_cmd: Option<&str>) -> Result<()> {
             placeholders: pds_core::SyncMode::from_env()
                 .unwrap_or(pds_core::SyncMode::Mirror)
                 == pds_core::SyncMode::Placeholders,
-            eviction_cap: Some(pds_core::EVICTION_CAP_DEFAULT),
+            // $PDS_CACHE_CAP (session) > the persisted Settings value >
+            // the default.
+            eviction_cap: pds_core::resolve_cache_cap(
+                None,
+                pds_core::cache_cap_from_env(),
+                pds_core::persisted_cache_cap(&root.join(STATE_DIR).join("state.db")),
+                Some(pds_core::EVICTION_CAP_DEFAULT),
+            ),
             ..Default::default()
         },
     )?;
@@ -233,7 +247,12 @@ async fn sync(folder: PathBuf, sidecar_cmd: Option<&str>) -> Result<()> {
 /// The mount spawns its own engine in placeholder mode against the folder's
 /// state DB — the same sidecar session, so hydrations authenticate as the
 /// logged-in user. Ctrl-C unmounts and exits.
-async fn mount(folder: PathBuf, mountpoint: PathBuf, sidecar_cmd: Option<&str>) -> Result<()> {
+async fn mount(
+    folder: PathBuf,
+    mountpoint: PathBuf,
+    cache_cap: Option<String>,
+    sidecar_cmd: Option<&str>,
+) -> Result<()> {
     let root = folder.canonicalize().with_context(|| {
         format!("sync folder {}", folder.display())
     })?;
@@ -252,12 +271,27 @@ async fn mount(folder: PathBuf, mountpoint: PathBuf, sidecar_cmd: Option<&str>) 
     }
     info!(root = %root.display(), mount = %mountpoint.display(), "mounting placeholder VFS");
 
+    // --cache-cap (this invocation) > $PDS_CACHE_CAP (this session) > the
+    // persisted Settings value > the default. `unlimited` disables
+    // eviction in every surface.
+    let db_path = root.join(STATE_DIR).join("state.db");
+    let flag = cache_cap
+        .map(|raw| pds_core::parse_cache_cap(&raw))
+        .transpose()
+        .map_err(|e| anyhow!("--cache-cap: {e}"))?;
+    let eviction_cap = pds_core::resolve_cache_cap(
+        flag,
+        pds_core::cache_cap_from_env(),
+        pds_core::persisted_cache_cap(&db_path),
+        Some(pds_core::EVICTION_CAP_DEFAULT),
+    );
+
     let notifications = client.take_notifications();
     let (engine, handle) = Engine::new(
         Arc::new(client),
         notifications,
         EngineConfig {
-            db_path: root.join(STATE_DIR).join("state.db"),
+            db_path,
             root: root.clone(),
             retry_base: pds_core::RETRY_BASE_DEFAULT,
             // The mount always serves placeholders (its whole purpose);
@@ -265,7 +299,7 @@ async fn mount(folder: PathBuf, mountpoint: PathBuf, sidecar_cmd: Option<&str>) 
             placeholders: pds_core::SyncMode::from_env()
                 .unwrap_or(pds_core::SyncMode::Placeholders)
                 == pds_core::SyncMode::Placeholders,
-            eviction_cap: Some(pds_core::EVICTION_CAP_DEFAULT),
+            eviction_cap,
             ..Default::default()
         },
     )?;
