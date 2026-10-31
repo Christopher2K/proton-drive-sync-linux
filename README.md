@@ -87,6 +87,7 @@ Environment knobs:
 |---|---|
 | `PDS_SYNC_ROOT` | Sync folder (default: `~/ProtonDrive`) |
 | `PDS_SYNC_MODE` | `placeholders` (on demand) or `mirror` (materialize everything); session-only override of the persisted Settings choice (never rewrites it) |
+| `PDS_CACHE_CAP` | Backing-cache cap: bytes with an optional `K`/`M`/`G`/`T` suffix (`500M`, `10G`) or `unlimited`; session-only override of the persisted Settings choice (never rewrites it). `pds mount --cache-cap <SIZE>` overrides both for one invocation |
 | `PDS_SIDECAR_CMD` | Sidecar command override, e.g. `node sidecar/dist/index.js` |
 | `PDS_SIDECAR_DIR` | Sidecar directory override for auto-discovery |
 | `RUST_LOG` | Log filter (default `info,pds_core=debug`), logs go to stderr |
@@ -160,7 +161,7 @@ sudo proton-drive-sync-*/install.sh
 
 ## CLI companion
 
-`pds sync` runs the engine headless; `pds status|pause|resume` control a running engine; `pds conflicts` lists the conflict inbox. `pds mount <folder> <mountpoint>` serves a **placeholder view** of a sync root (requires `/dev/fuse`): files hydrate from Drive on first open, files/folders you create through the mount upload to Drive on close, and edits to existing files upload as new revisions of the same Drive file (M3). Hydrated content is an LRU cache capped at 10 GiB — `pds pin <folder> <path>` keeps a file (or folder, recursively) offline-safe, `pds unpin` releases it. See `pds --help`.
+`pds sync` runs the engine headless; `pds status|pause|resume` control a running engine; `pds conflicts` lists the conflict inbox. `pds mount <folder> <mountpoint>` serves a **placeholder view** of a sync root (requires `/dev/fuse`): files hydrate from Drive on first open, files/folders you create through the mount upload to Drive on close, and edits to existing files upload as new revisions of the same Drive file (M3). Hydrated content is an LRU cache capped at 10 GiB by default — `pds mount --cache-cap <SIZE>` (e.g. `500M`, `10G`, `unlimited`) changes it for one invocation, `$PDS_CACHE_CAP` and the persisted Settings choice cover the rest. `pds pin <folder> <path>` keeps a file (or folder, recursively) offline-safe, `pds unpin` releases it. See `pds --help`.
 
 ## Testing
 
