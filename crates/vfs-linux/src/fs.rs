@@ -338,11 +338,13 @@ impl fuser::Filesystem for PdsFs {
             return reply.error(Errno::ENOENT);
         };
         let ino = if rel == STATE_PROXY {
-            let path = self.state_dir.join(name);
-            let Ok(meta) = std::fs::metadata(&path) else {
+            // The proxy stands for `state_dir` itself (same target as in
+            // `getattr`), not for a child of it. A missing state dir must
+            // ENOENT here too — otherwise root readdir advertises `.pds`
+            // while every lookup of it fails (phantom entry in `ls`).
+            if !self.state_dir.exists() {
                 return reply.error(Errno::ENOENT);
-            };
-            let _ = meta;
+            }
             self.tree.ino_of(&rel)
         } else if let Some(e) = self.overlay_entry(&rel) {
             e.ino
@@ -1018,7 +1020,15 @@ impl fuser::Filesystem for PdsFs {
         reply.error(Errno::ENODATA);
     }
 
-    fn listxattr(&self, _req: &Request, _ino: INodeNo, _size: u32, reply: ReplyXattr) {
-        reply.size(0);
+    fn listxattr(&self, _req: &Request, _ino: INodeNo, size: u32, reply: ReplyXattr) {
+        // No extended attributes. `size == 0` is the size query; when the
+        // kernel supplies a buffer the answer must be the (empty) data
+        // itself — replying with the size form here makes the kernel fail
+        // the caller with EIO (e.g. every `ls -l` entry).
+        if size == 0 {
+            reply.size(0);
+        } else {
+            reply.data(&[]);
+        }
     }
 }
