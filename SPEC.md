@@ -77,6 +77,38 @@ Sidecar consumes the SDK event stream; host applies create/update/trash events t
 
 Keep-both: the losing version is renamed `name (conflict YYYY-MM-DD HHmm).ext`; no silent overwrites in either direction.
 
+### F8 — Background service, start at login, tray (M5 ✅ 2026-10-31)
+
+The desktop app is the long-running sync service; there is no separate daemon.
+
+- **Start at login:** an XDG autostart entry
+  (`$XDG_CONFIG_HOME/autostart/proton-drive-sync.desktop`) launches
+  `proton-drive-sync --minimized` after the graphical session comes up
+  (systemd user units are not used: the tray needs the session and the FUSE
+  mount must share the process lifetime). Installed builds enable it on
+  first run; `Settings → Startup` toggles it, and the decision is persisted
+  in `$XDG_CONFIG_HOME/proton-drive-sync/app.conf` so a manual removal is
+  never silently undone. The `Exec=` path preserves distribution wrappers
+  (`argv[0]`) so Nix/Node environment injection survives.
+- **Tray icon:** StatusNotifierItem via `gpui-tray` (zbus on Linux). The icon
+  is drawn in code (no asset/theme dependency) with a status dot: running,
+  paused, delete-guard, sign-in required, stopped. Menu: Open Dashboard,
+  Pause/Resume, Open Sync Folder, Preferences…, Quit; primary activation
+  opens the dashboard.
+- **Window lifecycle:** closing the dashboard minimizes it while the tray is
+  usable (GPUI 0.2's Linux backend stops the event loop when the last window
+  is destroyed, and exposes no unminimize); with no tray host the close
+  quits and login start opens the dashboard instead of hiding it. `Quit`
+  lives in the tray and in Settings.
+- **Single instance:** a later launch sends `show` over
+  `$XDG_RUNTIME_DIR/proton-drive-sync.sock` and exits, so two engines can
+  never share one SQLite DB / FUSE mount.
+- Tray availability is probed over D-Bus (`org.kde.StatusNotifierWatcher`).
+  GNOME needs the AppIndicator extension; bare compositors need a panel
+  (waybar etc.). The app degrades to "dashboard at login" without one.
+- Explicitly **not** done: syncing while nobody is logged in (no system
+  daemon), multiple instances, and GNOME's built-in tray (it has none).
+
 ## 5. Compliance requirements (from Proton's SDK terms)
 
 - `x-pm-appversion: external-drive-{name}@{semver}-{channel}` — honest, non-spoofed.
@@ -85,7 +117,9 @@ Keep-both: the losing version is renamed `name (conflict YYYY-MM-DD HHmm).ext`; 
 
 ## 6. UI outline (GPUI, Linux)
 
-One main window: sidebar navigation (**Overview / Activity / Conflicts / Settings**) · account + engine-state badge · big pause/resume toggle · activity/event log · conflicts + failed-uploads inbox (from the state DB) · settings for the sync root and the **sync mode** (on-demand placeholders ⇄ mirror, with a confirm dialog and one-time layout notices). Browser-based sign-in with the mandated disclosure; sign-out confirmation modal. Keyboard-first: actions bound in `crates/app/src/actions.rs`.
+One main window: sidebar navigation (**Overview / Activity / Conflicts / Settings**) · account + engine-state badge · big pause/resume toggle · activity/event log · conflicts + failed-uploads inbox (from the state DB) · settings for the sync root, the **sync mode** (on-demand placeholders ⇄ mirror, with a confirm dialog and one-time layout notices), and **start at login**. Browser-based sign-in with the mandated disclosure; sign-out confirmation modal. Keyboard-first: actions bound in `crates/app/src/actions.rs`.
+
+A tray icon mirrors the engine state and offers Open Dashboard / Pause-Resume / Open Sync Folder / Preferences / Quit (F8). Closing the window keeps the service running; the dashboard is one click away.
 
 ## 7. Milestones
 
@@ -94,6 +128,7 @@ One main window: sidebar navigation (**Overview / Activity / Conflicts / Setting
 - **M2 — GPUI desktop shell (Linux):** single-window app; login, overview, activity, conflicts, settings, sign-out. ✅ 2026-10-29 (rewritten from the v0.1 tray shell when the project went Linux-only).
 - **M3 — Linux VFS:** FUSE mount, placeholders, hydration (M3.1 ✅ 2026-10-29), write-through + pins + LRU eviction (M3.2 ✅ 2026-10-29, E2E-proven in the VM), revision writes (M3.3 ✅ 2026-10-29), desktop integration: placeholder mode as the app default, mount at the sync root, external engine state, mode setting + safe conversion (M3.4 ✅ 2026-10-30).
 - **M4 — Hardening:** conflict soak tests, backoff/rate-limit validation, SDK upgrade rehearsal (M4 ✅ 2026-10-30 — see `docs/sdk-upgrade-rehearsal.md`; soak found + fixed the F7 remote-delete race, crash-interrupted transfers now recover on startup).
+- **M5 — Background service, login start, tray (F8):** ✅ 2026-10-31 — XDG autostart with a persisted toggle, StatusNotifierItem tray with status icon and actions, close-to-tray window lifecycle, single-instance socket, no-tray-host fallback.
 
 ## 8. Key risks
 

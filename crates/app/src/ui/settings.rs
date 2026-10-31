@@ -285,6 +285,60 @@ pub fn render(view: &mut AppView, cx: &mut Context<AppView>) -> AnyElement {
             ));
     }
 
+    // Start-at-login (XDG autostart): the app is its own background service.
+    let autostart = view.state.autostart_enabled;
+    let mut autostart_card = components::card()
+        .child(components::section_title(
+            "Startup",
+            Some("Keep syncing in the background without opening the dashboard"),
+        ))
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap_4()
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .child(
+                            div()
+                                .text_sm()
+                                .font_weight(FontWeight::MEDIUM)
+                                .child("Start at login"),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(rgb(theme::MUTED))
+                                .child(
+                                    "Launches minimized to the tray when you sign in, so files \
+                                     keep syncing. Close the dashboard at any time to keep the \
+                                     app running in the background.",
+                                ),
+                        ),
+                )
+                .child(components::toggle_switch(
+                    "autostart-toggle",
+                    autostart,
+                    cx,
+                    |this, _, _, cx| {
+                        let next = !this.state.autostart_enabled;
+                        this.set_autostart(next, cx);
+                    },
+                )),
+        );
+    if let Some(error) = &view.state.autostart_error {
+        autostart_card = autostart_card.child(
+            div()
+                .text_xs()
+                .text_color(rgb(theme::DANGER))
+                .child(format!("Could not update the login entry: {error}")),
+        );
+    }
+
     let about_card = components::card()
         .child(components::section_title(
             "About",
@@ -373,6 +427,7 @@ pub fn render(view: &mut AppView, cx: &mut Context<AppView>) -> AnyElement {
         .child(mode_card)
         .child(folder_card)
         .child(engine_card)
+        .child(autostart_card)
         .child(about_card)
         .into_any_element()
 }

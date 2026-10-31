@@ -13,18 +13,25 @@ window with sidebar navigation (upstream `gpui 0.2`, Wayland/X11).
   upload-error entries with timestamps and filters.
 - **Conflicts**: conflicts + failed uploads inbox (scanned from the state
   DB), with reveal-in-file-manager actions.
-- **Settings**: sync root, sidecar override, engine details.
+- **Settings**: sync root, sync mode + cache, start-at-login, engine
+  details.
 - **Sign-out** (sidebar footer) asks for confirmation, stops the engine
   gracefully, calls `auth.logout` (deletes the session server-side and wipes
   `session.json`), then returns to the login view. Files on disk and the
   local state DB are kept.
-- Closing the window quits gracefully: close is vetoed, the engine is asked
-  to shut down, and the app exits when it reports back (3 s fallback).
+- **Background service**: the process is the sync service. It can start at
+  login (`--minimized`, installed as an XDG autostart entry) and keeps a
+  StatusNotifierItem tray icon with live state + actions. Closing the window
+  minimizes it (when a tray host exists) so sync continues; Quit stops the
+  engine gracefully. Only one instance runs per user — a second launch asks
+  the primary to show its dashboard.
 
-Layout: `main.rs` (window + CLI) · `ui/` (pages + shell) · `state.rs` (pure
-state + reducer, tested) · `engine.rs` (tokio engine thread) ·
-`components.rs`/`theme.rs` (design system) · `actions.rs` (key bindings) ·
-`platform.rs` (XDG paths, `xdg-open`).
+Layout: `main.rs` (window + CLI + tray wiring) · `ui/` (pages + shell) ·
+`state.rs` (pure state + reducer, tested) · `engine.rs` (tokio engine thread) ·
+`tray.rs` (StatusNotifierItem, status icon, menu actions) ·
+`autostart.rs` (XDG login entry + persisted choice) · `instance.rs`
+(single-instance socket) · `components.rs`/`theme.rs` (design system) ·
+`actions.rs` (key bindings) · `platform.rs` (XDG paths, `xdg-open`).
 
 ## Run it (dev)
 
