@@ -6,18 +6,12 @@ use std::process::{Command, Stdio};
 
 use tracing::warn;
 
-fn home() -> PathBuf {
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."))
-}
-
 /// The sync root: `$PDS_SYNC_ROOT` or `~/ProtonDrive`.
 pub fn sync_root() -> PathBuf {
     if let Some(dir) = std::env::var_os("PDS_SYNC_ROOT") {
         return PathBuf::from(dir);
     }
-    home().join("ProtonDrive")
+    pds_xdg::home().join("ProtonDrive")
 }
 
 /// Open a URL in the user's default browser.

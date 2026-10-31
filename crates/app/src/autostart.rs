@@ -20,26 +20,13 @@ use tracing::{info, warn};
 pub const DESKTOP_FILE: &str = "proton-drive-sync.desktop";
 const CONFIG_FILE: &str = "app.conf";
 
-fn home() -> PathBuf {
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."))
-}
-
-fn config_home() -> PathBuf {
-    if let Some(dir) = std::env::var_os("XDG_CONFIG_HOME") {
-        return PathBuf::from(dir);
-    }
-    home().join(".config")
-}
-
 /// `$XDG_CONFIG_HOME/proton-drive-sync`.
 pub fn app_config_dir() -> PathBuf {
-    config_home().join("proton-drive-sync")
+    pds_xdg::app_config_dir()
 }
 
 fn autostart_dir() -> PathBuf {
-    config_home().join("autostart")
+    pds_xdg::config_home().join("autostart")
 }
 
 fn desktop_path() -> PathBuf {

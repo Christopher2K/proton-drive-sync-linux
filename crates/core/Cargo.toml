@@ -6,6 +6,7 @@ license.workspace = true
 description = "Sync engine, state DB, queues, and trash guards for proton-drive-sync"
 
 [dependencies]
+pds-xdg.workspace = true
 pds-sidecar-client.workspace = true
 tokio.workspace = true
 serde.workspace = true

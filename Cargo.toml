@@ -27,6 +27,7 @@ chrono = "0.4"
 clap = { version = "4", features = ["derive"] }
 tempfile = "3"
 
+pds-xdg = { path = "crates/xdg" }
 pds-sidecar-client = { path = "crates/sidecar-client" }
 pds-core = { path = "crates/core" }
 

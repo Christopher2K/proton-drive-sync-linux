@@ -4070,6 +4070,7 @@ dependencies = [
  "pds-core",
  "pds-sidecar-client",
  "pds-vfs-linux",
+ "pds-xdg",
  "rusqlite",
  "tempfile",
  "tokio",
@@ -4088,6 +4089,7 @@ dependencies = [
  "pds-core",
  "pds-sidecar-client",
  "pds-vfs-linux",
+ "pds-xdg",
  "serde_json",
  "tempfile",
  "tokio",
@@ -4104,6 +4106,7 @@ dependencies = [
  "notify",
  "notify-debouncer-mini",
  "pds-sidecar-client",
+ "pds-xdg",
  "rusqlite",
  "serde",
  "serde_json",
@@ -4122,6 +4125,7 @@ version = "0.2.2"
 dependencies = [
  "anyhow",
  "async-trait",
+ "pds-xdg",
  "serde",
  "serde_json",
  "sha1",
@@ -4145,6 +4149,10 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
 ]
+
+[[package]]
+name = "pds-xdg"
+version = "0.2.2"
 
 [[package]]
 name = "percent-encoding"

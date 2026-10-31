@@ -98,11 +98,7 @@ fn spawn_in(dir: &Path) -> Result<(SidecarClient, Child)> {
 
 /// `$XDG_DATA_HOME/proton-drive-sync`, defaulting to `~/.local/share/...`.
 fn xdg_data_dir() -> PathBuf {
-    if let Some(dir) = std::env::var_os("XDG_DATA_HOME") {
-        return PathBuf::from(dir).join("proton-drive-sync");
-    }
-    let home = std::env::var_os("HOME").unwrap_or_default();
-    PathBuf::from(home).join(".local/share/proton-drive-sync")
+    pds_xdg::app_data_dir()
 }
 
 fn split_cmd(line: &str) -> Result<(&str, Vec<&str>)> {
