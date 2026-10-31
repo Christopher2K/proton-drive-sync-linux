@@ -330,6 +330,54 @@ async fn pinned_file_survives_eviction() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
+async fn set_cache_cap_applies_live_with_immediate_eviction() {
+    // Start unlimited; shrinking the cap below current usage via the live
+    // command reclaims the over-cap content on the spot — no restart, no
+    // waiting for an idle tick. Growing it again is live too.
+    let fx = start_with_cap(None).await;
+    wait_for(|| fx.store.snapshot().by_path.contains_key("hello.txt")).await;
+
+    fx.handle.pin("hello.txt").await.unwrap();
+    wait_for(|| {
+        fx.store
+            .backing_path("hello.txt")
+            .map(|p| p.is_file())
+            .unwrap_or(false)
+    })
+    .await;
+    fx.handle.unpin("hello.txt").await.unwrap();
+
+    // Shrink to 1 byte: the hydrated file is over cap and unpinned, so the
+    // on-the-spot eviction pass reclaims it.
+    fx.handle.set_cache_cap(Some(1)).await.unwrap();
+    assert_eq!(fx.handle.status().await.unwrap().cache_cap, Some(1));
+    wait_for(|| fx.store.backing_path("hello.txt").is_none()).await;
+    wait_for(|| !fx.store.snapshot().by_path["hello.txt"].content_ready).await;
+
+    // Back to unlimited: a fresh hydration survives the eviction pass.
+    fx.handle.set_cache_cap(None).await.unwrap();
+    assert_eq!(fx.handle.status().await.unwrap().cache_cap, None);
+    fx.store.begin_hydrate("hello.txt");
+    wait_for(|| {
+        fx.store
+            .backing_path("hello.txt")
+            .map(|p| p.is_file())
+            .unwrap_or(false)
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        fx.store
+            .backing_path("hello.txt")
+            .map(|p| p.is_file())
+            .unwrap_or(false),
+        "unlimited cap must not evict"
+    );
+    fx.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
 async fn backing_dir_events_never_enter_the_sync_pipeline() {
     // Regression (found in M3.3): the watcher and the initial scan saw
     // `.pds-vfs-backing/` and treated hydration as a local change —
