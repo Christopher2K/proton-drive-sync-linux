@@ -74,8 +74,19 @@ cargo update -w >/dev/null
 
 # 5. Verify nothing drifted, then generate the changelog. The release commit
 #    is not tagged yet, so label the unreleased section with the new tag.
+#    --prepend (not -o) is required: `-o` truncates the file and `--unreleased`
+#    only renders commits since the last tag, so every earlier release section
+#    would be dropped. --prepend inserts the new section after the header and
+#    keeps the existing history intact.
 ./scripts/check-versions.sh
-git-cliff --config cliff.toml --unreleased --tag "v$next" -o CHANGELOG.md
+# Guard: never let a changelog regeneration erase an earlier release section.
+previous_heading="$(grep -m1 '^## v' CHANGELOG.md || true)"
+git-cliff --config cliff.toml --unreleased --tag "v$next" --prepend CHANGELOG.md
+if [ -n "$previous_heading" ] \
+  && ! grep -qF -- "$previous_heading" CHANGELOG.md; then
+  echo "release: changelog lost '$previous_heading' — refusing to continue" >&2
+  exit 1
+fi
 
 # --- commit + tag -------------------------------------------------------------
 git add Cargo.toml Cargo.lock sidecar/package.json sidecar/src/config.ts \
