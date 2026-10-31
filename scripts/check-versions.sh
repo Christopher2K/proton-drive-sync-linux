@@ -32,6 +32,7 @@ $stray"
 fi
 grep -q '^version.workspace = true$' crates/app/Cargo.toml crates/cli/Cargo.toml \
   crates/core/Cargo.toml crates/sidecar-client/Cargo.toml crates/vfs-linux/Cargo.toml \
+  crates/xdg/Cargo.toml \
   || fail "expected 'version.workspace = true' in every crate manifest"
 
 check() { # <description> <file> <expected-line-content>

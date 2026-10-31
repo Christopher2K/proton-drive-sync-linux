@@ -10,7 +10,9 @@ name = "proton-drive-sync"
 path = "src/main.rs"
 
 [dependencies]
+pds-xdg.workspace = true
 gpui = "0.2"
+gpui-tray = "0.3"
 pds-core.workspace = true
 pds-sidecar-client.workspace = true
 pds-vfs-linux = { path = "../vfs-linux" }
@@ -21,3 +23,8 @@ anyhow.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 chrono.workspace = true
+# Session-bus probe for a StatusNotifier host (same zbus major as gpui-tray).
+zbus = { version = "6", default-features = false, features = ["default-rt"] }
+
+[dev-dependencies]
+tempfile.workspace = true

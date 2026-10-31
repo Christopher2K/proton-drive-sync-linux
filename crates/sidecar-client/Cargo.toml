@@ -6,6 +6,7 @@ license.workspace = true
 description = "Async JSON-RPC 2.0 client for the proton-drive-sync Node.js sidecar (NDJSON over stdio)"
 
 [dependencies]
+pds-xdg.workspace = true
 tokio.workspace = true
 serde.workspace = true
 serde_json.workspace = true

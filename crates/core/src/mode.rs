@@ -87,11 +87,7 @@ impl SyncMode {
 /// root (the desktop app mounts the FUSE view at the root itself, so engine
 /// state under the root would be shadowed / unreachable through the mount).
 pub fn app_data_dir() -> PathBuf {
-    if let Ok(xdg) = std::env::var("XDG_DATA_HOME") {
-        return PathBuf::from(xdg).join("proton-drive-sync");
-    }
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-    PathBuf::from(home).join(".local/share/proton-drive-sync")
+    pds_xdg::app_data_dir()
 }
 
 /// Registry/state key for a sync root: a hash, so arbitrary paths are safe
