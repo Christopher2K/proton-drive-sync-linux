@@ -43,6 +43,8 @@ commit_parsers = [
   { message = "^test", group = "Testing" },
   # The release commit itself must not appear in the changelog.
   { message = "^chore\\(release", skip = true },
+  # Merge commits carry no user-facing change of their own.
+  { message = "^Merge (pull request|branch)", skip = true },
   { message = "^chore", group = "Miscellaneous" },
   { message = "^build", group = "Miscellaneous" },
   { message = "^ci", group = "Miscellaneous" },

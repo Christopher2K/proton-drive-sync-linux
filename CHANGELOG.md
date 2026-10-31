@@ -5,6 +5,18 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## v0.2.2 - 2026-10-31
+
+
+### Fixed
+
+- Answer both listxattr reply forms and resolve the .pds proxy
+- Create the sync root before canonicalizing it
+
+### Miscellaneous
+
+- NixOS dev-shell Vulkan libs, ignore nix result, FUSE gotchas
+
 ## v0.2.1 - 2026-10-31
 
 
