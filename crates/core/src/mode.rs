@@ -21,6 +21,15 @@ pub const META_SYNC_MODE: &str = "sync_mode";
 /// the caller when it matters).
 pub const ENV_SYNC_MODE: &str = "PDS_SYNC_MODE";
 
+/// `meta` key holding the persisted backing-cache cap in bytes; the literal
+/// value `unlimited` means eviction is disabled.
+pub const META_CACHE_CAP: &str = "cache_cap_bytes";
+
+/// Environment variable overriding the persisted backing-cache cap for one
+/// session: a byte count with an optional `K`/`M`/`G`/`T` (binary) suffix,
+/// or `unlimited`. Never rewrites the persisted setting.
+pub const ENV_CACHE_CAP: &str = "PDS_CACHE_CAP";
+
 /// How local file content is stored (F5).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SyncMode {
@@ -138,6 +147,98 @@ pub fn set_sync_mode(db: &crate::db::Db, mode: SyncMode) -> Result<(), rusqlite:
     db.set_meta(META_SYNC_MODE, mode.as_meta_value())
 }
 
+/// Parse a human cache-cap value: plain bytes, or bytes with a binary
+/// `K`/`M`/`G`/`T` suffix (`10G`, `500M`, `2g`…). `unlimited`/`none`/`off`/
+/// `0` disable eviction (`Ok(None)`).
+pub fn parse_cache_cap(raw: &str) -> Result<Option<u64>, String> {
+    let s = raw.trim();
+    if matches!(s.to_ascii_lowercase().as_str(), "unlimited" | "none" | "off" | "0") {
+        return Ok(None);
+    }
+    let (digits, suffix) = s
+        .find(|c: char| !c.is_ascii_digit())
+        .map(|i| s.split_at(i))
+        .unwrap_or((s, ""));
+    let value: u64 = digits.parse().map_err(|_| format!("invalid size `{raw}`"))?;
+    if digits.is_empty() {
+        return Err(format!("invalid size `{raw}`"));
+    }
+    let mult: u64 = match suffix.trim().to_ascii_lowercase().as_str() {
+        "" => 1,
+        "k" | "kb" | "kib" => 1 << 10,
+        "m" | "mb" | "mib" => 1 << 20,
+        "g" | "gb" | "gib" => 1 << 30,
+        "t" | "tb" | "tib" => 1 << 40,
+        other => return Err(format!("unknown size suffix `{other}` in `{raw}`")),
+    };
+    value
+        .checked_mul(mult)
+        .ok_or_else(|| format!("size `{raw}` overflows u64"))
+        .map(Some)
+}
+
+/// The `$PDS_CACHE_CAP` override: `Some(None)` = explicitly unlimited this
+/// session; `Some(Some(bytes))` = explicit cap; `None` = unset or invalid
+/// (invalid values are ignored so a typo never disables eviction).
+pub fn cache_cap_from_env() -> Option<Option<u64>> {
+    let raw = std::env::var(ENV_CACHE_CAP).ok()?;
+    match parse_cache_cap(&raw) {
+        Ok(cap) => Some(cap),
+        Err(e) => {
+            tracing::warn!(value = %raw, error = %e, "ignoring invalid {ENV_CACHE_CAP}");
+            None
+        }
+    }
+}
+
+/// Read the persisted cache cap straight from a state DB (read-only).
+/// `None` = not set; `Some(None)` = persisted unlimited;
+/// `Some(Some(bytes))` = persisted cap.
+pub fn persisted_cache_cap(db_path: &Path) -> Option<Option<u64>> {
+    let conn = rusqlite::Connection::open_with_flags(
+        db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .ok()?;
+    let value: String = conn
+        .query_row(
+            &format!("SELECT value FROM meta WHERE key = '{META_CACHE_CAP}'"),
+            [],
+            |row| row.get(0),
+        )
+        .ok()?;
+    match value.as_str() {
+        "unlimited" => Some(None),
+        _ => value.parse::<u64>().ok().map(Some),
+    }
+}
+
+/// Persist the cache cap chosen in Settings. `Some(bytes)` stores the byte
+/// count; `None` (Unlimited) stores the literal `unlimited`. There is no
+/// "reset to unset": roots that never touched the setting have no key and
+/// fall through to the default, exactly like `META_SYNC_MODE`.
+pub fn set_cache_cap(db: &crate::db::Db, cap: Option<u64>) -> Result<(), rusqlite::Error> {
+    match cap {
+        Some(bytes) => db.set_meta(META_CACHE_CAP, &bytes.to_string()),
+        None => db.set_meta(META_CACHE_CAP, "unlimited"),
+    }
+}
+
+/// Resolve the effective cache cap. Precedence: an explicit CLI flag >
+/// `$PDS_CACHE_CAP` (both session-only, never persisted) > the persisted
+/// Settings value > `default_cap`. The result is `None` for unlimited.
+pub fn resolve_cache_cap(
+    flag: Option<Option<u64>>,
+    env: Option<Option<u64>>,
+    persisted: Option<Option<u64>>,
+    default_cap: Option<u64>,
+) -> Option<u64> {
+    match flag.or(env) {
+        Some(inner) => inner,
+        None => persisted.unwrap_or(default_cap),
+    }
+}
+
 /// Move a file, falling back to copy+delete across filesystems (the app's
 /// backing cache may live on a different mount than the sync root).
 /// The copy fallback verifies the byte size before deleting the source.
@@ -229,5 +330,109 @@ mod tests {
             db.meta(META_SYNC_MODE).unwrap().as_deref(),
             Some("placeholders")
         );
+    }
+
+    #[test]
+    fn cache_cap_parse_sizes() {
+        assert_eq!(parse_cache_cap("0"), Ok(None));
+        assert_eq!(parse_cache_cap("unlimited"), Ok(None));
+        assert_eq!(parse_cache_cap("UNLIMITED"), Ok(None));
+        assert_eq!(parse_cache_cap(" none "), Ok(None));
+        assert_eq!(parse_cache_cap("off"), Ok(None));
+        assert_eq!(parse_cache_cap("500"), Ok(Some(500)));
+        assert_eq!(parse_cache_cap("1k"), Ok(Some(1 << 10)));
+        assert_eq!(parse_cache_cap("10K"), Ok(Some(10 << 10)));
+        assert_eq!(parse_cache_cap("500M"), Ok(Some(500 << 20)));
+        assert_eq!(parse_cache_cap("2g"), Ok(Some(2 << 30)));
+        assert_eq!(parse_cache_cap("1GiB"), Ok(Some(1 << 30)));
+        assert_eq!(parse_cache_cap("3 TB"), Ok(Some(3 << 40)));
+        assert!(parse_cache_cap("").is_err());
+        assert!(parse_cache_cap("lots").is_err());
+        assert!(parse_cache_cap("10x").is_err());
+        assert!(parse_cache_cap("18446744073709551616G").is_err());
+    }
+
+    #[test]
+    fn cache_cap_env_override_is_session_only() {
+        // SAFETY: test-only mutation of this process's env. PDS_CACHE_CAP is
+        // cleared before the env-less resolution below; the placeholders
+        // integration tests that read the env run in another process.
+        unsafe {
+            std::env::set_var(ENV_CACHE_CAP, "500M");
+        }
+        assert_eq!(cache_cap_from_env(), Some(Some(500 << 20)));
+        unsafe {
+            std::env::remove_var(ENV_CACHE_CAP);
+        }
+        assert_eq!(cache_cap_from_env(), None);
+
+        unsafe {
+            std::env::set_var(ENV_CACHE_CAP, "unlimited");
+        }
+        assert_eq!(cache_cap_from_env(), Some(None));
+        unsafe {
+            std::env::remove_var(ENV_CACHE_CAP);
+        }
+
+        // Invalid values are ignored, never treated as unlimited.
+        unsafe {
+            std::env::set_var(ENV_CACHE_CAP, "bogus");
+        }
+        assert_eq!(cache_cap_from_env(), None);
+        unsafe {
+            std::env::remove_var(ENV_CACHE_CAP);
+        }
+    }
+
+    #[test]
+    fn cache_cap_precedence_flag_env_persisted_default() {
+        // Flag beats everything, including an explicit unlimited.
+        assert_eq!(
+            resolve_cache_cap(Some(None), Some(Some(1)), Some(Some(2)), Some(3)),
+            None
+        );
+        assert_eq!(
+            resolve_cache_cap(Some(Some(1)), Some(Some(2)), Some(Some(3)), Some(4)),
+            Some(1)
+        );
+        // Env beats persisted + default; explicit unlimited wins too.
+        assert_eq!(
+            resolve_cache_cap(None, Some(Some(1)), Some(Some(2)), Some(3)),
+            Some(1)
+        );
+        assert_eq!(
+            resolve_cache_cap(None, Some(None), Some(Some(2)), Some(3)),
+            None
+        );
+        // Persisted beats the default; persisted unlimited is honored.
+        assert_eq!(resolve_cache_cap(None, None, Some(Some(2)), Some(3)), Some(2));
+        assert_eq!(resolve_cache_cap(None, None, Some(None), Some(3)), None);
+        // Fall through to the default.
+        assert_eq!(resolve_cache_cap(None, None, None, Some(3)), Some(3));
+        assert_eq!(resolve_cache_cap(None, None, None, None), None);
+    }
+
+    #[test]
+    fn cache_cap_persistence_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("state.db");
+        let db = crate::db::Db::open(&db_path).unwrap();
+
+        // Unset falls through to the default.
+        assert_eq!(persisted_cache_cap(&db_path), None);
+
+        // A byte cap persists and reads back.
+        set_cache_cap(&db, Some(10 << 30)).unwrap();
+        assert_eq!(persisted_cache_cap(&db_path), Some(Some(10 << 30)));
+
+        // Unlimited persists as the literal `unlimited` (and reads back as
+        // Some(None) — not "unset").
+        set_cache_cap(&db, None).unwrap();
+        assert_eq!(db.meta(META_CACHE_CAP).unwrap().as_deref(), Some("unlimited"));
+        assert_eq!(persisted_cache_cap(&db_path), Some(None));
+
+        // Re-picking a byte cap overwrites the unlimited literal.
+        set_cache_cap(&db, Some(2 << 30)).unwrap();
+        assert_eq!(persisted_cache_cap(&db_path), Some(Some(2 << 30)));
     }
 }

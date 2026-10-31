@@ -556,4 +556,10 @@ impl Db {
             })
             .optional()
     }
+
+    pub fn remove_meta(&self, key: &str) -> rusqlite::Result<()> {
+        self.lock()
+            .execute("DELETE FROM meta WHERE key=?1", params![key])?;
+        Ok(())
+    }
 }

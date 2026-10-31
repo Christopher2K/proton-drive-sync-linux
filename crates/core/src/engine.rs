@@ -88,6 +88,10 @@ pub struct EngineStatus {
     /// How local file content is stored (F5): placeholders (on demand) or
     /// a full materialized mirror.
     pub mode: crate::mode::SyncMode,
+    /// Backing-cache cap (placeholder mode): `Some(bytes)` = LRU eviction
+    /// past the cap, `None` = unlimited. Live-adjustable via
+    /// [`EngineHandle::set_cache_cap`].
+    pub cache_cap: Option<u64>,
 }
 
 /// Control commands (CLI socket / UI).
@@ -100,6 +104,10 @@ pub enum Command {
     Pin(String, oneshot::Sender<Result<()>>),
     /// Drop the pin; the file becomes evictable again.
     Unpin(String, oneshot::Sender<Result<()>>),
+    /// Change the backing-cache cap live (Settings → cache size).
+    /// `None` disables eviction. Applied immediately: if the cache is
+    /// already over the new cap, an eviction pass runs on the spot.
+    SetEvictionCap(Option<u64>, oneshot::Sender<Result<()>>),
 }
 
 /// A queued pin command awaiting its (async) hydration.
@@ -210,6 +218,19 @@ impl EngineHandle {
         let (tx, rx) = oneshot::channel();
         self.tx
             .send(Command::Unpin(rel.to_string(), tx))
+            .await
+            .context("engine gone")?;
+        rx.await.context("engine gone")?
+    }
+
+    /// Change the backing-cache cap (placeholder mode): `Some(bytes)` caps
+    /// the hydrated cache with LRU eviction, `None` disables eviction.
+    /// Takes effect immediately, including an on-the-spot eviction pass
+    /// when the cache already exceeds the new cap.
+    pub async fn set_cache_cap(&self, cap: Option<u64>) -> Result<()> {
+        let (tx, rx) = oneshot::channel();
+        self.tx
+            .send(Command::SetEvictionCap(cap, tx))
             .await
             .context("engine gone")?;
         rx.await.context("engine gone")?
@@ -2132,9 +2153,20 @@ impl<S: SidecarApi + 'static> Engine<S> {
                     errored_nodes: self.db.count_errored().unwrap_or(0),
                     conflicted_nodes: self.db.count_remote_conflicted().unwrap_or(0),
                     mode: self.sync_mode(),
+                    cache_cap: self.eviction_cap,
                 });
             }
             Command::Shutdown => {}
+            Command::SetEvictionCap(cap, reply) => {
+                self.eviction_cap = cap;
+                // Enforce immediately: shrinking the cap below current
+                // usage should reclaim space now, not on the next idle tick.
+                if let Some(store) = self.store.clone() {
+                    self.maybe_evict(&store, "");
+                }
+                info!(cap = cap.map(|c| c.to_string()).unwrap_or_else(|| "unlimited".into()), "cache cap changed");
+                let _ = reply.send(Ok(()));
+            }
             Command::Pin(rel, reply) => {
                 // pin_file downloads, so it cannot run inline (non-async
                 // context): queue it and complete the reply when drained.
