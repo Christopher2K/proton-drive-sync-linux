@@ -176,6 +176,10 @@ pub struct AppState {
     pub mount_error: Option<String>,
     /// Pending sync-mode switch (confirm modal / restart in flight).
     pub mode_switch: ModeSwitchState,
+    /// Whether the XDG autostart entry is installed (Settings toggle).
+    pub autostart_enabled: bool,
+    /// Last failure while writing/removing the autostart entry.
+    pub autostart_error: Option<String>,
 }
 
 impl AppState {
@@ -196,6 +200,8 @@ impl AppState {
             layout_migrated: false,
             mount_error: None,
             mode_switch: ModeSwitchState::None,
+            autostart_enabled: false,
+            autostart_error: None,
         }
     }
 

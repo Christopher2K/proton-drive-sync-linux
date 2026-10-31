@@ -44,6 +44,9 @@ instead.
 - Mass-deletion guard: bulk deletes pause sync until you confirm
 - Pause / resume; conflict handling keeps both versions (`name (conflict …).ext`)
 - Native GPUI window: Overview, Activity, Conflicts, and Settings pages
+- **Runs in the background:** optional start-at-login (XDG autostart) plus a
+  tray icon with live status; closing the dashboard hides it to the tray, and
+  a later launch simply reopens the running instance
 
 In **mirror** mode the sync root is a fully materialized folder instead (the
 pre-placeholder behavior, still available for `pds sync` via `PDS_SYNC_MODE`).
@@ -102,6 +105,34 @@ PREFIX=$HOME/.local packaging/linux/install.sh
 ```
 
 This installs the `proton-drive-sync` binary, the `pds` CLI, the sidecar (with vendored npm deps), a `.desktop` entry, and an icon. The app then appears in your application menu.
+
+## Background service and tray
+
+The app **is** the sync service: the engine, the on-demand mount, and the tray
+live in one long-running process, so closing the dashboard never interrupts a
+transfer.
+
+- **Start at login** is on by default for installed builds (development
+  builds from `target/` stay opt-in). `Settings → Startup` toggles it. The app
+  writes the standard XDG entry
+  `~/.config/autostart/proton-drive-sync.desktop`, launching
+  `proton-drive-sync --minimized` a few seconds after you sign in to your
+  desktop session. Your choice is remembered in
+  `~/.config/proton-drive-sync/app.conf`; toggling it off removes the entry
+  and a later launch will not re-enable it.
+- **Tray icon** (StatusNotifierItem): a coloured dot shows syncing, paused,
+  delete-guard, signed-out, or stopped. The menu has *Open Dashboard*,
+  *Pause/Resume syncing*, *Open Sync Folder*, *Preferences…*, and *Quit*;
+  left-clicking the icon opens the dashboard. Closing the dashboard minimizes
+  it, and `Quit` is the only way to stop the service.
+- **No tray host?** GNOME needs the AppIndicator extension, and some bare
+  compositors (e.g. niri) need a panel such as waybar with a tray module.
+  When no `StatusNotifierWatcher` is present the app still starts at login,
+  but opens the dashboard instead of hiding and closes normally.
+- **One instance only:** launching `proton-drive-sync` again does not start a
+  second engine — it asks the running instance to show its dashboard
+  (`$XDG_RUNTIME_DIR/proton-drive-sync.sock`) and exits. This protects the
+  SQLite state and the FUSE mount from two writers.
 
 ## Install (Nix)
 

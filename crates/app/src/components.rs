@@ -91,6 +91,42 @@ pub fn text_button<V: 'static>(
         .child(label.into())
 }
 
+/// A small on/off switch. GPUI ships no toggle widget, so this is a styled
+/// track with a knob positioned by flex alignment.
+pub fn toggle_switch<V: 'static>(
+    id: impl Into<ElementId>,
+    on: bool,
+    cx: &mut Context<V>,
+    on_click: impl Fn(&mut V, &ClickEvent, &mut Window, &mut Context<V>) + 'static,
+) -> Stateful<Div> {
+    let mut track = div()
+        .id(id)
+        .flex()
+        .items_center()
+        .w(px(38.0))
+        .h(px(22.0))
+        .p(px(2.0))
+        .rounded_full()
+        .bg(rgb(if on {
+            theme::ACCENT
+        } else {
+            theme::BORDER_STRONG
+        }))
+        .cursor_pointer()
+        .on_click(cx.listener(on_click));
+    track = if on {
+        track.justify_end()
+    } else {
+        track.justify_start()
+    };
+    track.child(
+        div()
+            .size(px(18.0))
+            .rounded_full()
+            .bg(rgb(0xffffff)),
+    )
+}
+
 fn button_base<V: 'static>(
     id: impl Into<ElementId>,
     label: impl Into<SharedString>,
