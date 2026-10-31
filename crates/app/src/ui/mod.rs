@@ -182,6 +182,21 @@ impl AppView {
         cx.notify();
     }
 
+    /// Settings changed the backing-cache cap: persist it (own SQLite
+    /// connection) and let the running engine apply it live — no restart.
+    pub(crate) fn set_cache_cap(&mut self, cap: Option<u64>, cx: &mut Context<Self>) {
+        let db_path = pds_core::engine_state_dir(&self.state.root).join("state.db");
+        if let Ok(db) = Db::open(&db_path)
+            && let Err(e) = pds_core::set_cache_cap(&db, cap)
+        {
+            warn!("persisting cache cap failed: {e}");
+        }
+        if let Some(service) = &self.service {
+            service.send(UiCommand::SetCacheCap(cap));
+        }
+        cx.notify();
+    }
+
     /// Start a fresh background engine thread. Call only when the previous
     /// thread has fully exited (Failed-phase retry, or the post-shutdown
     /// mode switch) — never while one is running on the same root.

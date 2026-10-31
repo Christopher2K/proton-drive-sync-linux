@@ -44,6 +44,8 @@ pub enum UiCommand {
     /// the sign-in screen.
     SignOut,
     Shutdown,
+    /// Settings changed the backing-cache cap; applied live by the engine.
+    SetCacheCap(Option<u64>),
 }
 
 /// Cloneable handle to the background thread.
@@ -472,6 +474,14 @@ fn build_engine(
     db_path: PathBuf,
     placeholders: bool,
 ) -> Result<(Engine<pds_sidecar_client::SidecarClient>, EngineHandle)> {
+    // Cache cap: $PDS_CACHE_CAP (session-only) > the persisted Settings
+    // value > the 10 GiB default. Applied live later via SetCacheCap when
+    // the user changes it in Settings (no restart needed).
+    let eviction_cap = match pds_core::cache_cap_from_env() {
+        Some(session) => session,
+        None => pds_core::persisted_cache_cap(&db_path)
+            .unwrap_or(Some(EVICTION_CAP_DEFAULT)),
+    };
     Engine::new(
         client,
         notifications,
@@ -480,7 +490,7 @@ fn build_engine(
             root: layout.root.clone(),
             retry_base: RETRY_BASE_DEFAULT,
             placeholders,
-            eviction_cap: Some(EVICTION_CAP_DEFAULT),
+            eviction_cap,
             backing_dir: Some(layout.backing_dir.clone()),
             // Placeholder sessions mount FUSE AT the root: writes arrive
             // through the VFS store queues, not inotify (watching the
@@ -549,6 +559,11 @@ async fn drive_engine_task(
                     return EngineExit::SignOut;
                 }
                 Some(UiCommand::StartLogin) => {} // already signed in
+                Some(UiCommand::SetCacheCap(cap)) => {
+                    if let Err(e) = handle.set_cache_cap(cap).await {
+                        warn!("set cache cap: {e}");
+                    }
+                }
             },
             item = activity_rx.recv() => match item {
                 Ok(item) => {

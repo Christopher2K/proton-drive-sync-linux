@@ -454,6 +454,7 @@ mod tests {
             errored_nodes: 0,
             conflicted_nodes: 0,
             mode: SyncMode::Placeholders,
+            cache_cap: Some(10 * 1024 * 1024 * 1024),
         }
     }
 

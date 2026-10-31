@@ -119,6 +119,84 @@ pub fn render(view: &mut AppView, cx: &mut Context<AppView>) -> AnyElement {
             .text_color(rgb(theme::MUTED))
             .child("Switching modes keeps every file and never deletes from Drive."),
     );
+    // Local cache size (placeholder mode): the LRU cap on hydrated content.
+    // Effective value comes from the engine status ($PDS_CACHE_CAP and the
+    // persisted setting are resolved there); a session override is noted.
+    if current_mode == Some(SyncMode::Placeholders) {
+        let effective = status.as_ref().and_then(|s| s.cache_cap);
+        let presets: [(Option<u64>, &str); 5] = [
+            (Some(2 << 30), "2 GB"),
+            (Some(5 << 30), "5 GB"),
+            (Some(10 << 30), "10 GB"),
+            (Some(25 << 30), "25 GB"),
+            (None, "Unlimited"),
+        ];
+        let mut chips = div().flex().items_center().gap_2().flex_wrap();
+        for (cap, label) in presets {
+            let active = effective == cap;
+            let mut chip = div()
+                .id(label)
+                .px_3()
+                .py_1()
+                .rounded(px(6.0))
+                .text_xs()
+                .cursor_pointer()
+                .border_1()
+                .on_click(cx.listener(move |this, _, _, cx| this.set_cache_cap(cap, cx)));
+            chip = if active {
+                chip.bg(rgb(theme::INSET))
+                    .border_color(rgb(theme::ACCENT))
+                    .text_color(rgb(theme::ACCENT))
+            } else {
+                chip.border_color(rgb(theme::BORDER))
+                    .text_color(rgb(theme::MUTED))
+                    .hover(|s| s.bg(rgb(theme::CARD_HOVER)))
+            };
+            chips = chips.child(chip.child(label));
+        }
+        let mut cache_block = div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_weight(FontWeight::MEDIUM)
+                            .child("Local cache"),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(theme::MUTED))
+                            .child(match effective {
+                                Some(bytes) => format!("{} GB max", bytes >> 30),
+                                None => "Unlimited".to_string(),
+                            }),
+                    ),
+            )
+            .child(chips)
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(theme::MUTED))
+                    .child("Files you open are stored locally up to this size; the least-used \
+                            are cleaned automatically. Pinned files are never cleaned."),
+            );
+        if pds_core::cache_cap_from_env().is_some() {
+            cache_block = cache_block.child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(theme::WARN))
+                    .child("PDS_CACHE_CAP is set; it overrides this setting for this session."),
+            );
+        }
+        mode_card = mode_card.child(cache_block);
+    }
     let mode_card = mode_card;
 
     let folder_card = components::card()
