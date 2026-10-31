@@ -13,6 +13,9 @@ path = "src/main.rs"
 gpui = "0.2"
 pds-core.workspace = true
 pds-sidecar-client.workspace = true
+pds-vfs-linux = { path = "../vfs-linux" }
+fuser = "0.18"
+rusqlite = { version = "0.35", features = ["bundled"] }
 tokio.workspace = true
 anyhow.workspace = true
 tracing.workspace = true

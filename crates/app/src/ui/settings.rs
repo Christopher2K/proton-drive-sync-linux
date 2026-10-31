@@ -1,9 +1,10 @@
-//! Settings page: account, local folder, engine controls, about.
+//! Settings page: account, sync mode, local folder, engine controls, about.
 
 use gpui::{AnyElement, Context, FontWeight, div, prelude::*, px, rgb};
+use pds_core::SyncMode;
 
 use crate::components;
-use crate::state::{self, APP_TITLE, DISCLOSURE, Phase};
+use crate::state::{self, APP_TITLE, DISCLOSURE, ModeSwitchState, Phase};
 use crate::theme;
 use crate::ui::AppView;
 
@@ -12,6 +13,7 @@ pub fn render(view: &mut AppView, cx: &mut Context<AppView>) -> AnyElement {
     let account = state.account_label();
     let root = state.root.display().to_string();
     let status = state.status.clone();
+    let current_mode = status.as_ref().map(|s| s.mode);
     let badge_color = match state.engine_state() {
         Some(pds_core::EngineState::Running) if state.phase == Phase::Running => theme::OK,
         Some(pds_core::EngineState::Paused) => theme::WARN,
@@ -45,10 +47,90 @@ pub fn render(view: &mut AppView, cx: &mut Context<AppView>) -> AnyElement {
                 )),
         );
 
+    // Sync mode (F5): placeholders (default) vs full mirror.
+    let mut mode_card = components::card().child(components::section_title(
+        "Sync mode",
+        Some("How files in the sync folder are stored locally"),
+    ));
+    for mode in [SyncMode::Placeholders, SyncMode::Mirror] {
+        let (title, detail) = match mode {
+            SyncMode::Placeholders => (
+                "On demand (recommended)",
+                "Files appear as placeholders at ~0 bytes. Opening one downloads it on the \
+                 spot; the local cache is capped and cleaned up automatically. Nothing else \
+                 is stored on disk.",
+            ),
+            SyncMode::Mirror => (
+                "Mirror everything",
+                "Every file on Drive is downloaded into the sync folder and kept in full — \
+                 offline by default, uses the same space as your Drive.",
+            ),
+        };
+        let selected = current_mode == Some(mode);
+        let mut row = div()
+            .id(("sync-mode", mode as usize))
+            .flex()
+            .flex_col()
+            .gap_1()
+            .p_3()
+            .rounded(px(8.0))
+            .border_1()
+            .cursor_pointer()
+            .on_click(cx.listener(move |this, _, _, cx| {
+                if this.state.status.as_ref().map(|s| s.mode) != Some(mode) {
+                    this.request_mode_switch(mode, cx);
+                }
+            }));
+        row = if selected {
+            row.border_color(rgb(theme::ACCENT)).bg(rgb(theme::INSET))
+        } else {
+            row.border_color(rgb(theme::BORDER))
+                .hover(|s| s.bg(rgb(theme::CARD_HOVER)))
+        };
+        row = row
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_weight(FontWeight::MEDIUM)
+                            .child(title),
+                    )
+                    .child(if selected {
+                        components::pill("Active", theme::OK, theme::OK_SOFT).into_any_element()
+                    } else {
+                        div().into_any_element()
+                    }),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(theme::MUTED))
+                    .child(detail),
+            );
+        mode_card = mode_card.child(row);
+    }
+    mode_card = mode_card.child(
+        div()
+            .text_xs()
+            .text_color(rgb(theme::MUTED))
+            .child("Switching modes keeps every file and never deletes from Drive."),
+    );
+    let mode_card = mode_card;
+
     let folder_card = components::card()
         .child(components::section_title(
             "Sync folder",
-            Some("Everything in this folder is mirrored to Proton Drive"),
+            Some(
+                if current_mode == Some(SyncMode::Placeholders) {
+                    "A placeholder view of your Drive; files hydrate when opened"
+                } else {
+                    "Everything in this folder is mirrored to Proton Drive"
+                },
+            ),
         ))
         .child(
             div()
@@ -157,7 +239,41 @@ pub fn render(view: &mut AppView, cx: &mut Context<AppView>) -> AnyElement {
                 )),
         );
 
-    div()
+    let mut has_notices = false;
+    let mut notices = div().flex().flex_col().gap_4();
+    if state.layout_migrated {
+        has_notices = true;
+        notices = notices.child(components::banner(
+            "Settings storage moved",
+            "This update moved the sync engine's internal database out of your sync folder. \
+             Your existing sync state was carried over automatically.",
+            theme::OK,
+            theme::OK_SOFT,
+        ));
+    }
+    if let Some(error) = &state.mount_error {
+        has_notices = true;
+        notices = notices.child(components::banner(
+            "On-demand view unavailable this session",
+            format!("The placeholder filesystem could not be mounted ({error}). Files are \
+                     being materialized in the sync folder instead; the on-demand view \
+                     returns next time the app starts."),
+            theme::WARN,
+            theme::WARN_SOFT,
+        ));
+    }
+    if matches!(state.mode_switch, ModeSwitchState::InProgress(_)) {
+        has_notices = true;
+        notices = notices.child(components::banner(
+            "Switching sync mode…",
+            "The sync engine is restarting with your new setting. This notice clears when \
+             the new mode is active.",
+            theme::ACCENT,
+            theme::INSET,
+        ));
+    }
+
+    let mut page = div()
         .id("settings-scroll")
         .flex()
         .flex_col()
@@ -171,8 +287,12 @@ pub fn render(view: &mut AppView, cx: &mut Context<AppView>) -> AnyElement {
                 .text_base()
                 .font_weight(FontWeight::SEMIBOLD)
                 .child("Preferences"),
-        )
-        .child(account_card)
+        );
+    if has_notices {
+        page = page.child(notices);
+    }
+    page.child(account_card)
+        .child(mode_card)
         .child(folder_card)
         .child(engine_card)
         .child(about_card)

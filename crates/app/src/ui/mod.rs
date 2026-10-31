@@ -15,7 +15,7 @@ use gpui::{
 };
 use pds_core::EngineState;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::actions::{Quit, ShowActivity, ShowConflicts, ShowOverview, ShowSettings, TogglePause};
 use crate::components::{self, pill, status_dot};
@@ -23,8 +23,9 @@ use crate::engine::{self, EngineService, UiCommand};
 use crate::platform;
 use crate::state::{
     self, APP_TAGLINE, APP_TITLE, ActivityFilter, AppState, AppUpdate, DISCLOSURE, LoginState,
-    Page, Phase, SignOutState, badge, pause_label,
+    ModeSwitchState, Page, Phase, SignOutState, SyncMode, badge, pause_label,
 };
+use pds_core::Db;
 use crate::theme;
 
 /// The root view. It owns the view state and bridges engine updates into the
@@ -38,7 +39,6 @@ pub struct AppView {
     focus_handle: FocusHandle,
     _pump: Task<()>,
 }
-
 impl AppView {
     pub fn new(
         root: PathBuf,
@@ -86,6 +86,7 @@ impl AppView {
     /// app should quit (the engine finished a requested shutdown).
     fn apply_update(&mut self, update: AppUpdate, cx: &mut Context<Self>) -> bool {
         let before = self.state.phase;
+        let was_mode_restart = matches!(self.state.mode_switch, ModeSwitchState::InProgress(_));
         if let AppUpdate::LoginUrl { url, .. } = &update {
             platform::open_url(url);
         }
@@ -93,6 +94,14 @@ impl AppView {
 
         if before != self.state.phase {
             info!(?before, phase = ?self.state.phase, "phase transition");
+        }
+
+        // A mode-switch shutdown: the engine thread has fully exited, so it
+        // is safe to start a fresh one into the new mode.
+        if was_mode_restart && matches!(update, AppUpdate::Exited { .. }) && !self.state.quitting {
+            info!("restarting the engine into the new sync mode");
+            self.start_engine(cx);
+            return false;
         }
 
         let quit = self.state.quitting && matches!(update, AppUpdate::Exited { .. });
@@ -139,6 +148,56 @@ impl AppView {
         cx.notify();
     }
 
+    /// Open the confirm modal for switching the sync mode.
+    pub(crate) fn request_mode_switch(&mut self, to: SyncMode, cx: &mut Context<Self>) {
+        self.state.open_mode_switch(to);
+        cx.notify();
+    }
+
+    /// Confirmed: persist the new mode, then ask the engine thread to shut
+    /// down. `apply_update` starts a fresh engine into the new mode when the
+    /// `Exited` arrives — never two engines on one root at once.
+    fn confirm_mode_switch(&mut self, cx: &mut Context<Self>) {
+        let to = match self.state.mode_switch {
+            ModeSwitchState::Confirming(to) => to,
+            _ => return,
+        };
+        self.state.mode_switch = ModeSwitchState::InProgress(to);
+        // Persist immediately (own SQLite connection; the engine's handle is
+        // separate). The next engine construction reads this value.
+        let db_path = pds_core::engine_state_dir(&self.state.root).join("state.db");
+        if let Ok(db) = Db::open(&db_path)
+            && let Err(e) = pds_core::set_sync_mode(&db, to)
+        {
+            warn!("persisting sync mode failed: {e}");
+        }
+        if let Some(service) = &self.service {
+            service.send(UiCommand::Shutdown);
+        }
+        cx.notify();
+    }
+
+    fn cancel_mode_switch(&mut self, cx: &mut Context<Self>) {
+        self.state.mode_switch = ModeSwitchState::None;
+        cx.notify();
+    }
+
+    /// Start a fresh background engine thread. Call only when the previous
+    /// thread has fully exited (Failed-phase retry, or the post-shutdown
+    /// mode switch) — never while one is running on the same root.
+    fn start_engine(&mut self, cx: &mut Context<Self>) {
+        self.state.phase = Phase::Starting;
+        self.state.fatal = None;
+        self.state.login = LoginState::Idle;
+        self.state.mount_error = None;
+        self.service = Some(engine::start(
+            self.state.root.clone(),
+            self.sidecar_cmd.clone(),
+            self.updates_tx.clone(),
+        ));
+        cx.notify();
+    }
+
     pub(crate) fn set_page(&mut self, page: Page, cx: &mut Context<Self>) {
         self.state.page = page;
         cx.notify();
@@ -153,18 +212,10 @@ impl AppView {
         platform::open_folder(&self.state.root);
     }
 
-    /// Retry after a fatal startup/runtime error: restart the engine thread
-    /// with the same configuration.
+    /// Retry after a fatal startup/runtime error: start a fresh engine
+    /// thread with the same configuration (the failed one has exited).
     fn retry(&mut self, cx: &mut Context<Self>) {
-        self.state.phase = Phase::Starting;
-        self.state.fatal = None;
-        self.state.login = LoginState::Idle;
-        self.service = Some(engine::start(
-            self.state.root.clone(),
-            self.sidecar_cmd.clone(),
-            self.updates_tx.clone(),
-        ));
-        cx.notify();
+        self.start_engine(cx);
     }
 
     /// Quit gracefully. The engine gets a chance to stop transfers and close
@@ -711,6 +762,85 @@ impl AppView {
             )
     }
 
+    /// Confirm dialog for switching the sync mode (Settings).
+    fn render_mode_switch_modal(&self, cx: &mut Context<Self>) -> Div {
+        let (title, body) = match self.state.mode_switch {
+            ModeSwitchState::Confirming(SyncMode::Mirror) => (
+                "Download everything to this folder?",
+                "Switching to mirror materializes every file in your sync folder. Files already \
+                 on disk are kept; the rest download from Drive once. Your Drive is never \
+                 deleted.",
+            ),
+            ModeSwitchState::Confirming(SyncMode::Placeholders) => (
+                "Switch to on-demand placeholders?",
+                "Files in your sync folder become placeholders at ~0 bytes. Content stays on \
+                 Drive; opening a file fetches it on demand and the local cache is capped (LRU \
+                 eviction). Nothing is deleted from Drive.",
+            ),
+            ModeSwitchState::None => ("", ""),
+            ModeSwitchState::InProgress(_) => ("Switching sync mode…", ""),
+        };
+
+        let mut panel = div()
+            .flex()
+            .flex_col()
+            .gap_4()
+            .w(px(460.0))
+            .p_6()
+            .rounded(px(14.0))
+            .bg(rgb(theme::CARD))
+            .border_1()
+            .border_color(rgb(theme::BORDER))
+            .child(
+                div()
+                    .text_lg()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child(title),
+            );
+        if !body.is_empty() {
+            panel = panel.child(
+                div()
+                    .text_sm()
+                    .text_color(rgb(theme::MUTED))
+                    .child(body),
+            );
+        }
+
+        if let ModeSwitchState::InProgress(_) = self.state.mode_switch {
+            panel = panel.child(status_dot("Switching…", theme::ACCENT));
+        } else {
+            panel = panel.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_3()
+                    .child(components::primary_button(
+                        "confirm-mode-switch",
+                        "Switch mode",
+                        cx,
+                        |this, _, _, cx| this.confirm_mode_switch(cx),
+                    ))
+                    .child(components::secondary_button(
+                        "cancel-mode-switch",
+                        "Cancel",
+                        cx,
+                        |this, _, _, cx| this.cancel_mode_switch(cx),
+                    )),
+            );
+        }
+
+        div()
+            .absolute()
+            .top_0()
+            .left_0()
+            .size_full()
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(rgba(0x05060aa8))
+            .child(panel)
+    }
+
     fn render_sign_out_modal(&self, cx: &mut Context<Self>) -> Div {
         let email = self.state.account_label();
         let mut panel = div()
@@ -801,6 +931,9 @@ impl Render for AppView {
 
         if self.state.sign_out != SignOutState::None {
             root = root.child(self.render_sign_out_modal(cx));
+        }
+        if self.state.mode_switch != ModeSwitchState::None {
+            root = root.child(self.render_mode_switch_modal(cx));
         }
         root
     }

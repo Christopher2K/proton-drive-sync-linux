@@ -4046,9 +4046,12 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "chrono",
+ "fuser",
  "gpui",
  "pds-core",
  "pds-sidecar-client",
+ "pds-vfs-linux",
+ "rusqlite",
  "tokio",
  "tracing",
  "tracing-subscriber",

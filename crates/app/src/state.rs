@@ -6,6 +6,8 @@ use std::path::PathBuf;
 
 use pds_core::{ActivityItem, ActivityKind, EngineState, EngineStatus};
 
+pub use pds_core::SyncMode;
+
 /// Mandated third-party disclosure (SPEC.md §5 / AGENT.md hard rules).
 pub const DISCLOSURE: &str =
     "This is a third-party application not officially supported by Proton.";
@@ -122,6 +124,17 @@ pub enum SignOutState {
     InProgress,
 }
 
+/// Pending sync-mode switch (destructive-ish → confirm first).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ModeSwitchState {
+    #[default]
+    None,
+    /// The confirmation modal is showing for `to`.
+    Confirming(SyncMode),
+    /// Confirmed; the engine restarts into the new mode.
+    InProgress(SyncMode),
+}
+
 /// Fork-login progress, driven by sidecar traffic.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LoginState {
@@ -157,6 +170,12 @@ pub struct AppState {
     pub sign_out: SignOutState,
     /// Currently visible page (ignored while signing in).
     pub page: Page,
+    /// One-time notice: the engine adopted the legacy in-root state DB.
+    pub layout_migrated: bool,
+    /// This session's mount failure (running materialized instead).
+    pub mount_error: Option<String>,
+    /// Pending sync-mode switch (confirm modal / restart in flight).
+    pub mode_switch: ModeSwitchState,
 }
 
 impl AppState {
@@ -174,6 +193,9 @@ impl AppState {
             quitting: false,
             sign_out: SignOutState::None,
             page: Page::Overview,
+            layout_migrated: false,
+            mount_error: None,
+            mode_switch: ModeSwitchState::None,
         }
     }
 
@@ -211,6 +233,13 @@ impl AppState {
     pub fn confirm_sign_out(&mut self) {
         if self.sign_out == SignOutState::Confirming {
             self.sign_out = SignOutState::InProgress;
+        }
+    }
+
+    /// Open the sync-mode switch confirm modal for `to`.
+    pub fn open_mode_switch(&mut self, to: SyncMode) {
+        if self.phase == Phase::Running && self.mode_switch == ModeSwitchState::None {
+            self.mode_switch = ModeSwitchState::Confirming(to);
         }
     }
 
@@ -256,7 +285,13 @@ pub enum AppUpdate {
     /// `auth.loginFork` failed; the sign-in screen offers a retry.
     LoginFailed { error: String },
     /// Engine constructed and running.
-    EngineStarted { email: String },
+    EngineStarted,
+    /// The engine adopted the pre-0.3 in-root state DB (one-time layout
+    /// migration); purely informational.
+    LayoutMigrated,
+    /// The FUSE placeholder view could not be mounted; this session runs
+    /// materialized instead (shown as a Settings notice).
+    MountUnavailable { error: String },
     /// Periodic engine status snapshot.
     Status(EngineStatus),
     /// One activity-feed entry from the engine.
@@ -296,11 +331,16 @@ pub fn apply(state: &mut AppState, update: &AppUpdate) {
         AppUpdate::LoginFailed { error } => {
             state.login = LoginState::Failed(error.clone());
         }
-        AppUpdate::EngineStarted { email } => {
-            state.email = Some(email.clone());
+        AppUpdate::EngineStarted => {
             state.phase = Phase::Running;
             state.fatal = None;
             state.page = Page::Overview;
+        }
+        AppUpdate::LayoutMigrated => {
+            state.layout_migrated = true;
+        }
+        AppUpdate::MountUnavailable { error } => {
+            state.mount_error = Some(error.clone());
         }
         AppUpdate::Status(status) => {
             state.status = Some(status.clone());
@@ -330,11 +370,19 @@ pub fn apply(state: &mut AppState, update: &AppUpdate) {
             state.errored.clear();
             state.sign_out = SignOutState::None;
             state.page = Page::Overview;
+            state.mount_error = None;
         }
         AppUpdate::Exited { reason } => {
             if !state.quitting {
-                state.phase = Phase::Failed;
-                state.fatal = Some(format!("sync engine stopped: {reason}"));
+                if matches!(state.mode_switch, ModeSwitchState::InProgress(_)) {
+                    // Expected stop mid mode-switch: the UI restarts the
+                    // engine thread into the new mode (no failure).
+                    state.mode_switch = ModeSwitchState::None;
+                    state.phase = Phase::Starting;
+                } else {
+                    state.phase = Phase::Failed;
+                    state.fatal = Some(format!("sync engine stopped: {reason}"));
+                }
             }
         }
     }
@@ -405,6 +453,7 @@ mod tests {
             queued_tombstones: 2,
             errored_nodes: 0,
             conflicted_nodes: 0,
+            mode: SyncMode::Placeholders,
         }
     }
 
@@ -440,12 +489,14 @@ mod tests {
 
         apply(
             &mut s,
-            &AppUpdate::EngineStarted {
+            &AppUpdate::AuthOk {
                 email: "a@b.c".into(),
             },
         );
-        assert_eq!(s.phase, Phase::Running);
         assert_eq!(s.email.as_deref(), Some("a@b.c"));
+
+        apply(&mut s, &AppUpdate::EngineStarted);
+        assert_eq!(s.phase, Phase::Running);
     }
 
     #[test]
@@ -522,12 +573,7 @@ mod tests {
     #[test]
     fn badge_reflects_guard_pause() {
         let mut s = AppState::new(PathBuf::from("/tmp/root"));
-        apply(
-            &mut s,
-            &AppUpdate::EngineStarted {
-                email: "a@b.c".into(),
-            },
-        );
+        apply(&mut s, &AppUpdate::EngineStarted);
         apply(&mut s, &AppUpdate::Status(status(EngineState::GuardPaused)));
         assert_eq!(badge(&s), "Delete guard");
     }
@@ -556,14 +602,28 @@ mod tests {
     }
 
     #[test]
-    fn sign_out_flow_returns_to_login() {
+    fn mode_switch_exit_is_an_expected_restart_not_a_failure() {
         let mut s = AppState::new(PathBuf::from("/tmp/root"));
+        apply(&mut s, &AppUpdate::EngineStarted);
+        s.open_mode_switch(SyncMode::Mirror);
+        assert!(matches!(s.mode_switch, ModeSwitchState::Confirming(SyncMode::Mirror)));
+        s.mode_switch = ModeSwitchState::InProgress(SyncMode::Mirror);
+
         apply(
             &mut s,
-            &AppUpdate::EngineStarted {
-                email: "a@b.c".into(),
+            &AppUpdate::Exited {
+                reason: "shutdown".into(),
             },
         );
+        assert_eq!(s.phase, Phase::Starting);
+        assert_eq!(s.mode_switch, ModeSwitchState::None);
+        assert!(s.fatal.is_none());
+    }
+
+    #[test]
+    fn sign_out_flow_returns_to_login() {
+        let mut s = AppState::new(PathBuf::from("/tmp/root"));
+        apply(&mut s, &AppUpdate::EngineStarted);
         apply(&mut s, &AppUpdate::Status(status(EngineState::Running)));
         apply(
             &mut s,

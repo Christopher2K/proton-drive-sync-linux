@@ -2,16 +2,30 @@
 //!
 //! A single dedicated thread owns the Node sidecar and the sync engine. The
 //! GPUI thread never touches tokio types: commands go out through an mpsc
-//! channel and progress comes back as [`AppUpdate`] values. This keeps the UI
-//! responsive even while a large transfer or a key-unlock operation is in
+//! channel and progress comes back as [`AppUpdate`] values. This keeps the
+//! UI responsive even while a large transfer or a key-unlock operation is in
 //! flight.
+//!
+//! Sync mode (F5): new roots default to placeholder mode and the app mounts
+//! the FUSE placeholder view AT the sync root — `~/ProtonDrive` shows the
+//! whole Drive with ~0-byte placeholder files that hydrate on open and an
+//! LRU-capped local cache. The engine's state (SQLite DB, VFS backing
+//! cache, control socket) lives under
+//! `$XDG_DATA_HOME/proton-drive-sync/roots/<hash>/`, OUTSIDE the root: a
+//! directory cannot serve both its real contents and a FUSE view mounted
+//! over it, and running the DB through the mount would risk corruption.
+//! `PDS_SYNC_MODE=mirror` (or the Settings toggle) selects the classic
+//! fully materialized folder instead.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use pds_core::{Db, Engine, EngineConfig, RETRY_BASE_DEFAULT, STATE_DIR};
+use pds_core::{
+    Db, Engine, EngineConfig, EngineHandle, EVICTION_CAP_DEFAULT, RETRY_BASE_DEFAULT, SyncMode,
+    engine_state_dir,
+};
 use pds_sidecar_client::types::error_codes;
 use pds_sidecar_client::{Notification, SidecarApi, spawn::spawn_sidecar};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
@@ -127,21 +141,17 @@ async fn run(
         };
         info!(email = %email, root = %root.display(), "starting sync engine");
 
-        let db_path = root.join(STATE_DIR).join("state.db");
-        let (engine, handle) = Engine::new(
+        // The single notification stream (taken once at spawn): the login
+        // flow borrowed it; ownership moves into the engine session now.
+        match engine_session(
             client.clone(),
+            root.clone(),
             notifications,
-            EngineConfig {
-                db_path: db_path.clone(),
-                root: root.clone(),
-                retry_base: RETRY_BASE_DEFAULT,
-                placeholders: false,
-            eviction_cap: None,
-            },
-        )?;
-        let _ = updates.send(AppUpdate::EngineStarted { email });
-
-        match drive_engine(engine, handle, &db_path, &mut cmds, updates).await {
+            &mut cmds,
+            updates,
+        )
+        .await
+        {
             EngineExit::Quit(reason) => {
                 let _ = updates.send(AppUpdate::Exited { reason });
                 return Ok(());
@@ -166,15 +176,349 @@ async fn run(
     }
 }
 
-/// Run one engine session until a UI command or engine exit ends it.
-async fn drive_engine(
-    engine: Engine<pds_sidecar_client::SidecarClient>,
-    handle: pds_core::EngineHandle,
+/// One signed-in engine session: resolve layout + mode, mount the FUSE
+/// placeholder view (when applicable), run the engine, tear down in
+/// reverse order. A mode switch from Settings lands here on the next
+/// sign-in-less restart: the UI restarts the whole service, which re-enters
+/// this function and picks up the new persisted mode.
+async fn engine_session(
+    client: Arc<pds_sidecar_client::SidecarClient>,
+    root: PathBuf,
+    notifications: tokio::sync::mpsc::Receiver<Notification>,
+    cmds: &mut UnboundedReceiver<UiCommand>,
+    updates: &UnboundedSender<AppUpdate>,
+) -> EngineExit {
+    // Mode for THIS session, from $PDS_SYNC_MODE > persisted `sync_mode` >
+    // defaults. A legacy in-root state DB (pre-0.3 mirror user) defaults to
+    // mirror so an upgrade changes nothing for them; brand-new roots get
+    // placeholders (F5). The engine itself re-resolves the persisted value
+    // authoritatively; this pre-read only has to agree on the layout.
+    let state_dir = engine_state_dir(&root);
+    let legacy_db = root.join(pds_core::STATE_DIR).join("state.db");
+    let mode = if let Some(env) = SyncMode::from_env() {
+        env
+    } else if state_dir.join("state.db").is_file() {
+        read_persisted_mode(&state_dir).unwrap_or_default()
+    } else if legacy_db.is_file() {
+        SyncMode::Mirror
+    } else {
+        SyncMode::default()
+    };
+
+    let layout = match prepare_layout(&root) {
+        Ok(l) => l,
+        Err(e) => return EngineExit::Quit(format!("{e:#}")),
+    };
+    if layout.adopted_legacy_db {
+        let _ = updates.send(AppUpdate::LayoutMigrated);
+    }
+
+    let db_path = layout.state_dir.join("state.db");
+
+    // Decide placeholder vs mirror BEFORE building the engine: the engine
+    // consumes the sidecar's single notification stream, so a later
+    // fallback rebuild would be deaf to remote events. Probe FUSE with a
+    // throwaway mount; a failure downgrades THIS SESSION to mirror (the
+    // persisted mode stays placeholders — next start retries the mount).
+    let want_placeholders = mode == SyncMode::Placeholders;
+    let placeholders = if want_placeholders && !fuse_available() {
+        warn!("FUSE unavailable; running mirror mode for this session");
+        let _ = updates.send(AppUpdate::MountUnavailable {
+            error: "FUSE is not available on this system".into(),
+        });
+        false
+    } else {
+        want_placeholders
+    };
+
+    let (engine, handle) = match build_engine(
+        client,
+        notifications,
+        &layout,
+        db_path.clone(),
+        placeholders,
+    ) {
+        Ok(v) => v,
+        Err(e) => return EngineExit::Quit(format!("{e:#}")),
+    };
+    let engine_task = tokio::spawn(engine.run());
+
+    let mut mount = None;
+    if placeholders {
+        // Mount only AFTER the engine's initial sync: its first-run local
+        // scan and the layout conversion must see the REAL folder (the
+        // mount shadows the root and serves an empty tree until the engine
+        // publishes a snapshot, which would hide every pre-existing local
+        // file from the scan). The watcher-ready flag flips right after
+        // the initial sync — exactly when the mount can go up.
+        if !handle.wait_for_watcher(Duration::from_secs(600)).await {
+            warn!("engine readiness timed out; mounting the placeholder view anyway");
+        }
+        match mount_placeholder_view(&layout, &handle) {
+            Ok(session) => mount = Some(session),
+            Err(e) => {
+                warn!(
+                    root = %layout.root.display(),
+                    error = %e,
+                    "placeholder mount failed after the FUSE probe"
+                );
+                let _ = updates.send(AppUpdate::MountUnavailable {
+                    error: format!("{e:#}"),
+                });
+                // No safe fallback: a mirror rebuild would never receive
+                // remote events (the notification stream is spent), and a
+                // placeholder engine without its mount sees no local
+                // writes. Stop and let the user retry (Restart button).
+                let _ = handle.shutdown().await;
+                let _ = engine_task.await;
+                return EngineExit::Quit(
+                    "The placeholder view could not be mounted even though FUSE is available; \
+                     restart the app to retry"
+                        .into(),
+                );
+            }
+        }
+    }
+
+    let _ = updates.send(AppUpdate::EngineStarted);
+    let exit = drive_engine_task(engine_task, handle, &db_path, cmds, updates).await;
+
+    if let Some(session) = mount {
+        info!(mount = %layout.root.display(), "unmounting placeholder view");
+        drop(session);
+        unmount_lazy(&layout.root);
+    }
+    exit
+}
+
+/// Cheap FUSE liveness probe: mount a throwaway placeholder filesystem at
+/// a temp dir, then unmount. Deciding mountability up front (rather than
+/// after the engine owns the notification stream) keeps the mirror
+/// fallback able to receive remote events.
+fn fuse_available() -> bool {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    let probe = std::env::temp_dir().join(format!(
+        "pds-fuse-probe-{}-{seq}",
+        std::process::id()
+    ));
+    let mnt = probe.join("mnt");
+    if std::fs::create_dir_all(&mnt).is_err() {
+        return false;
+    }
+    let store = pds_core::Store::new();
+    let fs = pds_vfs_linux::PdsFs::new(
+        store,
+        probe.join("state"),
+        probe.join("backing"),
+    );
+    let mut cfg = fuser::Config::default();
+    cfg.mount_options = vec![fuser::MountOption::FSName("pds-probe".into())];
+    let ok = match fuser::Session::new(fs, &mnt, &cfg) {
+        Ok(session) => {
+            drop(session);
+            let target = mnt.to_string_lossy().into_owned();
+            let _ = std::process::Command::new("fusermount3")
+                .args(["-uz", &target])
+                .status();
+            let _ = std::process::Command::new("fusermount")
+                .args(["-uz", &target])
+                .status();
+            true
+        }
+        Err(_) => false,
+    };
+    let _ = std::fs::remove_dir_all(&probe);
+    ok
+}
+
+/// Mount the FUSE placeholder view at the sync root.
+fn mount_placeholder_view(
+    layout: &RootLayout,
+    handle: &EngineHandle,
+) -> Result<fuser::Session<pds_vfs_linux::PdsFs>> {
+    let store = handle
+        .store()
+        .cloned()
+        .context("engine has no VFS store (not in placeholder mode)")?;
+    // The fs reserves `.pds` as a proxy for its `state_dir` (a CLI-mount
+    // feature so the control socket stays reachable). The app's real state
+    // dir holds the LIVE SQLite DB and the backing content cache — serving
+    // it inside the user-facing mount would let a stray `rm -rf .pds` (or a
+    // backup tool) destroy sync state behind the engine's back. Hand the
+    // mount an empty dir instead: `.pds` shows up as an empty folder.
+    let proxy_dir = layout.state_dir.join("mount");
+    std::fs::create_dir_all(&proxy_dir)?;
+    let fs = pds_vfs_linux::PdsFs::new(store, proxy_dir, layout.backing_dir.clone());
+    let mut cfg = fuser::Config::default();
+    cfg.mount_options = vec![
+        fuser::MountOption::FSName("proton-drive-sync".into()),
+        fuser::MountOption::Subtype("pds".into()),
+    ];
+    Ok(fuser::Session::new(fs, &layout.root, &cfg)?)
+}
+
+/// Sync-root layout: where the engine state and (in placeholder mode) the
+/// backing cache live. `prepare_layout` migrates legacy state out of the
+/// root; it never deletes anything.
+struct RootLayout {
+    /// The canonical root path (the FUSE mountpoint in placeholder mode).
+    root: PathBuf,
+    /// Engine state dir: state.db, the `backing/` VFS cache, root marker.
+    state_dir: PathBuf,
+    /// VFS backing cache in placeholder mode (outside the root).
+    backing_dir: PathBuf,
+    /// True when the state DB was just adopted from the legacy in-root
+    /// location (`<root>/.pds/state.db`).
+    adopted_legacy_db: bool,
+}
+
+/// Resolve and prepare the local layout for `root`. Creates the state dir,
+/// adopts a legacy in-root state DB when present (verified copy, then the
+/// original is removed), and writes the root marker. Never deletes content.
+fn prepare_layout(root: &Path) -> Result<RootLayout> {
+    let root = root
+        .canonicalize()
+        .with_context(|| format!("sync root {}", root.display()))?;
+    let state_dir = engine_state_dir(&root);
+    std::fs::create_dir_all(&state_dir)
+        .with_context(|| format!("create engine state dir {}", state_dir.display()))?;
+    let db_path = state_dir.join("state.db");
+    let mut adopted_legacy_db = false;
+
+    if !db_path.exists() {
+        let legacy_db = root.join(pds_core::STATE_DIR).join("state.db");
+        if legacy_db.is_file() {
+            std::fs::copy(&legacy_db, &db_path).with_context(|| {
+                format!(
+                    "adopting state DB from {} to {}",
+                    legacy_db.display(),
+                    db_path.display()
+                )
+            })?;
+            // The legacy WAL/SHM sidecars belong to the old DB; the adopted
+            // copy was checkpointed into the main file at close.
+            for suffix in ["-wal", "-shm"] {
+                std::fs::remove_file(format!("{}{suffix}", legacy_db.display())).ok();
+            }
+            // Only drop the original once the copy provably opens as the
+            // same database — a lingering stale copy could be mistaken for
+            // live state by older/future code paths.
+            let verified = rusqlite::Connection::open_with_flags(
+                &db_path,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )
+            .and_then(|c| c.query_row("SELECT count(*) FROM sqlite_master", [], |r| r.get::<_, i64>(0)))
+            .map(|n| n >= 0)
+            .unwrap_or(false);
+            if !verified {
+                std::fs::remove_file(&db_path).ok();
+                anyhow::bail!(
+                    "adopted state DB at {} did not verify; keeping the original at {}",
+                    db_path.display(),
+                    legacy_db.display()
+                );
+            }
+            std::fs::remove_file(&legacy_db).with_context(|| {
+                format!("removing adopted legacy state DB {}", legacy_db.display())
+            })?;
+            adopted_legacy_db = true;
+            info!(
+                from = %legacy_db.display(),
+                to = %db_path.display(),
+                "adopted legacy in-root state DB"
+            );
+        }
+    }
+    std::fs::write(state_dir.join("root"), root.to_string_lossy().as_bytes())?;
+
+    Ok(RootLayout {
+        root,
+        backing_dir: state_dir.join("backing"),
+        state_dir,
+        adopted_legacy_db,
+    })
+}
+
+/// Read the persisted sync mode straight from the state DB (read-only — the
+/// engine owns the writable handle). `None` → caller default.
+fn read_persisted_mode(state_dir: &Path) -> Option<SyncMode> {
+    let conn = rusqlite::Connection::open_with_flags(
+        state_dir.join("state.db"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .ok()?;
+    let value: String = conn
+        .query_row(
+            &format!(
+                "SELECT value FROM meta WHERE key = '{}'",
+                pds_core::META_SYNC_MODE
+            ),
+            [],
+            |row| row.get(0),
+        )
+        .ok()?;
+    SyncMode::from_meta_value(Some(&value))
+}
+
+/// Construct the engine with the layout resolved above. `placeholders` is
+/// this session's intent; the engine re-reads the persisted mode and keeps
+/// it when they disagree (the persisted value always wins).
+fn build_engine(
+    client: Arc<pds_sidecar_client::SidecarClient>,
+    notifications: tokio::sync::mpsc::Receiver<Notification>,
+    layout: &RootLayout,
+    db_path: PathBuf,
+    placeholders: bool,
+) -> Result<(Engine<pds_sidecar_client::SidecarClient>, EngineHandle)> {
+    Engine::new(
+        client,
+        notifications,
+        EngineConfig {
+            db_path,
+            root: layout.root.clone(),
+            retry_base: RETRY_BASE_DEFAULT,
+            placeholders,
+            eviction_cap: Some(EVICTION_CAP_DEFAULT),
+            backing_dir: Some(layout.backing_dir.clone()),
+            // Placeholder sessions mount FUSE AT the root: writes arrive
+            // through the VFS store queues, not inotify (watching the
+            // mount would double-upload write-through files). Mirror
+            // sessions have a plain folder and need the watcher (F2).
+            watch_local_writes: !placeholders,
+        },
+    )
+}
+
+/// Best-effort lazy unmount (`fusermount -uz`) after dropping the session.
+fn unmount_lazy(root: &Path) {
+    let target = root.to_string_lossy().into_owned();
+    let ok = std::process::Command::new("fusermount3")
+        .args(["-uz", &target])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+        || std::process::Command::new("fusermount")
+            .args(["-uz", &target])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+    if !ok {
+        warn!(root = %root.display(), "lazy unmount failed (will disappear at process exit)");
+    }
+}
+
+/// Run one engine session until a UI command or engine exit ends it. The
+/// engine task is already spawned (the caller may have waited on readiness
+/// or remounted around it).
+async fn drive_engine_task(
+    mut engine_task: tokio::task::JoinHandle<Result<()>>,
+    handle: EngineHandle,
     db_path: &Path,
     cmds: &mut UnboundedReceiver<UiCommand>,
     updates: &UnboundedSender<AppUpdate>,
 ) -> EngineExit {
-    let mut engine_task = tokio::spawn(engine.run());
     let mut activity_rx = handle.subscribe_activity();
     let mut tick = tokio::time::interval(Duration::from_secs(1));
     let mut db = None;
