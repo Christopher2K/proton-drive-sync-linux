@@ -7,6 +7,9 @@ actions!(
     [
         Quit,
         TogglePause,
+        OpenDashboard,
+        OpenSyncFolder,
+        OpenSettings,
         ShowOverview,
         ShowActivity,
         ShowConflicts,

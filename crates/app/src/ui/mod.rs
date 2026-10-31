@@ -67,8 +67,11 @@ impl AppView {
             }
         });
 
+        let mut state = AppState::new(root);
+        state.autostart_enabled = crate::autostart::is_enabled();
+
         Self {
-            state: AppState::new(root),
+            state,
             filter: ActivityFilter::All,
             sidecar_cmd,
             service: Some(service),
@@ -105,6 +108,7 @@ impl AppView {
         }
 
         let quit = self.state.quitting && matches!(update, AppUpdate::Exited { .. });
+        crate::tray::refresh(cx, &self.state);
         cx.notify();
         quit
     }
@@ -193,6 +197,22 @@ impl AppView {
         }
         if let Some(service) = &self.service {
             service.send(UiCommand::SetCacheCap(cap));
+        }
+        cx.notify();
+    }
+
+    /// Settings: install/remove the XDG autostart entry. The decision is
+    /// persisted so a later launch never re-enables it behind the user's
+    /// back.
+    pub(crate) fn set_autostart(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        match crate::autostart::set_enabled(enabled) {
+            Ok(()) => {
+                self.state.autostart_enabled = enabled;
+                self.state.autostart_error = None;
+            }
+            Err(e) => {
+                self.state.autostart_error = Some(format!("{e:#}"));
+            }
         }
         cx.notify();
     }

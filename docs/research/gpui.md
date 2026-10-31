@@ -540,3 +540,34 @@ tracing = "0.1"
    missing) — fix: `gpui = { features = ["runtime_shaders"] }`.
 5. `Icon::system_symbol` + scale_factor/template setters are macOS-only — cross-platform
    icon code needs cfg guards.
+
+## Linux errata (found during M5 background-service implementation, verified against gpui 0.2.2 / gpui-tray 0.3.0)
+
+The §4–§5 "windowless menu-bar app" shape is **macOS-only**. On Linux the
+constraints are different and stricter:
+
+1. **The event loop dies with the last window.** Both Linux backends call
+   `signal.stop()` when the final window is *dropped* (Wayland `client.rs`
+   `drop_window`, X11 `client.rs` `drop_window` — each checks
+   `state.windows.is_empty()`). `Application::run` then returns and the process
+   exits. The zero-window background-running recommended in §5 is impossible
+   on Linux; a background service must keep its window alive and veto closes
+   instead of destroying them.
+2. **No hide, no deferred show.** There is no `Window::hide`/`set_visible`, and
+   `WindowOptions.show` is never read by the Linux backend (always mapped at
+   open). The only close-to-tray move: veto in `on_window_should_close` (return
+   `false`), then `window.minimize_window()`. Restore via
+   `window.activate_window()` (raise/focus) — but un-minimizing this way is
+   compositor-dependent on Wayland and may not work everywhere (e.g. niri).
+   Test per compositor; a tray "Open Dashboard" action that re-activates is
+   the reliable restore path when a tray host exists.
+3. **The tray needs a StatusNotifier host, and its absence is silent.**
+   gpui-tray's Linux backend is StatusNotifierItem over zbus; with no
+   `org.kde.StatusNotifierWatcher` owner on the session bus (plain niri/sway
+   session without a tray-capable bar) `Tray::builder().build()` still
+   succeeds but nothing ever appears. Probe for the watcher before relying on
+   the tray — one `NameHasOwner` call on `zbus::Connection::session()` (see
+   `crates/app/src/tray.rs::host_available()`) — and degrade gracefully when
+   absent: at login open the dashboard instead of minimizing, and make
+   closing the window quit, so the window can never become unreachable
+   (see the close handler in `crates/app/src/main.rs`).
