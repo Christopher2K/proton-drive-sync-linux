@@ -17,7 +17,7 @@ use pds_core::EngineState;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tracing::{info, warn};
 
-use crate::actions::{Quit, ShowActivity, ShowConflicts, ShowOverview, ShowSettings, TogglePause};
+use crate::actions::{CloseWindow, Quit, ShowActivity, ShowConflicts, ShowOverview, ShowSettings, TogglePause};
 use crate::components::{self, pill, status_dot};
 use crate::engine::{self, EngineService, UiCommand};
 use crate::platform;
@@ -251,6 +251,24 @@ impl AppView {
     /// thread with the same configuration (the failed one has exited).
     fn retry(&mut self, cx: &mut Context<Self>) {
         self.start_engine(cx);
+    }
+
+    /// Close the window. Mirrors the window manager's close request: with a
+    /// tray available the window is hidden (restorable from the tray);
+    /// otherwise the app quits. Bound to ctrl-w, which is the only way to
+    /// close the window on compositors (e.g. niri) that show no decorations.
+    pub(crate) fn close_window(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.state.quitting {
+            return;
+        }
+        let tray_available = cx
+            .try_global::<crate::tray::TrayAvailable>()
+            .is_some_and(|flag| flag.0);
+        if tray_available {
+            window.minimize_window();
+        } else {
+            self.request_quit(cx);
+        }
     }
 
     /// Quit gracefully. The engine gets a chance to stop transfers and close
@@ -957,6 +975,9 @@ impl Render for AppView {
             .text_sm()
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(|this, _: &Quit, _, cx| this.request_quit(cx)))
+            .on_action(
+                cx.listener(|this, _: &CloseWindow, window, cx| this.close_window(window, cx)),
+            )
             .on_action(cx.listener(|this, _: &TogglePause, _, cx| this.toggle_pause(cx)))
             .on_action(cx.listener(|this, _: &ShowOverview, _, cx| this.set_page(Page::Overview, cx)))
             .on_action(cx.listener(|this, _: &ShowActivity, _, cx| this.set_page(Page::Activity, cx)))
@@ -978,6 +999,7 @@ impl Render for AppView {
 pub fn key_bindings() -> Vec<KeyBinding> {
     vec![
         KeyBinding::new("ctrl-q", Quit, None),
+        KeyBinding::new("ctrl-w", CloseWindow, None),
         KeyBinding::new("ctrl-p", TogglePause, None),
         KeyBinding::new("ctrl-1", ShowOverview, None),
         KeyBinding::new("ctrl-2", ShowActivity, None),
