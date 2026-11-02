@@ -2,6 +2,7 @@
 //! and a hand-scripted server for out-of-order/error edge cases.
 
 use pds_sidecar_client::types::error_codes;
+use pds_sidecar_client::types::TrashResult;
 use pds_sidecar_client::{JsonRpcClient, MockSidecar, Notification, SidecarApi};
 use serde_json::json;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -25,6 +26,32 @@ async fn protocol_error_maps_code() {
     // "Documents" already exists under root → createFolder must fail with 1005.
     let err = client.create_folder("root", "Documents").await.unwrap_err();
     assert_eq!(err.code(), Some(error_codes::CONFLICT));
+}
+
+/// Trash → list → restore round trip, plus per-node error results for
+/// unknown uids (`drive.restore` mirrors `drive.trash`'s result shape).
+#[tokio::test]
+async fn restore_round_trip() {
+    let (client, handle) = MockSidecar::new().connect();
+
+    let uid = handle.find_uid("root", "hello.txt").unwrap();
+    assert!(client.trash(std::slice::from_ref(&uid)).await.unwrap()[0].ok);
+    assert_eq!(handle.child_names("root"), ["Documents"]);
+
+    let trashed = client.list_trashed().await.unwrap();
+    assert_eq!(trashed.len(), 1);
+    assert_eq!(trashed[0].uid, uid);
+
+    let results = client.restore(&[uid.clone(), "no-such".to_string()]).await.unwrap();
+    assert_eq!(results.len(), 2);
+    assert_eq!(results[0], TrashResult { uid: uid.clone(), ok: true, error: None });
+    assert!(!results[1].ok);
+    assert!(results[1].error.is_some());
+
+    // Restored node is visible as a child again.
+    assert_eq!(handle.child_names("root"), ["Documents", "hello.txt"]);
+    assert!(client.list_trashed().await.unwrap().is_empty());
+    assert_eq!(handle.restored_uids(), vec![uid, "no-such".to_string()]);
 }
 
 #[tokio::test]

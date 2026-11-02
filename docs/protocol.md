@@ -39,6 +39,8 @@ Node objects: `{"uid": str, "parentUid": str|null, "name": str, "type": "file"|"
 - `drive.createFolder` `{"parentUid", "name"}` → node. Name collision → error `1005`.
 - `drive.getAvailableName` `{"parentUid", "name"}` → `{"name"}` (for F7 keep-both).
 - `drive.trash` `{"uids": [str]}` → `{"results": [{"uid", "ok": bool, "error"?}]}` — trash only, never hard-delete.
+- `drive.restore` `{"uids": [str]}` → `{"results": [{"uid", "ok": bool, "error"?}]}` — restores trashed nodes (path back from trash; F3.4).
+- `drive.listTrashed` → `{"nodes": [...]}` — current trash contents (one level; trashed subtree roots as reported by the SDK).
 
 ## Transfers (async)
 
