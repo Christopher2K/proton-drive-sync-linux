@@ -128,6 +128,8 @@ export class SidecarService {
     this.rpc.method("drive.createFolder", (p) => this.driveCreateFolder(p));
     this.rpc.method("drive.getAvailableName", (p) => this.driveGetAvailableName(p));
     this.rpc.method("drive.trash", (p) => this.driveTrash(p));
+    this.rpc.method("drive.restore", (p) => this.driveRestore(p));
+    this.rpc.method("drive.listTrashed", () => this.driveListTrashed());
 
     this.rpc.method("drive.upload", (p) => this.driveUpload(p));
     this.rpc.method("drive.download", (p) => this.driveDownload(p));
@@ -304,6 +306,28 @@ export class SidecarService {
       results.push(r.ok ? { uid: r.uid, ok: true } : { uid: r.uid, ok: false, error: String(r.error) });
     }
     return { results };
+  }
+
+  private async driveRestore(params: unknown): Promise<{ results: unknown[] }> {
+    const { uids } = requireParams<{ uids: string[] }>(params, ["uids"]);
+    if (!Array.isArray(uids)) throw new RpcError(RPC.invalidParams, '"uids" must be an array');
+    const results: { uid: string; ok: boolean; error?: string }[] = [];
+    for await (const r of this.requireClient().restoreNodes(uids)) {
+      results.push(r.ok ? { uid: r.uid, ok: true } : { uid: r.uid, ok: false, error: String(r.error) });
+    }
+    return { results };
+  }
+
+  private async driveListTrashed(): Promise<{ nodes: ProtoNode[] }> {
+    const client = this.requireClient();
+    const uids: string[] = [];
+    for await (const uid of client.iterateTrashedNodeUids()) uids.push(uid);
+    const nodes: ProtoNode[] = [];
+    for await (const node of client.iterateNodes(uids)) {
+      if ("missingUid" in node) continue;
+      nodes.push(this.toProtoNode(node));
+    }
+    return { nodes };
   }
 
   // -------------------------------------------------------------- transfers

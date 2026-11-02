@@ -28,6 +28,8 @@ pub trait SidecarApi: Send + Sync {
     async fn create_folder(&self, parent_uid: &str, name: &str) -> Result<Node, Error>;
     async fn get_available_name(&self, parent_uid: &str, name: &str) -> Result<String, Error>;
     async fn trash(&self, uids: &[String]) -> Result<Vec<TrashResult>, Error>;
+    async fn restore(&self, uids: &[String]) -> Result<Vec<TrashResult>, Error>;
+    async fn list_trashed(&self) -> Result<Vec<Node>, Error>;
 
     // Transfers (async — completion arrives as notifications)
     async fn upload(&self, params: &UploadParams) -> Result<String, Error>;
@@ -176,6 +178,21 @@ impl SidecarApi for SidecarClient {
             .call("drive.trash", json!({ "uids": uids }))
             .await?;
         serde_json::from_value(Self::get(&result, "results")?.clone())
+            .map_err(|e| Error::Malformed(e.to_string()))
+    }
+
+    async fn restore(&self, uids: &[String]) -> Result<Vec<TrashResult>, Error> {
+        let result = self
+            .rpc
+            .call("drive.restore", json!({ "uids": uids }))
+            .await?;
+        serde_json::from_value(Self::get(&result, "results")?.clone())
+            .map_err(|e| Error::Malformed(e.to_string()))
+    }
+
+    async fn list_trashed(&self) -> Result<Vec<Node>, Error> {
+        let result = self.rpc.call("drive.listTrashed", json!({})).await?;
+        serde_json::from_value(Self::get(&result, "nodes")?.clone())
             .map_err(|e| Error::Malformed(e.to_string()))
     }
 

@@ -98,6 +98,18 @@ impl MockHandle {
             .collect()
     }
 
+    /// Uids passed to `drive.restore`, in call order.
+    pub fn restored_uids(&self) -> Vec<String> {
+        self.state
+            .lock()
+            .unwrap()
+            .calls
+            .iter()
+            .filter(|(m, _)| m == "restore")
+            .flat_map(|(_, u)| u.clone())
+            .collect()
+    }
+
     /// Names passed to `drive.upload`, in call order.
     pub fn uploaded_names(&self) -> Vec<String> {
         self.state
@@ -542,6 +554,37 @@ impl MockSidecar {
                     })
                     .collect();
                 vec![ok(json!({"results": results}))]
+            }
+            "drive.restore" => {
+                let mut st = self.state.lock().unwrap();
+                let uids: Vec<String> = params
+                    .get("uids")
+                    .and_then(Value::as_array)
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(Value::as_str)
+                            .map(str::to_string)
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                st.calls.push(("restore".into(), uids.clone()));
+                let results: Vec<Value> = uids
+                    .iter()
+                    .map(|u| match st.nodes.get_mut(u) {
+                        Some(n) => {
+                            n.trashed = false;
+                            json!({"uid": u, "ok": true, "error": null})
+                        }
+                        None => json!({"uid": u, "ok": false, "error": "no such node"}),
+                    })
+                    .collect();
+                vec![ok(json!({"results": results}))]
+            }
+            "drive.listTrashed" => {
+                let st = self.state.lock().unwrap();
+                let mut nodes: Vec<&MockNode> = st.nodes.values().filter(|n| n.trashed).collect();
+                nodes.sort_by(|a, b| a.name.cmp(&b.name));
+                vec![ok(json!({"nodes": nodes.iter().map(|n| st.node_json(n)).collect::<Vec<_>>()}))]
             }
             "drive.upload" => {
                 let mut st = self.state.lock().unwrap();

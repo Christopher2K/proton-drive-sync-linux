@@ -96,6 +96,22 @@ enum Cmd {
         /// Root-relative path to unpin.
         path: String,
     },
+    /// Inspect / recover the remote trash (F3.4: deletes are trash-only).
+    Trash {
+        #[command(subcommand)]
+        cmd: TrashCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum TrashCmd {
+    /// List trashed nodes (uid, type, name).
+    List,
+    /// Restore trashed nodes back into Drive by uid.
+    Restore {
+        /// Node uids to restore (see `pds trash list`).
+        uids: Vec<String>,
+    },
 }
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
@@ -123,6 +139,44 @@ async fn main() -> Result<()> {
         } => mount(folder, mountpoint, cache_cap, cli.sidecar_cmd.as_deref()).await,
         Cmd::Pin { folder, path } => control::send_pin("pin", &folder, &path).await,
         Cmd::Unpin { folder, path } => control::send_pin("unpin", &folder, &path).await,
+        Cmd::Trash { cmd } => trash(cmd, cli.sidecar_cmd.as_deref()).await,
+    }
+}
+
+async fn trash(cmd: TrashCmd, sidecar_cmd: Option<&str>) -> Result<()> {
+    let (client, _child) = spawn::spawn_sidecar(sidecar_cmd)?;
+    match cmd {
+        TrashCmd::List => {
+            let nodes = client.list_trashed().await.context("drive.listTrashed")?;
+            if nodes.is_empty() {
+                println!("Trash is empty.");
+                return Ok(());
+            }
+            for n in nodes {
+                println!("{}\t{}\t{}", n.uid, if n.is_folder() { "folder" } else { "file" }, n.name);
+            }
+            Ok(())
+        }
+        TrashCmd::Restore { uids } => {
+            if uids.is_empty() {
+                bail!("no uids given — run `pds trash list` to find them");
+            }
+            let results = client.restore(&uids).await.context("drive.restore")?;
+            let mut failed = false;
+            for r in results {
+                match (r.ok, &r.error) {
+                    (true, _) => println!("restored {}", r.uid),
+                    (false, e) => {
+                        failed = true;
+                        println!("FAILED  {}\t{}", r.uid, e.as_deref().unwrap_or("unknown error"));
+                    }
+                }
+            }
+            if failed {
+                bail!("some nodes could not be restored");
+            }
+            Ok(())
+        }
     }
 }
 
