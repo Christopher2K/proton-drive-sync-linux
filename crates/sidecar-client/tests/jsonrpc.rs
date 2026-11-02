@@ -55,6 +55,37 @@ async fn restore_round_trip() {
 }
 
 #[tokio::test]
+async fn rename_round_trips_and_collides() {
+    let (client, handle) = MockSidecar::new().connect();
+    let node = client.rename_node("node-hello", "hi.txt").await.unwrap();
+    assert_eq!(node.name, "hi.txt");
+    // Colliding with the sibling "Documents" name (as a file, still a name
+    // clash in the mock's sibling check) errors with 1005.
+    let err = client
+        .rename_node("node-hello", "Documents")
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), Some(error_codes::CONFLICT));
+    // Unknown uid → protocol error.
+    assert!(client.rename_node("nope", "x").await.is_err());
+    assert_eq!(
+        handle.renames().first().map(|(u, n)| (u.as_str(), n.as_str())),
+        Some(("node-hello", "hi.txt"))
+    );
+}
+
+#[tokio::test]
+async fn move_round_trips() {
+    let (client, _handle) = MockSidecar::new().connect();
+    // Move hello.txt into Documents (parent uid node-docs).
+    assert!(client.move_node("node-hello", "node-docs").await.unwrap());
+    let children = client.list_children("node-docs").await.unwrap();
+    assert!(children.iter().any(|n| n.name == "hello.txt"));
+    // Unknown parent fails with ok=false (result-level, not an error).
+    assert!(!client.move_node("node-hello", "nope").await.unwrap());
+}
+
+#[tokio::test]
 async fn concurrent_calls_are_correlated() {
     let (client, _handle) = MockSidecar::new().connect();
     let (a, b, c) = tokio::join!(

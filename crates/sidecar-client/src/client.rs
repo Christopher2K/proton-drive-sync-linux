@@ -27,6 +27,8 @@ pub trait SidecarApi: Send + Sync {
     async fn get_node(&self, uid: &str) -> Result<Node, Error>;
     async fn create_folder(&self, parent_uid: &str, name: &str) -> Result<Node, Error>;
     async fn get_available_name(&self, parent_uid: &str, name: &str) -> Result<String, Error>;
+    async fn rename_node(&self, node_uid: &str, new_name: &str) -> Result<Node, Error>;
+    async fn move_node(&self, node_uid: &str, new_parent_uid: &str) -> Result<bool, Error>;
     async fn trash(&self, uids: &[String]) -> Result<Vec<TrashResult>, Error>;
     async fn restore(&self, uids: &[String]) -> Result<Vec<TrashResult>, Error>;
     async fn list_trashed(&self) -> Result<Vec<Node>, Error>;
@@ -170,6 +172,36 @@ impl SidecarApi for SidecarClient {
             .as_str()
             .ok_or_else(|| Error::Malformed("`name` is not a string".into()))?
             .to_string())
+    }
+
+    async fn rename_node(&self, node_uid: &str, new_name: &str) -> Result<Node, Error> {
+        let result = self
+            .rpc
+            .call(
+                "drive.rename",
+                json!({ "nodeUid": node_uid, "newName": new_name }),
+            )
+            .await?;
+        let node = serde_json::from_value::<Node>(
+            Self::get(&result, "node")?.clone(),
+        )
+        .map_err(|e| Error::Malformed(e.to_string()))?;
+        Ok(node)
+    }
+
+    async fn move_node(&self, node_uid: &str, new_parent_uid: &str) -> Result<bool, Error> {
+        let result = self
+            .rpc
+            .call(
+                "drive.move",
+                json!({ "nodeUid": node_uid, "newParentUid": new_parent_uid }),
+            )
+            .await?;
+        let results = serde_json::from_value::<Vec<TrashResult>>(
+            Self::get(&result, "results")?.clone(),
+        )
+        .map_err(|e| Error::Malformed(e.to_string()))?;
+        Ok(results.first().map(|r| r.ok).unwrap_or(false))
     }
 
     async fn trash(&self, uids: &[String]) -> Result<Vec<TrashResult>, Error> {

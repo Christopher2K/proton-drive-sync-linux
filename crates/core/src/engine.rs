@@ -736,6 +736,18 @@ impl<S: SidecarApi + 'static> Engine<S> {
                     }
                     continue;
                 }
+                if let Some((old, new)) = store.next_rename_request() {
+                    if let Err(e) = self.apply_local_rename(&store, &old, &new).await {
+                        warn!(from = %old, to = %new, error = %e, "write-through rename failed");
+                        store.finish_rename(&old, &new, false);
+                    } else {
+                        store.finish_rename(&old, &new, true);
+                    }
+                    if let Err(e) = self.publish_vfs_snapshot(&store) {
+                        warn!(error = %e, "post-rename VFS snapshot failed");
+                    }
+                    continue;
+                }
                 if let Some(rel) = store.next_write_request() {
                     self.upload_write_one(&store, &rel).await;
                     continue;
@@ -1462,10 +1474,115 @@ impl<S: SidecarApi + 'static> Engine<S> {
     // F3 — conservative trash
     // ------------------------------------------------------------------
 
-    /// Local delete detected by the watcher. EXACTLY per SPEC F3:
-    /// - only nodes present in the DB with `sync_state = synced` propagate;
-    /// - unknown / never-synced items are simply forgotten locally;
-    /// - remote action is trash only; the mass-delete guard auto-pauses.
+    /// A rename made through the VFS mount. Re-keys the DB rows beneath
+    /// the old path and mirrors it remotely as `renameNode` (+ `moveNodes`
+    /// when the parent changed) — never a trash + re-upload, so content
+    /// and revision history survive. Rows that never synced (no remote
+    /// uid) just re-key; their queued upload picks up the new path.
+    async fn apply_local_rename(&mut self, store: &Store, old_rel: &str, new_rel: &str) -> Result<()> {
+        // Guard against cycles: renaming a folder into itself is invalid.
+        if new_rel.starts_with(&format!("{old_rel}/")) || old_rel == new_rel {
+            warn!(from = %old_rel, to = %new_rel, "invalid rename target (into itself)");
+            return Ok(());
+        }
+        let Some(row) = self.db.node_by_path(old_rel)? else {
+            // Source vanished (deleted before the queue drained) or never
+            // tracked. Nothing remote to rename; if backing content moved
+            // on disk the write queue will upload it as a new file.
+            debug!(path = %old_rel, "rename of unknown local item: no remote action");
+            return Ok(());
+        };
+        let new_name = new_rel
+            .rsplit('/')
+            .next()
+            .unwrap_or(new_rel)
+            .to_string();
+        let new_parent_rel = new_rel.rsplit_once('/').map(|(d, _)| d.to_string());
+        let old_parent_rel = old_rel.rsplit_once('/').map(|(d, _)| d.to_string());
+        let cross_folder = new_parent_rel != old_parent_rel;
+
+        // Mirror remotely first (while rows still key the old path): a
+        // synced node renames in place; an unsynced one only re-keys.
+        if !row.node_uid.starts_with("pending:") {
+            if cross_folder {
+                // New parent: None = root.
+                let parent_uid = match &new_parent_rel {
+                    Some(p) => self.ensure_remote_folder_async(p).await?,
+                    None => self
+                        .db_root_uid()?
+                        .ok_or_else(|| anyhow!("root uid unknown before initial sync"))?,
+                };
+                let ok = self.sidecar.move_node(&row.node_uid, &parent_uid).await?;
+                if !ok {
+                    anyhow::bail!("remote move of {} rejected", row.node_uid);
+                }
+            }
+            if row.name != new_name {
+                self.sidecar.rename_node(&row.node_uid, &new_name).await?;
+            }
+        }
+
+        // Re-key rows: read them all first, delete the old-path rows (the
+        // `node_uid` UNIQUE constraint would reject the insert otherwise),
+        // then insert with the prefix-swapped paths. Children first so a
+        // mid-flight crash leaves an adoptable gap, not a duplicate.
+        let like = format!("{old_rel}/%");
+        let mut rows: Vec<NodeRow> = self.db.nodes_under(&like)?;
+        rows.push(row.clone());
+        for r in &rows {
+            self.db.remove_node(&r.local_path)?;
+        }
+        for mut r in rows {
+            r.local_path = if r.local_path == old_rel {
+                new_rel.to_string()
+            } else {
+                format!("{new_rel}/{}", &r.local_path[old_rel.len() + 1..])
+            };
+            if r.local_path == new_rel {
+                r.name = new_name.clone();
+            }
+            self.db.upsert_node(&r)?;
+        }
+        // Parent uid follows the (possibly new) parent folder row; a move
+        // to the root re-anchors to the root uid.
+        if cross_folder {
+            let parent_uid = match &new_parent_rel {
+                Some(p) => self.db.node_by_path(p)?.map(|r| r.node_uid),
+                None => self.db_root_uid()?,
+            };
+            if let (Some(parent_uid), Some(mut r)) = (parent_uid, self.db.node_by_path(new_rel)?) {
+                r.parent_uid = Some(parent_uid);
+                self.db.upsert_node(&r)?;
+            }
+        }
+
+        // Move backing content so hydration state and pending uploads
+        // follow the rows. `forget(old)` first drops the old-path store
+        // entries; hydrated children re-register under the new prefix.
+        let from = to_abs(&self.backing_dir, old_rel);
+        let to = to_abs(&self.backing_dir, new_rel);
+        if from.exists() {
+            if let Some(dir) = to.parent() {
+                std::fs::create_dir_all(dir).ok();
+            }
+            std::fs::rename(&from, &to)?;
+        }
+        store.forget_tree(old_rel);
+        let like = format!("{new_rel}/%");
+        for child in self.db.nodes_under(&like)? {
+            let abs = to_abs(&self.backing_dir, &child.local_path);
+            if abs.is_file() && store.backing_path(&child.local_path).is_none() {
+                store.set_backing(&child.local_path, abs);
+            }
+        }
+        let own = to_abs(&self.backing_dir, new_rel);
+        if own.is_file() && store.backing_path(new_rel).is_none() {
+            store.set_backing(new_rel, own);
+        }
+        info!(from = %old_rel, to = %new_rel, "rename applied");
+        Ok(())
+    }
+
     async fn handle_local_delete(&mut self, rel: &str) -> Result<()> {
         let Some(row) = self.db.node_by_path(rel)? else {
             debug!(path = %rel, "delete of unknown local item: no remote action");
