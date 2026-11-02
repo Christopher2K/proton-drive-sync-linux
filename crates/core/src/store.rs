@@ -338,7 +338,7 @@ impl Store {
             let mut inner = self.lock();
             let old = old_rel.to_string();
             let new = new_rel.to_string();
-            // Re-key queued pairs whose destination is this source: the
+            // Re-key queued renames whose destination is this source: the
             // file they describe is the one now moving again.
             let mut rekeyed = false;
             for r in inner.pending_renames.iter_mut() {
@@ -349,7 +349,26 @@ impl Store {
             }
             // A pair renamed back onto itself cancels.
             inner.pending_renames.retain(|(o, n)| o != n);
-            if rekeyed {
+            // The source's queued upload (if any) must follow the renamed
+            // backing file, or the engine finds "backing file vanished".
+            // A queued upload of the DESTINATION is dropped: the overwrite
+            // delete + rename pair supersedes it.
+            if inner.pending_writes.contains(&old) {
+                inner.pending_writes.retain(|w| *w != old && *w != new);
+                inner.pending_writes.push_back(new.clone());
+            } else {
+                inner.pending_writes.retain(|w| *w != new);
+            }
+            // An IN-FLIGHT upload of the source refers to the old path and
+            // will fail ("backing file vanished") — re-queue it under the
+            // new path so the content still uploads after the rename.
+            if inner.uploading.contains(&old) {
+                inner.uploading.remove(&old);
+                if !inner.pending_writes.contains(&new) {
+                    inner.pending_writes.push_back(new.clone());
+                }
+            }
+            let notify = if rekeyed {
                 // The new rename is expressed by the merged pair (or
                 // cancelled); the standalone (old, new) entry would move
                 // a source path that no longer exists.
@@ -361,9 +380,12 @@ impl Store {
             {
                 false
             } else {
-                inner.pending_renames.push_back((old, new));
+                inner.pending_renames.push_back((old, new.clone()));
                 true
-            }
+            };
+            // A re-keyed write queue entry may need the engine awake even
+            // when the rename itself deduped away.
+            notify || (!inner.pending_writes.is_empty() && !inner.uploading.contains(&new))
         };
         if first {
             self.notify.notify_one();
@@ -395,6 +417,15 @@ impl Store {
                 .pending_renames
                 .push_back((old_rel.to_string(), new_rel.to_string()));
         }
+    }
+
+    /// True while a queued or in-flight rename targets `rel` (an
+    /// overwrite-rename's destination): the delete queue entry for the
+    /// same path must not tear down the backing content the rename is
+    /// delivering.
+    pub fn rename_inbound(&self, rel: &str) -> bool {
+        let inner = self.lock();
+        inner.pending_renames.iter().any(|(_, n)| n == rel)
     }
 
     /// Drop a path from every queue (row deleted, or hydration failed).
