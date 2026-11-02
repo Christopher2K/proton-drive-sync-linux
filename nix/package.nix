@@ -54,7 +54,7 @@ let
 in
 rustPlatform.buildRustPackage {
   pname = "proton-drive-sync";
-  version = "0.4.0";
+  version = "0.4.1";
 
   src = self;
 
