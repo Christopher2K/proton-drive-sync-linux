@@ -6,6 +6,7 @@ actions!(
     pds_app,
     [
         Quit,
+        CloseWindow,
         TogglePause,
         OpenDashboard,
         OpenSyncFolder,
