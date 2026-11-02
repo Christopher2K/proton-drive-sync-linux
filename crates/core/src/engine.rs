@@ -714,6 +714,20 @@ impl<S: SidecarApi + 'static> Engine<S> {
                     self.maybe_evict(&store, &rel);
                     continue;
                 }
+                // Folders created through the mount with nothing inside
+                // them yet: no write-queue entry exists to drag them out
+                // (upload_write_one also drains mkdirs, but only for
+                // parents of queued writes). Drain them here so a bare
+                // mkdir reaches the remote and gets its DB row.
+                if let Some(dir) = store.next_mkdir_request() {
+                    if let Err(e) = self.ensure_remote_folder_async(&dir).await {
+                        warn!(path = %dir, error = %e, "queued mkdir failed; re-queueing");
+                        store.requeue_mkdir(&dir);
+                    } else if let Err(e) = self.publish_vfs_snapshot(&store) {
+                        warn!(error = %e, "post-mkdir VFS snapshot failed");
+                    }
+                    continue;
+                }
                 if let Some(rel) = store.next_write_request() {
                     self.upload_write_one(&store, &rel).await;
                     continue;

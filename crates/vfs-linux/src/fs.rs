@@ -886,13 +886,19 @@ impl fuser::Filesystem for PdsFs {
             return reply.error(Errno::ENOTDIR);
         }
         // POSIX: only empty directories are removable. Check snapshot
-        // children + overlay children.
+        // children + overlay children. A folder still only in the overlay
+        // (no snapshot row yet) has no snapshot children by definition —
+        // resolving its ino would fall back to ROOT and make the root's
+        // listing answer for it (spurious ENOTEMPTY on an empty folder).
         let prefix = format!("{rel}/");
-        let snapshot_children = self
-            .tree
-            .children(self.tree.ino_of(&rel))
-            .map(|c| !c.is_empty())
-            .unwrap_or(false);
+        let snapshot_children = match self.tree.ino_of_opt(&rel) {
+            Some(ino) => self
+                .tree
+                .children(ino)
+                .map(|c| !c.is_empty())
+                .unwrap_or(false),
+            None => false,
+        };
         let overlay_child = self
             .overlay
             .lock()

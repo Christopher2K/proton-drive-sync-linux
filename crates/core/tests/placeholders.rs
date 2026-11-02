@@ -224,6 +224,67 @@ async fn hydrate_request_downloads_to_backing() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
+async fn bare_mkdir_from_vfs_creates_remote_folder_and_rmdir_trashes_it() {
+    // Regression: a folder created through the mount with NOTHING inside
+    // it used to sit in pending_mkdirs forever — the only consumer lived
+    // in upload_write_one, which runs when a *file* write is queued. The
+    // folder never reached the remote and never got a DB row (it existed
+    // only in the FUSE overlay), and rmdir then failed with ENOTEMPTY
+    // because Tree::ino_of resolved the unknown path to the ROOT inode
+    // (root's children answered the emptiness check).
+    let fx = start().await;
+    wait_for(|| fx.store.snapshot().by_path.contains_key("hello.txt")).await;
+
+    // VFS-side: mkdir queues the folder (no write follows).
+    fx.store.record_mkdir("NewFolder");
+    fx.store.record_mkdir("NewFolder/inner");
+
+    // Engine drains the queue on its own: both folders exist remotely…
+    wait_for(|| fx.mock.child_names("root").iter().any(|n| n == "NewFolder")).await;
+    let uid = fx.mock.find_uid("root", "NewFolder").unwrap();
+    wait_for(|| fx.mock.child_names(&uid).iter().any(|n| n == "inner")).await;
+
+    // …and the snapshot serves them as directories (DB rows written).
+    wait_for(|| {
+        fx.store
+            .snapshot()
+            .by_path
+            .get("NewFolder")
+            .is_some_and(|n| n.is_dir)
+    })
+    .await;
+    wait_for(|| {
+        fx.store
+            .snapshot()
+            .by_path
+            .get("NewFolder/inner")
+            .is_some_and(|n| n.is_dir)
+    })
+    .await;
+
+    // rmdir path: children first, then the parent — both trash remotely
+    // (the tombstone drain), and the rows leave the snapshot.
+    fx.store.record_delete("NewFolder/inner");
+    wait_for(|| !fx.store.snapshot().by_path.contains_key("NewFolder/inner")).await;
+    wait_for(|| fx.mock.child_names(&uid).is_empty()).await;
+
+    fx.store.record_delete("NewFolder");
+    // The mass-deletion guard counts percentage limbs too, and this tiny
+    // tree (3 synced nodes, 2 deletes) trips it. Resume once to approve
+    // the batch — same UX as a real user confirming a small tree.
+    fx.handle.resume().await.unwrap();
+    wait_for(|| !fx.store.snapshot().by_path.contains_key("NewFolder")).await;
+    wait_for(|| !fx.mock.child_names("root").iter().any(|n| n == "NewFolder")).await;
+    assert!(
+        fx.mock.trashed_uids().contains(&uid),
+        "NewFolder ({uid}) must be trashed remotely, got {:?}",
+        fx.mock.trashed_uids()
+    );
+    fx.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
 async fn vfs_snapshot_reflects_remote_events() {
     let fx = start().await;
     wait_for(|| fx.store.snapshot().by_path.contains_key("hello.txt")).await;
