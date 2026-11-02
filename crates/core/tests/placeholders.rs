@@ -326,6 +326,66 @@ async fn bare_mkdir_from_vfs_creates_remote_folder_and_rmdir_trashes_it() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
+async fn vfs_rename_rekeys_rows_and_renames_remotely() {
+    let fx = start().await;
+    wait_for(|| fx.store.snapshot().by_path.contains_key("hello.txt")).await;
+
+    // Same-folder rename: hello.txt → hi.txt. The engine must rename the
+    // remote node (NOT trash + re-upload) and re-key the DB row.
+    fx.store.record_rename("hello.txt", "hi.txt");
+    wait_for(|| fx.store.snapshot().by_path.contains_key("hi.txt")).await;
+    wait_for(|| {
+        fx.mock
+            .child_names("root")
+            .iter()
+            .any(|n| n == "hi.txt")
+    })
+    .await;
+    assert!(
+        !fx.store.snapshot().by_path.contains_key("hello.txt"),
+        "old path must be gone from the snapshot"
+    );
+    assert!(
+        !fx.mock.trashed_uids().contains(&"node-hello".to_string()),
+        "rename must never trash; trashed: {:?}",
+        fx.mock.trashed_uids()
+    );
+    assert_eq!(
+        fx.mock.renames(),
+        vec![("node-hello".to_string(), "hi.txt".to_string())]
+    );
+
+    // Cross-folder move: hi.txt → Documents/moved.txt. The folder already
+    // exists remotely (seeded Documents); move + rename apply.
+    fx.store.record_rename("hi.txt", "Documents/moved.txt");
+    wait_for(|| {
+        fx.store
+            .snapshot()
+            .by_path
+            .contains_key("Documents/moved.txt")
+    })
+    .await;
+    let docs_uid = fx.mock.find_uid("root", "Documents").unwrap();
+    wait_for(|| {
+        fx.mock
+            .child_names(&docs_uid)
+            .iter()
+            .any(|n| n == "moved.txt")
+    })
+    .await;
+    assert!(!fx.store.snapshot().by_path.contains_key("hi.txt"));
+    assert!(fx.mock.trashed_uids().is_empty(), "no trashes at all");
+
+    // Rename of an unknown path is a no-op (no error, no remote calls).
+    let renames_before = fx.mock.renames().len();
+    fx.store.record_rename("ghost.txt", "phantom.txt");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(fx.mock.renames().len(), renames_before);
+    fx.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
 async fn vfs_snapshot_reflects_remote_events() {
     let fx = start().await;
     wait_for(|| fx.store.snapshot().by_path.contains_key("hello.txt")).await;

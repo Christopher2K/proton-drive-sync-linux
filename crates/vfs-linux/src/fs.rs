@@ -212,6 +212,31 @@ impl PdsFs {
             .unwrap_or(0)
     }
 
+    /// Snapshot children + overlay children check (rmdir and the dir
+    /// overwrite arm of rename share it). A folder still only in the
+    /// overlay has no snapshot children by definition.
+    fn dir_is_empty(&self, rel: &str) -> bool {
+        let prefix = format!("{rel}/");
+        let snapshot_child = match self.tree.ino_of_opt(rel) {
+            Some(ino) => self
+                .tree
+                .children(ino)
+                .map(|c| !c.is_empty())
+                .unwrap_or(false),
+            None => false,
+        };
+        if snapshot_child {
+            return false;
+        }
+        !self
+            .overlay
+            .lock()
+            .expect("overlay mutex")
+            .by_rel
+            .keys()
+            .any(|c| c.starts_with(&prefix))
+    }
+
     /// Metadata for an overlay entry (file or dir), if `rel` is one.
     fn overlay_entry(&self, rel: &str) -> Option<WriteEntry> {
         self.overlay
@@ -298,6 +323,15 @@ fn unix_time(secs: i64) -> std::time::SystemTime {
         std::time::UNIX_EPOCH + Duration::from_secs(secs as u64)
     } else {
         std::time::UNIX_EPOCH
+    }
+}
+
+/// `parent` ("" for root) + `name` → rel path.
+fn join_rel(parent: &str, name: &str) -> String {
+    if parent.is_empty() {
+        name.to_string()
+    } else {
+        format!("{parent}/{name}")
     }
 }
 
@@ -842,6 +876,153 @@ impl fuser::Filesystem for PdsFs {
         reply.entry(&TTL, &self.attr_for(ino, true, 0, mtime), Generation(0));
     }
 
+    /// Rename/move through the mount. Moves the backing content, re-keys
+    /// the write overlay, and queues the remote rename for the engine
+    /// (which re-keys DB rows and calls `renameNode`/`moveNodes` — no
+    /// trash + re-upload, so content and revision history survive). The
+    /// snapshot tree flips on the engine's next publish; until then the
+    /// overlay serves the new path and the old one is gone.
+    fn rename(
+        &self,
+        _req: &Request,
+        parent: INodeNo,
+        name: &OsStr,
+        newparent: INodeNo,
+        newname: &OsStr,
+        flags: fuser::RenameFlags,
+        reply: ReplyEmpty,
+    ) {
+        let Some(old_parent_rel) = self.rel_of_any(parent) else {
+            return reply.error(Errno::ENOENT);
+        };
+        let Some(new_parent_rel) = self.rel_of_any(newparent) else {
+            return reply.error(Errno::ENOENT);
+        };
+        let (Some(name), Some(newname)) = (name.to_str(), newname.to_str()) else {
+            return reply.error(Errno::EINVAL);
+        };
+        for n in [name, newname] {
+            if n.contains('/') || n == "." || n == ".." || n.is_empty() {
+                return reply.error(Errno::EINVAL);
+            }
+        }
+        // RENAME_EXCHANGE (renameat2) swaps two entries — no single-move
+        // mapping; reject rather than fake it.
+        if flags.contains(fuser::RenameFlags::RENAME_EXCHANGE) {
+            return reply.error(Errno::EINVAL);
+        }
+        let old_rel = join_rel(&old_parent_rel, name);
+        let new_rel = join_rel(&new_parent_rel, newname);
+        // The `.pds` proxy and the root are not renamable.
+        if old_rel == STATE_PROXY || new_rel == STATE_PROXY || old_rel.is_empty() {
+            return reply.error(Errno::EPERM);
+        }
+        // Source must exist (overlay or snapshot).
+        let Some((src_is_dir, src_size, _src_mtime, _)) = self.node_meta(&old_rel) else {
+            return reply.error(Errno::ENOENT);
+        };
+        // Renaming a folder into its own subtree is invalid.
+        if src_is_dir && new_rel.starts_with(&format!("{old_rel}/")) {
+            return reply.error(Errno::EINVAL);
+        }
+
+        // Destination handling per rename(2)/renameat2 semantics: a file
+        // replaces a file, a dir replaces an EMPTY dir, anything else is an
+        // error. The replaced destination is mirrored as a remote delete.
+        if let Some((dst_is_dir, _, _, _)) = self.node_meta(&new_rel) {
+            if flags.contains(fuser::RenameFlags::RENAME_NOREPLACE) {
+                return reply.error(Errno::EEXIST);
+            }
+            if dst_is_dir && !src_is_dir {
+                return reply.error(Errno::EISDIR);
+            }
+            if src_is_dir && !dst_is_dir {
+                return reply.error(Errno::ENOTDIR);
+            }
+            if src_is_dir && dst_is_dir && !self.dir_is_empty(&new_rel) {
+                return reply.error(Errno::ENOTEMPTY);
+            }
+            self.overlay.lock().expect("overlay mutex").remove(&new_rel);
+            let abs = to_abs(&self.backing_dir, &new_rel);
+            if dst_is_dir {
+                std::fs::remove_dir(&abs).ok();
+                self.store.forget_tree(&new_rel);
+            } else {
+                std::fs::remove_file(&abs).ok();
+                self.store.forget(&new_rel);
+            }
+            self.store.record_delete(&new_rel);
+        }
+
+        // 1. Move the backing content (hydrated or write-created). A pure
+        //    placeholder has none — its content arrives by path later.
+        let from = to_abs(&self.backing_dir, &old_rel);
+        let to = to_abs(&self.backing_dir, &new_rel);
+        if from.exists() {
+            if let Some(dir) = to.parent() {
+                std::fs::create_dir_all(dir).ok();
+            }
+            if let Err(e) = std::fs::rename(&from, &to) {
+                warn!(error = %e, from = %old_rel, to = %new_rel, "backing rename failed");
+                return reply.error(Errno::EIO);
+            }
+        }
+
+        // 2. Overlay: re-key this entry and any children to the new prefix
+        //    (same inos, so kernel dentries stay valid). A snapshot-backed
+        //    source gets a fresh overlay entry so the new path serves
+        //    until the engine's next snapshot publish re-keys the rows.
+        {
+            let mut overlay = self.overlay.lock().expect("overlay mutex");
+            let old_prefix = format!("{old_rel}/");
+            let moves: Vec<(String, WriteEntry)> = overlay
+                .by_rel
+                .iter()
+                .filter(|(rel, _)| {
+                    **rel == old_rel || (src_is_dir && rel.starts_with(&old_prefix))
+                })
+                .map(|(rel, e)| (rel.clone(), e.clone()))
+                .collect();
+            let mut had_source = false;
+            for (rel, mut e) in moves {
+                let new_path = if rel == old_rel {
+                    had_source = true;
+                    new_rel.clone()
+                } else {
+                    format!("{new_rel}/{}", &rel[old_rel.len() + 1..])
+                };
+                overlay.remove(&rel);
+                e.mtime = self.now_secs();
+                overlay.by_ino.insert(e.ino.0, new_path.clone());
+                overlay.by_rel.insert(new_path, e);
+            }
+            if !had_source && self.tree.node(&new_rel).is_none() {
+                let max_ino = overlay
+                    .by_ino
+                    .keys()
+                    .filter(|k| **k >= OVERLAY_INO_BASE)
+                    .max()
+                    .copied()
+                    .unwrap_or(OVERLAY_INO_BASE);
+                overlay.insert(
+                    &new_rel,
+                    WriteEntry {
+                        ino: INodeNo(max_ino + 1),
+                        size: src_size,
+                        mtime: self.now_secs(),
+                        is_dir: src_is_dir,
+                    },
+                );
+            }
+        }
+
+        // 3. Queue the remote rename (engine re-keys rows, renameNode /
+        //    moveNodes remotely, re-registers backing paths).
+        self.store.record_rename(&old_rel, &new_rel);
+        debug!(from = %old_rel, to = %new_rel, "vfs: rename queued");
+        reply.ok();
+    }
+
     fn unlink(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
         debug!(parent = parent.0, name = ?name, "vfs: unlink");
         let Some(parent_rel) = self.rel_of_any(parent) else {
@@ -890,23 +1071,7 @@ impl fuser::Filesystem for PdsFs {
         // (no snapshot row yet) has no snapshot children by definition —
         // resolving its ino would fall back to ROOT and make the root's
         // listing answer for it (spurious ENOTEMPTY on an empty folder).
-        let prefix = format!("{rel}/");
-        let snapshot_children = match self.tree.ino_of_opt(&rel) {
-            Some(ino) => self
-                .tree
-                .children(ino)
-                .map(|c| !c.is_empty())
-                .unwrap_or(false),
-            None => false,
-        };
-        let overlay_child = self
-            .overlay
-            .lock()
-            .expect("overlay mutex")
-            .by_rel
-            .keys()
-            .any(|child| child.starts_with(&prefix));
-        if snapshot_children || overlay_child {
+        if !self.dir_is_empty(&rel) {
             return reply.error(Errno::ENOTEMPTY);
         }
         self.overlay.lock().expect("overlay mutex").remove(&rel);

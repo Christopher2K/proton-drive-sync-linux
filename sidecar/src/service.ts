@@ -130,6 +130,8 @@ export class SidecarService {
     this.rpc.method("drive.trash", (p) => this.driveTrash(p));
     this.rpc.method("drive.restore", (p) => this.driveRestore(p));
     this.rpc.method("drive.listTrashed", () => this.driveListTrashed());
+    this.rpc.method("drive.rename", (p) => this.driveRename(p));
+    this.rpc.method("drive.move", (p) => this.driveMove(p));
 
     this.rpc.method("drive.upload", (p) => this.driveUpload(p));
     this.rpc.method("drive.download", (p) => this.driveDownload(p));
@@ -296,6 +298,31 @@ export class SidecarService {
       "name",
     ]);
     return { name: await this.requireClient().getAvailableName(parentUid, name, NodeType.File) };
+  }
+
+  private async driveRename(
+    params: unknown,
+  ): Promise<{ node: ProtoNode }> {
+    const { nodeUid, newName } = requireParams<{ nodeUid: string; newName: string }>(params, [
+      "nodeUid",
+      "newName",
+    ]);
+    const node = await this.requireClient().renameNode(nodeUid, newName);
+    return { node: this.toProtoNode(node) };
+  }
+
+  private async driveMove(params: unknown): Promise<{ results: unknown[] }> {
+    const { nodeUid, newParentUid } = requireParams<{ nodeUid: string; newParentUid: string }>(
+      params,
+      ["nodeUid", "newParentUid"],
+    );
+    const results: { uid: string; ok: boolean; error?: string }[] = [];
+    for await (const r of this.requireClient().moveNodes([nodeUid], newParentUid)) {
+      results.push(
+        r.ok ? { uid: r.uid, ok: true } : { uid: r.uid, ok: false, error: String(r.error) },
+      );
+    }
+    return { results };
   }
 
   private async driveTrash(params: unknown): Promise<{ results: unknown[] }> {

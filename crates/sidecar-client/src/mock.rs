@@ -110,6 +110,23 @@ impl MockHandle {
             .collect()
     }
 
+    /// `(uid, newName)` pairs passed to `drive.rename`, in call order.
+    pub fn renames(&self) -> Vec<(String, String)> {
+        self.state
+            .lock()
+            .unwrap()
+            .calls
+            .iter()
+            .filter(|(m, _)| m == "rename")
+            .map(|(_, u)| {
+                (
+                    u.first().cloned().unwrap_or_default(),
+                    u.get(1).cloned().unwrap_or_default(),
+                )
+            })
+            .collect()
+    }
+
     /// Names passed to `drive.upload`, in call order.
     pub fn uploaded_names(&self) -> Vec<String> {
         self.state
@@ -529,6 +546,60 @@ impl MockSidecar {
                     .map(|n| n.name.clone())
                     .collect();
                 vec![ok(json!({"name": available_name(&taken, &name)}))]
+            }
+            "drive.rename" => {
+                let mut st = self.state.lock().unwrap();
+                let uid = pstr("nodeUid");
+                let new_name = pstr("newName");
+                st.calls.push(("rename".into(), vec![uid.clone(), new_name.clone()]));
+                let (parent, trashed) = match st.nodes.get(&uid) {
+                    Some(n) => (n.parent_uid.clone(), n.trashed),
+                    None => return vec![err(-32602, "no such node")],
+                };
+                if trashed {
+                    return vec![err(-32602, "no such node")];
+                }
+                // Same-name collision against non-trashed siblings.
+                if let Some(parent) = parent {
+                    let clash = st.nodes.values().any(|other| {
+                        !other.trashed
+                            && other.uid != uid
+                            && other.parent_uid.as_deref() == Some(parent.as_str())
+                            && other.name == new_name
+                    });
+                    if clash {
+                        return vec![err(error_codes::CONFLICT, "name already exists")];
+                    }
+                }
+                st.nodes.get_mut(&uid).unwrap().name = new_name;
+                let json = st.node_json(st.nodes.get(&uid).unwrap());
+                vec![ok(json!({"node": json}))]
+            }
+            "drive.move" => {
+                let mut st = self.state.lock().unwrap();
+                let uid = pstr("nodeUid");
+                let new_parent = pstr("newParentUid");
+                st.calls.push(("move".into(), vec![uid.clone(), new_parent.clone()]));
+                let fail =
+                    |e: &str| json!({"results": [{"uid": uid, "ok": false, "error": e}]});
+                let (name, trashed, parent_known) = match st.nodes.get(&uid) {
+                    Some(n) => (n.name.clone(), n.trashed, st.nodes.contains_key(&new_parent)),
+                    None => return vec![ok(fail("no such node"))],
+                };
+                if trashed || !parent_known {
+                    return vec![ok(fail("no such node"))];
+                }
+                let clash = st.nodes.values().any(|other| {
+                    !other.trashed
+                        && other.uid != uid
+                        && other.parent_uid.as_deref() == Some(new_parent.as_str())
+                        && other.name == name
+                });
+                if clash {
+                    return vec![ok(fail("name already exists"))];
+                }
+                st.nodes.get_mut(&uid).unwrap().parent_uid = Some(new_parent);
+                vec![ok(json!({"results": [{"uid": uid, "ok": true}]}))]
             }
             "drive.trash" => {
                 let mut st = self.state.lock().unwrap();

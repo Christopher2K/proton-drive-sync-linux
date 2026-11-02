@@ -58,6 +58,10 @@ struct Inner {
     pending_mkdirs: VecDeque<String>,
     /// Paths deleted through the mount, awaiting a remote trash.
     pending_deletes: VecDeque<String>,
+    /// Renames made through the mount: (old rel, new rel), oldest first.
+    /// The engine turns each into a remote `renameNode` (never a
+    /// trash+re-upload), re-keying the DB rows beneath the paths.
+    pending_renames: VecDeque<(String, String)>,
     /// Last access per hydrated rel (LRU order for eviction; M3.2).
     /// Monotonic counter, not wall time: avoids clock skew and gives a
     /// total order even for same-second reads.
@@ -326,6 +330,73 @@ impl Store {
         self.lock().pending_deletes.pop_front()
     }
 
+    /// Queue a rename made through the mount (VFS `rename`). Chained
+    /// renames merge: a→b queued, then b→c arrives → a→c; a rename back
+    /// onto itself (a→b→a) cancels out entirely.
+    pub fn record_rename(&self, old_rel: &str, new_rel: &str) {
+        let first = {
+            let mut inner = self.lock();
+            let old = old_rel.to_string();
+            let new = new_rel.to_string();
+            // Re-key queued pairs whose destination is this source: the
+            // file they describe is the one now moving again.
+            let mut rekeyed = false;
+            for r in inner.pending_renames.iter_mut() {
+                if r.1 == old {
+                    r.1 = new.clone();
+                    rekeyed = true;
+                }
+            }
+            // A pair renamed back onto itself cancels.
+            inner.pending_renames.retain(|(o, n)| o != n);
+            if rekeyed {
+                // The new rename is expressed by the merged pair (or
+                // cancelled); the standalone (old, new) entry would move
+                // a source path that no longer exists.
+                !inner.pending_renames.is_empty()
+            } else if inner
+                .pending_renames
+                .iter()
+                .any(|(o, n)| o == &old && n == &new)
+            {
+                false
+            } else {
+                inner.pending_renames.push_back((old, new));
+                true
+            }
+        };
+        if first {
+            self.notify.notify_one();
+        }
+    }
+
+    /// Next queued rename (engine). None if only cancelled pairs remain.
+    pub fn next_rename_request(&self) -> Option<(String, String)> {
+        let mut inner = self.lock();
+        loop {
+            let (old, new) = inner.pending_renames.pop_front()?;
+            if old == new {
+                continue; // renamed back to itself; no-op
+            }
+            return Some((old, new));
+        }
+    }
+
+    /// Engine finished one rename attempt. On failure the pair re-queues.
+    pub fn finish_rename(&self, old_rel: &str, new_rel: &str, ok: bool) {
+        let mut inner = self.lock();
+        if !ok
+            && !inner
+                .pending_renames
+                .iter()
+                .any(|(o, n)| o == old_rel && n == new_rel)
+        {
+            inner
+                .pending_renames
+                .push_back((old_rel.to_string(), new_rel.to_string()));
+        }
+    }
+
     /// Drop a path from every queue (row deleted, or hydration failed).
     /// Called with the DB-rel form of the path.
     pub fn forget(&self, rel: &str) {
@@ -339,6 +410,9 @@ impl Store {
         inner.pending_deletes.retain(|p| p != rel);
         inner.last_access.remove(rel);
         inner.open_handles.remove(rel);
+        inner
+            .pending_renames
+            .retain(|(o, n)| o != rel && n != rel);
     }
 
     /// Drop `rel` and every path under it (recursive delete through the
@@ -356,6 +430,7 @@ impl Store {
         inner.pending_deletes.retain(|p| keep(p));
         inner.last_access.retain(|p, _| keep(p));
         inner.open_handles.retain(|p, _| keep(p));
+        inner.pending_renames.retain(|(o, n)| keep(o) && keep(n));
     }
 
     // ---- VFS side ------------------------------------------------------
@@ -529,6 +604,50 @@ mod tests {
         store.forget_tree("gone");
         assert_eq!(store.next_mkdir_request(), None);
         assert_eq!(store.next_write_request(), None);
+    }
+
+    #[test]
+    fn rename_queue_roundtrip_and_chaining() {
+        let store = Store::new();
+        store.record_rename("a.txt", "b.txt");
+        store.record_rename("a.txt", "b.txt"); // dedup
+        assert_eq!(
+            store.next_rename_request(),
+            Some(("a.txt".into(), "b.txt".into()))
+        );
+        store.finish_rename("a.txt", "b.txt", true);
+        assert_eq!(store.next_rename_request(), None);
+
+        // Failure re-queues; rename-back cancels on drain.
+        store.record_rename("a.txt", "b.txt");
+        assert_eq!(
+            store.next_rename_request(),
+            Some(("a.txt".into(), "b.txt".into()))
+        );
+        store.finish_rename("a.txt", "b.txt", false);
+        assert_eq!(
+            store.next_rename_request(),
+            Some(("a.txt".into(), "b.txt".into()))
+        );
+        store.finish_rename("a.txt", "b.txt", true);
+
+        store.record_rename("a.txt", "b.txt");
+        store.record_rename("b.txt", "a.txt"); // chained → a→a, cancels
+        assert_eq!(store.next_rename_request(), None);
+
+        // Chained destination re-key: a→b then b→c merges into a→c.
+        store.record_rename("a.txt", "b.txt");
+        store.record_rename("b.txt", "c.txt");
+        assert_eq!(
+            store.next_rename_request(),
+            Some(("a.txt".into(), "c.txt".into()))
+        );
+        store.finish_rename("a.txt", "c.txt", true);
+
+        // forget drops renames touching the path.
+        store.record_rename("x.txt", "y.txt");
+        store.forget("x.txt");
+        assert_eq!(store.next_rename_request(), None);
     }
 
     #[test]

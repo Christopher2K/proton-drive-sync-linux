@@ -416,6 +416,94 @@ async fn fuse_mount_serves_placeholders_and_hydrates() {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 
+    // 9. rename through the mount (same folder): the file must move
+    // locally AND rename remotely — never trash + re-upload.
+    let docs_uid = mock.find_uid("root", "docs").expect("docs uid");
+    let uid_docs_a = mock.find_uid(&docs_uid, "a.md").expect("a.md uid");
+    std::fs::rename(mnt.join("docs").join("a.md"), mnt.join("docs").join("renamed.md"))
+        .expect("rename through the mount");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if mock.child_names(&docs_uid).iter().any(|n| n == "renamed.md") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "rename never reached the remote: docs children {:?}, renames {:?}, trashed {:?}",
+            mock.child_names(&docs_uid),
+            mock.renames(),
+            mock.trashed_uids(),
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        !mock.trashed_uids().contains(&uid_docs_a),
+        "rename must not trash the source; trashed: {:?}",
+        mock.trashed_uids()
+    );
+    assert!(mock
+        .renames()
+        .iter()
+        .any(|(u, n)| u == &uid_docs_a && n == "renamed.md"));
+    // The mount serves the file under its new name, old one is gone, and
+    // the content survived (same node, no re-upload). Wait for the
+    // engine's snapshot publish (content-ready), then outlast the kernel's
+    // negative-dentry TTL (the rename syscall's destination lookup ran
+    // before the row existed and was cached as ENOENT for TTL=1s).
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if store
+            .snapshot()
+            .by_path
+            .get("docs/renamed.md")
+            .is_some_and(|n| n.content_ready)
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "renamed file never became content-ready in the snapshot"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    assert_eq!(
+        std::fs::read(mnt.join("docs").join("renamed.md")).unwrap(),
+        b"# hi"
+    );
+    assert!(!mnt.join("docs").join("a.md").exists());
+
+    // 9b. Cross-folder move: renamed.md → root as moved.md. Same TTL note
+    // as above applies to the moved name's first lookup.
+    std::fs::rename(
+        mnt.join("docs").join("renamed.md"),
+        mnt.join("moved.md"),
+    )
+    .expect("cross-folder rename through the mount");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if mock.child_names("root").iter().any(|n| n == "moved.md") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "cross-folder move never reached the remote: root children {:?}",
+            mock.child_names("root"),
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    assert_eq!(std::fs::read(mnt.join("moved.md")).unwrap(), b"# hi");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if !mnt.join("docs").join("renamed.md").exists() {
+            break;
+        }
+        assert!(Instant::now() < deadline, "old rename path still visible");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(!mock.trashed_uids().contains(&uid_docs_a));
+
     handle.shutdown().await.ok();
     drop(session);
     let _ = engine_task.await;
