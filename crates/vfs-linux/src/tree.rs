@@ -133,11 +133,19 @@ impl Tree {
     }
 
     pub fn ino_of(&self, rel: &str) -> INodeNo {
+        self.ino_of_opt(rel).unwrap_or(INodeNo::ROOT)
+    }
+
+    /// Like [`Tree::ino_of`] but distinguishes unknown paths from the
+    /// root. Callers that must not confuse the two (e.g. `rmdir`'s
+    /// emptiness check — treating an unknown folder as the root made
+    /// every empty overlay dir undeletable with ENOTEMPTY) use this.
+    pub fn ino_of_opt(&self, rel: &str) -> Option<INodeNo> {
         let inner = self.inner.lock().expect("tree mutex poisoned");
         if rel.is_empty() {
-            return INodeNo::ROOT;
+            return Some(INodeNo::ROOT);
         }
-        inner.path_to_ino.get(rel).copied().unwrap_or(INodeNo::ROOT)
+        inner.path_to_ino.get(rel).copied()
     }
 
     /// Resolve `name` under `parent` to a child path.
@@ -277,5 +285,23 @@ mod tests {
         assert_eq!(tree.parent_ino(b.ino), dir.ino);
         assert_eq!(tree.parent_ino(dir.ino), INodeNo::ROOT);
         assert_eq!(tree.parent_ino(INodeNo::ROOT), INodeNo::ROOT);
+    }
+
+    #[test]
+    fn ino_of_opt_distinguishes_unknown_from_root() {
+        // Regression: the fallback ino_of answered ROOT for unknown
+        // paths, which made rmdir's emptiness check consult the root's
+        // children for an overlay-only folder → spurious ENOTEMPTY.
+        let tree = Tree::new();
+        tree.refresh(&snap(1, &["dir"]));
+        assert_eq!(tree.ino_of_opt(""), Some(INodeNo::ROOT));
+        assert!(tree.ino_of_opt("dir").is_some());
+        assert_eq!(
+            tree.ino_of_opt("overlay-only"),
+            None,
+            "unknown paths must not resolve to the root inode"
+        );
+        // Legacy accessor keeps its ROOT fallback (other callers rely on it).
+        assert_eq!(tree.ino_of("overlay-only"), INodeNo::ROOT);
     }
 }

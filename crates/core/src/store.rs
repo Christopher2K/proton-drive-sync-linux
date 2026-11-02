@@ -292,6 +292,17 @@ impl Store {
         self.lock().pending_mkdirs.pop_front()
     }
 
+    /// Put a folder back after a failed remote create (engine retry).
+    /// Without this the folder would vanish from the queue and never
+    /// reach the remote.
+    pub fn requeue_mkdir(&self, rel: &str) {
+        let mut inner = self.lock();
+        let rel = rel.to_string();
+        if !inner.pending_mkdirs.contains(&rel) {
+            inner.pending_mkdirs.push_back(rel);
+        }
+    }
+
     /// Queue a path removed through the mount (VFS `unlink`/`rmdir`).
     /// Deletion order is the VFS's problem (children are unlinked first);
     /// the engine mirrors each as a durable tombstone + trash.
@@ -495,6 +506,15 @@ mod tests {
         store.record_mkdir("docs/sub");
         assert_eq!(store.next_mkdir_request(), Some("docs".into()));
         assert_eq!(store.next_mkdir_request(), Some("docs/sub".into()));
+        assert_eq!(store.next_mkdir_request(), None);
+
+        // A failed remote create re-queues (no dedup loss, no drop).
+        store.record_mkdir("retry-me");
+        assert_eq!(store.next_mkdir_request(), Some("retry-me".into()));
+        store.requeue_mkdir("retry-me");
+        assert_eq!(store.next_mkdir_request(), Some("retry-me".into()));
+        store.requeue_mkdir("retry-me"); // no duplicate when already queued
+        assert_eq!(store.next_mkdir_request(), Some("retry-me".into()));
         assert_eq!(store.next_mkdir_request(), None);
 
         store.record_delete("docs/sub/a.txt");

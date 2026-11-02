@@ -322,6 +322,76 @@ async fn fuse_mount_serves_placeholders_and_hydrates() {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 
+    // 7b. Regression: a BARE mkdir (no file written inside) must reach
+    // the remote on its own — the engine used to drain pending_mkdirs
+    // only from upload_write_one, so a childless folder never synced and
+    // stayed FUSE-overlay-only.
+    std::fs::create_dir(mnt.join("emptydir")).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if mock.child_names("root").iter().any(|n| n == "emptydir") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "bare mkdir never reached the remote: root children {:?}",
+            mock.child_names("root"),
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    // …and the snapshot serves it as a directory (DB row written).
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if store
+            .snapshot()
+            .by_path
+            .get("emptydir")
+            .is_some_and(|n| n.is_dir)
+        {
+            break;
+        }
+        assert!(Instant::now() < deadline, "no snapshot row for emptydir");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // 7c. Regression: rmdir of that folder must succeed. It used to fail
+    // with ENOTEMPTY because Tree::ino_of resolved the overlay-only path
+    // to the ROOT inode and the root's children answered the emptiness
+    // check. First delete while it is still overlay-only (before the
+    // snapshot row lands) — the exact user-visible failure — then repeat
+    // after the row exists.
+    let emptydir_uid = mock.find_uid("root", "emptydir").expect("emptydir uid");
+    std::fs::create_dir(mnt.join("gone-soon")).unwrap();
+    std::fs::remove_dir(mnt.join("gone-soon")).expect("rmdir overlay-only folder");
+    std::fs::remove_dir(mnt.join("emptydir")).expect("rmdir snapshot-backed folder");
+    // Both remove cleanly; emptydir trashes remotely (gone-soon may or
+    // may not have a row yet depending on drain order — either way the
+    // engine handles it). Two rapid deletes on this small tree can trip
+    // the percentage limb of the mass-deletion guard; one explicit
+    // resume approves the batch.
+    handle.resume().await.unwrap();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if mock.trashed_uids().contains(&emptydir_uid) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "emptydir rmdir never trashed remotely: {:?}",
+            mock.trashed_uids()
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    // The mount no longer lists either folder.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let names: Vec<String> = std::fs::read_dir(&mnt)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    assert!(!names.contains(&"emptydir".to_string()), "{names:?}");
+    assert!(!names.contains(&"gone-soon".to_string()), "{names:?}");
+
     // 8. unlink through the mount trashes remotely (tombstone drains).
     std::fs::remove_file(mnt.join("notes.txt")).unwrap();
     let deadline = Instant::now() + Duration::from_secs(30);
