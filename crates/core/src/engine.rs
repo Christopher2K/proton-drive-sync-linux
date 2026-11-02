@@ -46,6 +46,11 @@ const META_MATERIALIZED_FOR_MODE: &str = "materialized_for_mirror";
 
 /// First backoff delay after a retryable upload failure (F2).
 pub const RETRY_BASE_DEFAULT: Duration = Duration::from_secs(1);
+
+/// How long a vanished backing file stays re-queued before its write is
+/// dropped: long enough for a simultaneously-queued rename to re-key the
+/// write queue, short enough that a real orphan doesn't hot-loop.
+const WRITE_VANISH_GRACE: Duration = Duration::from_secs(5);
 /// Cap for the exponential upload backoff (F2).
 pub const RETRY_BACKOFF_MAX: Duration = Duration::from_secs(300);
 /// Consecutive retryable failures after which a node is marked errored and
@@ -397,6 +402,10 @@ pub struct Engine<S: SidecarApi> {
     /// failure (F2 backoff). In-memory; the failure COUNT is durable in the
     /// DB so restarts don't reset the give-up budget.
     retry_at: HashMap<String, Instant>,
+    /// Writes whose backing file vanished, with the first-seen time: after
+    /// a short grace (a rename may be re-keying the write queue) they are
+    /// dropped instead of hot-looping "backing file vanished" retries.
+    vanished_writes: HashMap<String, Instant>,
     /// Base delay for the exponential backoff (`EngineConfig::retry_base`).
     retry_base: Duration,
     /// In-flight transfer currently being awaited (for pause/resume).
@@ -486,6 +495,7 @@ impl<S: SidecarApi + 'static> Engine<S> {
             buffered_events: VecDeque::new(),
             approved_tombstones: HashSet::new(),
             retry_at: HashMap::new(),
+            vanished_writes: HashMap::new(),
             retry_base: config.retry_base,
             scope_id: None,
             active_transfer: None,
@@ -736,6 +746,22 @@ impl<S: SidecarApi + 'static> Engine<S> {
                     }
                     continue;
                 }
+                // Deletes drain BEFORE renames and writes: an
+                // overwrite-rename (tmp → existing destination) queues a
+                // delete of the destination plus a rename onto the now-free
+                // path. If the rename ran first, the stale delete would
+                // trash the just-renamed node (observed: the destination's
+                // DB row vanishing while each save's tmp uploads as a
+                // separate remote file).
+                if let Some(rel) = store.next_delete_request() {
+                    if let Err(e) = self.handle_local_delete(&rel).await {
+                        warn!(path = %rel, error = %e, "write-through delete failed");
+                    }
+                    if let Err(e) = self.publish_vfs_snapshot(&store) {
+                        warn!(error = %e, "post-delete VFS snapshot failed");
+                    }
+                    continue;
+                }
                 if let Some((old, new)) = store.next_rename_request() {
                     if let Err(e) = self.apply_local_rename(&store, &old, &new).await {
                         warn!(from = %old, to = %new, error = %e, "write-through rename failed");
@@ -750,15 +776,6 @@ impl<S: SidecarApi + 'static> Engine<S> {
                 }
                 if let Some(rel) = store.next_write_request() {
                     self.upload_write_one(&store, &rel).await;
-                    continue;
-                }
-                if let Some(rel) = store.next_delete_request() {
-                    if let Err(e) = self.handle_local_delete(&rel).await {
-                        warn!(path = %rel, error = %e, "write-through delete failed");
-                    }
-                    if let Err(e) = self.publish_vfs_snapshot(&store) {
-                        warn!(error = %e, "post-delete VFS snapshot failed");
-                    }
                     continue;
                 }
             }
@@ -1584,6 +1601,16 @@ impl<S: SidecarApi + 'static> Engine<S> {
     }
 
     async fn handle_local_delete(&mut self, rel: &str) -> Result<()> {
+        // An overwrite-rename (tmp → existing destination) queues this
+        // delete AND a rename onto this path. By the time the delete
+        // drains, the VFS has already moved the NEW content into the
+        // destination's backing file — removing it would destroy the very
+        // content the rename is delivering. Skip the local teardown; the
+        // tombstone (old node) still proceeds.
+        let rename_inbound = self
+            .store
+            .as_ref()
+            .is_some_and(|s| s.rename_inbound(rel));
         let Some(row) = self.db.node_by_path(rel)? else {
             debug!(path = %rel, "delete of unknown local item: no remote action");
             return Ok(());
@@ -1591,7 +1618,9 @@ impl<S: SidecarApi + 'static> Engine<S> {
         if row.sync_state != SyncState::Synced {
             // Never confirmed synced → local removal only (F3.1).
             self.db.remove_node(rel)?;
-            if let Some(store) = &self.store {
+            if let Some(store) = &self.store
+                && !rename_inbound
+            {
                 store.forget(rel);
                 std::fs::remove_file(to_abs(&self.backing_dir, rel)).ok();
             }
@@ -1604,7 +1633,9 @@ impl<S: SidecarApi + 'static> Engine<S> {
             deleted_at: now_unix(),
         })?;
         // Write-through: drop queued work and the hydrated copy too.
-        if let Some(store) = &self.store {
+        if let Some(store) = &self.store
+            && !rename_inbound
+        {
             store.forget(rel);
             std::fs::remove_file(to_abs(&self.backing_dir, rel)).ok();
         }
@@ -2030,7 +2061,28 @@ impl<S: SidecarApi + 'static> Engine<S> {
         if let Err(e) = &result {
             warn!(path = %rel, error = %e, "write upload failed");
         }
-        store.finish_write(rel, result.is_ok());
+        // A vanished backing file usually means the file was renamed or
+        // deleted through the mount while this upload was queued/in flight;
+        // those queue entries own the path now. Re-queueing would hot-loop
+        // "backing file vanished" forever (the file never comes back at
+        // this path). Brief grace first: a rename queued a heartbeat ago
+        // may not have re-keyed the write queue yet, and the rename's own
+        // upload will carry the content.
+        let vanished = result
+            .as_ref()
+            .is_err_and(|e| e.chain().any(|c| c.to_string() == "backing file vanished"));
+        if vanished {
+            let first_seen = self
+                .vanished_writes
+                .entry(rel.to_string())
+                .or_insert_with(Instant::now);
+            if first_seen.elapsed() < WRITE_VANISH_GRACE {
+                store.finish_write(rel, false);
+                return;
+            }
+            self.vanished_writes.remove(rel);
+        }
+        store.finish_write(rel, result.is_ok() || vanished);
         if let Err(e) = self.publish_vfs_snapshot(store) {
             warn!(error = %e, "post-write VFS snapshot failed");
         }
@@ -2132,6 +2184,7 @@ impl<S: SidecarApi + 'static> Engine<S> {
             })?;
             self.db.clear_upload_failures(rel).ok();
             self.retry_at.remove(rel);
+            self.vanished_writes.remove(rel);
 
             if self.state != EngineState::Running {
                 debug!(path = %rel, "paused: write-through upload buffered");

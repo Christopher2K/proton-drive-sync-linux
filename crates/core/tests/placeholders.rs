@@ -326,6 +326,87 @@ async fn bare_mkdir_from_vfs_creates_remote_folder_and_rmdir_trashes_it() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
+async fn overwrite_rename_does_not_lose_the_destination() {
+    // Regression (Plasticity-style atomic save): an app writes
+    // `model.plasticity.<millis>.<n>.tmp`, closes it (write queued), then
+    // renames it over the existing `model.plasticity` (destination delete
+    // + rename queued). The engine used to drain renames before deletes:
+    // apply_local_rename re-keyed the tmp row onto the destination path,
+    // then the stale destination delete trashed the just-renamed node and
+    // removed the row — the file vanished from the DB while every tmp
+    // uploaded as a separate remote file. Deletes must drain first, and
+    // the source's queued write must follow the rename.
+    let fx = start().await;
+    wait_for(|| fx.store.snapshot().by_path.contains_key("hello.txt")).await;
+
+    // Seed a hydrated destination: `model.plasticity` exists remotely,
+    // locally, and in the snapshot. Extra siblings keep the mass-deletion
+    // guard's ratio limb out of this test (1 delete of 3 synced trips it).
+    for i in 0..10 {
+        fx.mock.remote_create_file("root", &format!("filler{i}.bin"), b"filler");
+    }
+    fx.mock.remote_create_file("root", "model.plasticity", b"v1 content");
+    wait_for(|| {
+        fx.store
+            .snapshot()
+            .by_path
+            .contains_key(&"filler9.bin".to_string())
+    })
+    .await;
+    fx.store.begin_hydrate("model.plasticity");
+    wait_for(|| fx.store.backing_path("model.plasticity").is_some()).await;
+    let model_uid = fx.mock.find_uid("root", "model.plasticity").unwrap();
+
+    // Atomic save, exactly as the FUSE layer sees it:
+    // 1. tmp created through the mount and closed → write queued
+    //    (VFS write path: backing file written, record_write called).
+    let tmp = "model.plasticity.1793648988585.3.tmp";
+    let backing_dir = fx
+        .store
+        .backing_path("model.plasticity")
+        .unwrap()
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    std::fs::write(backing_dir.join(tmp), b"v2 content").unwrap();
+    fx.store.record_write(tmp);
+    // 2. rename tmp → model.plasticity: VFS queues destination delete
+    //    (record_delete of model.plasticity) then record_rename(tmp → …).
+    std::fs::rename(backing_dir.join(tmp), backing_dir.join("model.plasticity")).unwrap();
+    fx.store.record_delete("model.plasticity");
+    fx.store.record_rename(tmp, "model.plasticity");
+
+    // The single delete plus the write/rename must land on their own: the
+    // guard no longer trips with the filler files present. The tmp must
+    // never appear remotely, and exactly one node named model.plasticity
+    // must exist — with v2 content.
+    wait_for(|| {
+        fx.mock.file_content(&model_uid).as_deref() == Some(&b"v2 content"[..])
+    })
+    .await;
+    assert!(
+        !fx.mock.uploaded_names().iter().any(|n| n.contains(".tmp")),
+        "temp file must not upload as its own remote node: {:?}",
+        fx.mock.uploaded_names()
+    );
+    assert!(
+        fx.mock.child_names("root").iter().filter(|n| *n == "model.plasticity").count() == 1,
+        "exactly one model.plasticity remotely: {:?}",
+        fx.mock.child_names("root")
+    );
+    assert!(
+        !fx.mock.trashed_uids().contains(&model_uid),
+        "the renamed-onto node must never be trashed: {:?}",
+        fx.mock.trashed_uids()
+    );
+    // And the row survives under the destination path.
+    wait_for(|| fx.store.snapshot().by_path.contains_key("model.plasticity")).await;
+    fx.shutdown().await;
+}
+
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
 async fn vfs_rename_rekeys_rows_and_renames_remotely() {
     let fx = start().await;
     wait_for(|| fx.store.snapshot().by_path.contains_key("hello.txt")).await;
