@@ -5,6 +5,23 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## v0.5.0 - 2026-11-02
+
+
+### Added
+
+- Add trash restore (drive.restore + drive.listTrashed)
+- Support rename through the placeholder mount
+
+### Fixed
+
+- Bind ctrl-w to close the window (#14)
+- Stop clobbering parent_uid on write-through uploads
+
+### Testing
+
+- Keep resuming after guard trips in delete tests (#15)
+
 ## v0.4.2 - 2026-11-02
 
 
