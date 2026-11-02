@@ -92,6 +92,14 @@ pub struct EngineStatus {
     /// past the cap, `None` = unlimited. Live-adjustable via
     /// [`EngineHandle::set_cache_cap`].
     pub cache_cap: Option<u64>,
+    /// Bytes the backing cache currently occupies on disk (placeholder
+    /// mode). Measured with a directory walk, so it reflects reality even
+    /// if the DB is stale. `0` in mirror mode (no backing cache).
+    pub cache_used: u64,
+    /// Where the backing cache lives (placeholder mode); surfaced so the
+    /// UI/CLI can point users at the folder eating their disk. `None` in
+    /// mirror mode.
+    pub cache_path: Option<PathBuf>,
 }
 
 /// Control commands (CLI socket / UI).
@@ -2141,6 +2149,17 @@ impl<S: SidecarApi + 'static> Engine<S> {
                 }
             }
             Command::Status(reply) => {
+                // Placeholder mode: report real on-disk usage of the backing
+                // cache (du-style walk, skipping in-flight *.pds-part tmp
+                // files is unnecessary — they are renamed atomically and a
+                // half-written tmp only ever inflates the count briefly).
+                let (cache_used, cache_path) = match self.store.as_ref() {
+                    Some(_) => {
+                        let used = dir_size(&self.backing_dir);
+                        (used, Some(self.backing_dir.clone()))
+                    }
+                    None => (0, None),
+                };
                 let _ = reply.send(EngineStatus {
                     state: self.state,
                     synced_nodes: self.db.count_synced().unwrap_or(0),
@@ -2154,6 +2173,8 @@ impl<S: SidecarApi + 'static> Engine<S> {
                     conflicted_nodes: self.db.count_remote_conflicted().unwrap_or(0),
                     mode: self.sync_mode(),
                     cache_cap: self.eviction_cap,
+                    cache_used,
+                    cache_path,
                 });
             }
             Command::Shutdown => {}
@@ -2289,6 +2310,56 @@ fn now_unix() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
+}
+
+/// Recursive on-disk size of `dir` (regular files only, symlinks not
+/// followed). Missing dir → 0. Used for the backing-cache usage figure in
+/// [`EngineStatus`] — a walk beats summing DB rows because it reflects
+/// reality even when the index is stale.
+fn dir_size(dir: &Path) -> u64 {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    let mut total = 0u64;
+    for entry in entries.flatten() {
+        let Ok(meta) = entry.metadata() else {
+            continue;
+        };
+        if meta.is_dir() {
+            total = total.saturating_add(dir_size(&entry.path()));
+        } else if meta.is_file() {
+            total = total.saturating_add(meta.len());
+        }
+    }
+    total
+}
+
+/// Human-readable byte count (`4.6 MB`, `10 GB`, `512 B`) for CLI/UI
+/// display. Uses binary units (1 GB = 2³⁰ B), matching the cache-cap
+/// presets in the app settings.
+pub fn format_bytes(bytes: u64) -> String {
+    const UNITS: [(&str, u64); 5] = [
+        ("B", 1),
+        ("KB", 1 << 10),
+        ("MB", 1 << 20),
+        ("GB", 1 << 30),
+        ("TB", 1 << 40),
+    ];
+    let mut unit = UNITS[0];
+    for u in UNITS.iter() {
+        if bytes >= u.1 {
+            unit = *u;
+        }
+    }
+    if unit.1 == 1 {
+        return format!("{} B", bytes);
+    }
+    let value = bytes as f64 / unit.1 as f64;
+    if value >= 10.0 {
+        format!("{value:.0} {}", unit.0)
+    } else {
+        format!("{value:.1} {}", unit.0)
+    }
 }
 
 /// Where the engine reads local file content from for `rel`: the visible

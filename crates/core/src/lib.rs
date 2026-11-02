@@ -13,8 +13,8 @@ pub mod store;
 pub use db::{Db, NodeRow, SyncState, Tombstone};
 pub use engine::{
     ActivityItem, ActivityKind, Command, Engine, EngineConfig, EngineHandle, EngineState,
-    EngineStatus, EVICTION_CAP_DEFAULT, RETRY_BASE_DEFAULT, STATE_DIR, VFS_BACKING_DIR, sha1_file,
-    to_abs, to_rel,
+    EngineStatus, EVICTION_CAP_DEFAULT, RETRY_BASE_DEFAULT, STATE_DIR, VFS_BACKING_DIR,
+    format_bytes, sha1_file, to_abs, to_rel,
 };
 pub use mode::{
     ENV_CACHE_CAP, ENV_SYNC_MODE, META_CACHE_CAP, META_SYNC_MODE, SyncMode, app_data_dir,

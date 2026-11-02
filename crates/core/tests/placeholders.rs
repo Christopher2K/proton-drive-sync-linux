@@ -189,6 +189,37 @@ async fn placeholders_skip_materialization_and_publish_snapshot() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
+async fn status_reports_backing_cache_usage() {
+    let fx = start().await;
+    wait_for(|| fx.store.snapshot().by_path.contains_key("hello.txt")).await;
+
+    // Before any hydration the cache is empty.
+    let s = fx.handle.status().await.unwrap();
+    assert_eq!(s.mode, pds_core::SyncMode::Placeholders);
+    assert_eq!(s.cache_used, 0, "nothing hydrated yet");
+    assert!(s.cache_path.is_some(), "cache path is surfaced");
+
+    // Hydrate hello.txt ("hello drive" = 11 bytes).
+    assert!(fx.store.begin_hydrate("hello.txt"));
+    wait_for(|| fx.store.snapshot().by_path["hello.txt"].content_ready).await;
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while fx.handle.status().await.unwrap().cache_used != 11 {
+        assert!(Instant::now() < deadline, "cache_used never reached 11 bytes");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // After eviction (cap=0 evicts everything) usage drops back to 0.
+    fx.handle.set_cache_cap(Some(0)).await.unwrap();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while fx.handle.status().await.unwrap().cache_used != 0 {
+        assert!(Instant::now() < deadline, "cache_used never dropped to 0");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    fx.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
 async fn hydrate_request_downloads_to_backing() {
     let fx = start().await;
     wait_for(|| fx.store.snapshot().by_path.contains_key("hello.txt")).await;

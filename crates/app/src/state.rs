@@ -461,6 +461,8 @@ mod tests {
             conflicted_nodes: 0,
             mode: SyncMode::Placeholders,
             cache_cap: Some(10 * 1024 * 1024 * 1024),
+            cache_used: 0,
+            cache_path: None,
         }
     }
 

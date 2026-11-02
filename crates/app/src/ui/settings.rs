@@ -174,8 +174,19 @@ pub fn render(view: &mut AppView, cx: &mut Context<AppView>) -> AnyElement {
                             .text_xs()
                             .text_color(rgb(theme::MUTED))
                             .child(match effective {
-                                Some(bytes) => format!("{} GB max", bytes >> 30),
-                                None => "Unlimited".to_string(),
+                                Some(cap) => format!(
+                                    "{} used / {} max",
+                                    pds_core::format_bytes(
+                                        status.as_ref().map(|s| s.cache_used).unwrap_or(0)
+                                    ),
+                                    pds_core::format_bytes(cap),
+                                ),
+                                None => format!(
+                                    "{} used / unlimited",
+                                    pds_core::format_bytes(
+                                        status.as_ref().map(|s| s.cache_used).unwrap_or(0)
+                                    ),
+                                ),
                             }),
                     ),
             )
