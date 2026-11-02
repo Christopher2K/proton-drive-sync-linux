@@ -511,7 +511,57 @@ impl fuser::Filesystem for PdsFs {
         }
         use fuser::OpenAccMode;
         let writable = flags.acc_mode() != OpenAccMode::O_RDONLY;
-        if writable && self.overlay_entry(&rel).is_none() {
+        let overlay = self.overlay_entry(&rel);
+        if writable && overlay.is_some() {
+            // Writable open of an overlay (created-this-session, not yet
+            // snapshotted) file: e.g. `cp src dst` re-opened dst with
+            // O_WRONLY|O_TRUNC before the upload landed. Falling through
+            // to the read path returns fh 0 and no handle is recorded,
+            // so every write(2) fails EIO. Serve a real write handle on
+            // the backing file instead.
+            let truncate = flags.0 & libc::O_TRUNC != 0;
+            let abs = to_abs(&self.backing_dir, &rel);
+            let file = match std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(truncate)
+                .open(&abs)
+            {
+                Ok(f) => f,
+                Err(e) => {
+                    warn!(error = %e, path = %rel, "overlay rewrite open failed");
+                    return reply.error(Errno::EIO);
+                }
+            };
+            let fh = self
+                .next_fh
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if truncate
+                && let Some(entry) = self
+                    .overlay
+                    .lock()
+                    .expect("overlay mutex")
+                    .by_rel
+                    .get_mut(&rel)
+            {
+                entry.size = 0;
+            }
+            self.handles.lock().expect("handles mutex").insert(
+                fh,
+                WriteHandle {
+                    rel: rel.clone(),
+                    file,
+                    // O_TRUNC already destroyed the old content; even a
+                    // close with no writes must re-upload (or the mount
+                    // would serve the stale uploaded head forever).
+                    dirty: truncate,
+                    overlay: true,
+                },
+            );
+            return reply.opened(FileHandle(fh), FopenFlags::empty());
+        }
+        if writable && overlay.is_none() {
             // Revision write (M3.3): the file must be hydrated before the
             // handle can serve bytes — same bounded wait as read().
             if !content_ready {
