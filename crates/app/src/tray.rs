@@ -357,6 +357,8 @@ mod tests {
             errored_nodes: 0,
             conflicted_nodes: 0,
             cache_cap: None,
+            cache_used: 0,
+            cache_path: None,
         });
         state
     }

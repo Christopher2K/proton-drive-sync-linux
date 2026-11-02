@@ -239,8 +239,18 @@ async fn serve_conn(stream: UnixStream, handle: EngineHandle) -> Result<()> {
             "pause" => handle.pause().await.map(|_| "ok: paused".to_string()),
             "resume" => handle.resume().await.map(|_| "ok: resumed".to_string()),
             "status" => handle.status().await.map(|s| {
+                let cache = if s.mode == pds_core::SyncMode::Placeholders {
+                    match s.cache_cap {
+                        Some(cap) => {
+                            format!(" cache={} / {}", pds_core::format_bytes(s.cache_used), pds_core::format_bytes(cap))
+                        }
+                        None => format!(" cache={}", pds_core::format_bytes(s.cache_used)),
+                    }
+                } else {
+                    String::new()
+                };
                 format!(
-                    "{} mode={} (synced={}, dirty={}, tombstones={}, errored={})",
+                    "{} mode={} (synced={}, dirty={}, tombstones={}, errored={}){cache}",
                     s.state,
                     s.mode.as_meta_value(),
                     s.synced_nodes,
