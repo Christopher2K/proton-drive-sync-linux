@@ -1161,6 +1161,21 @@ impl<S: SidecarApi + 'static> Engine<S> {
             }
             return self.upload_row(rel, &row).await;
         }
+        // Pending (never-uploaded) row without a parent uid: the sidecar
+        // requires exactly one of parentUid/nodeUid, so resolve the parent
+        // now (self-heal for legacy rows that lost it).
+        let mut row = row;
+        if row.parent_uid.is_none() {
+            let parent_rel = rel.rsplit_once('/').map(|(d, _)| d);
+            let parent_uid = match parent_rel {
+                Some(d) => Some(self.ensure_remote_folder_async(d).await?),
+                None => self.db_root_uid()?,
+            };
+            if let Some(p) = parent_uid {
+                row.parent_uid = Some(p);
+                self.db.upsert_node(&row)?;
+            }
+        }
         self.upload_row(rel, &row).await
     }
 
@@ -1925,9 +1940,24 @@ impl<S: SidecarApi + 'static> Engine<S> {
                 if row.sync_state == SyncState::Synced && row.sha1.as_deref() == Some(&sha1) {
                     return Ok(()); // content unchanged (spurious close)
                 }
-                // Revision of an existing (possibly pending) node.
+                // Revision of an existing (possibly pending) node. A pending
+                // row without a parent (legacy/bugged rows — the second
+                // upsert here used to clobber it to NULL) re-resolves the
+                // parent now: without it the sidecar rejects the upload
+                // (`exactly one of parentUid/nodeUid`).
+                let parent_uid = match row.parent_uid.clone() {
+                    Some(p) => Some(p),
+                    None if row.node_uid.starts_with("pending:") => {
+                        let parent_rel = rel.rsplit_once('/').map(|(d, _)| d);
+                        match parent_rel {
+                            Some(d) => Some(self.ensure_remote_folder_async(d).await?),
+                            None => self.db_root_uid()?,
+                        }
+                    }
+                    None => None,
+                };
                 (
-                    row.parent_uid.clone(),
+                    parent_uid,
                     (!row.node_uid.starts_with("pending:")).then(|| row.node_uid.clone()),
                     row.synced_sha1.clone(),
                 )
@@ -1966,11 +1996,14 @@ impl<S: SidecarApi + 'static> Engine<S> {
             }
         };
 
+        // Re-read the row: for a brand-new file the first upsert above
+        // already resolved and stored the parent uid (and possibly a
+        // collision-renamed `name`); the `None` tuple must not clobber it.
         if let Some(row) = self.db.node_by_path(rel)? {
             self.db.upsert_node(&NodeRow {
                 local_path: rel.to_string(),
                 node_uid: node_uid.unwrap_or_else(|| row.node_uid.clone()),
-                parent_uid,
+                parent_uid: parent_uid.or(row.parent_uid.clone()),
                 name: row.name.clone(),
                 kind: NodeKind::File,
                 size: Some(size as i64),

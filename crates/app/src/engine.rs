@@ -155,6 +155,7 @@ async fn run(
         .await
         {
             EngineExit::Quit(reason) => {
+                tracing::error!(reason = %reason, "engine session exited");
                 let _ = updates.send(AppUpdate::Exited { reason });
                 return Ok(());
             }
