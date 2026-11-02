@@ -303,8 +303,18 @@ async fn bare_mkdir_from_vfs_creates_remote_folder_and_rmdir_trashes_it() {
     // The mass-deletion guard counts percentage limbs too, and this tiny
     // tree (3 synced nodes, 2 deletes) trips it. Resume once to approve
     // the batch — same UX as a real user confirming a small tree.
-    fx.handle.resume().await.unwrap();
-    wait_for(|| !fx.store.snapshot().by_path.contains_key("NewFolder")).await;
+    //
+    // Resume only approves tombstones the engine has *received*; this
+    // delete may still be in flight on the store event queue, so retry
+    // resume until the row actually leaves the snapshot (a resume
+    // processed before the delete lands approves nothing and the guard
+    // re-pauses on the next drain).
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while fx.store.snapshot().by_path.contains_key("NewFolder") {
+        assert!(Instant::now() < deadline, "NewFolder never left the snapshot");
+        fx.handle.resume().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
     wait_for(|| !fx.mock.child_names("root").iter().any(|n| n == "NewFolder")).await;
     assert!(
         fx.mock.trashed_uids().contains(&uid),

@@ -367,19 +367,18 @@ async fn fuse_mount_serves_placeholders_and_hydrates() {
     // Both remove cleanly; emptydir trashes remotely (gone-soon may or
     // may not have a row yet depending on drain order — either way the
     // engine handles it). Two rapid deletes on this small tree can trip
-    // the percentage limb of the mass-deletion guard; one explicit
-    // resume approves the batch.
-    handle.resume().await.unwrap();
+    // the percentage limb of the mass-deletion guard; explicit resumes
+    // approve the batch. Resume only approves tombstones the engine has
+    // received, so keep resuming until emptydir is actually trashed (a
+    // resume processed before a delete lands approves nothing).
     let deadline = Instant::now() + Duration::from_secs(30);
-    loop {
-        if mock.trashed_uids().contains(&emptydir_uid) {
-            break;
-        }
+    while !mock.trashed_uids().contains(&emptydir_uid) {
         assert!(
             Instant::now() < deadline,
             "emptydir rmdir never trashed remotely: {:?}",
             mock.trashed_uids()
         );
+        handle.resume().await.unwrap();
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     // The mount no longer lists either folder.
@@ -394,23 +393,28 @@ async fn fuse_mount_serves_placeholders_and_hydrates() {
 
     // 8. unlink through the mount trashes remotely (tombstone drains).
     std::fs::remove_file(mnt.join("notes.txt")).unwrap();
+    // Third delete in the window on this small tree: the ratio limb can
+    // trip again. Resume only approves tombstones already received, so
+    // keep resuming until the trash lands and the row leaves the mount
+    // (earlier deletes may already be in trashed_uids).
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
-        let trashed = mock.trashed_uids();
-        if !trashed.is_empty() {
+        let names: Vec<String> = std::fs::read_dir(&mnt)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        if !names.contains(&"notes.txt".to_string()) {
             break;
         }
-        assert!(Instant::now() < deadline, "unlink never trashed remotely");
+        assert!(
+            Instant::now() < deadline,
+            "unlink never trashed remotely: {:?}",
+            mock.trashed_uids()
+        );
+        handle.resume().await.unwrap();
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    // The mount no longer lists it.
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    let names: Vec<String> = std::fs::read_dir(&mnt)
-        .unwrap()
-        .filter_map(|e| e.ok())
-        .map(|e| e.file_name().to_string_lossy().into_owned())
-        .collect();
-    assert!(!names.contains(&"notes.txt".to_string()), "{names:?}");
 
     handle.shutdown().await.ok();
     drop(session);
