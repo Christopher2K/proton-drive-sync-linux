@@ -307,6 +307,45 @@ async fn fuse_mount_serves_placeholders_and_hydrates() {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 
+    // 6d. Regression: replace an OVERLAY file (created this session,
+    // upload still in flight) with open(O_WRONLY|O_TRUNC) — the `cp`
+    // pattern. open() used to return fh 0 for writable overlay opens,
+    // so every write(2) failed EIO.
+    std::fs::write(mnt.join("overlay-replace.txt"), b"first version").unwrap();
+    // Do NOT wait for the upload: the rewrite must work even while the
+    // file is still overlay-only. `cp src dst` = open(dst, O_WRONLY|O_TRUNC)
+    // + write, i.e. File::create over an existing path.
+    let mut replace = std::fs::OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .open(mnt.join("overlay-replace.txt"))
+        .expect("writable open of overlay file");
+    replace.write_all(b"second version").unwrap();
+    replace.flush().unwrap();
+    drop(replace);
+    assert_eq!(
+        std::fs::read(mnt.join("overlay-replace.txt")).unwrap(),
+        b"second version",
+        "overlay rewrite must be readable back"
+    );
+    // …and the second version is what lands remotely.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let content = mock
+            .find_uid("root", "overlay-replace.txt")
+            .and_then(|uid| mock.file_content(&uid));
+        if content.as_deref() == Some(&b"second version"[..]) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "overlay replace never landed remotely: children {:?}, uploads {:?}",
+            mock.child_names("root"),
+            mock.uploaded_names(),
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
     // 7. mkdir + nested create upload the folder chain too.
     std::fs::create_dir(mnt.join("docs")).unwrap();
     std::fs::write(mnt.join("docs").join("a.md"), b"# hi").unwrap();
