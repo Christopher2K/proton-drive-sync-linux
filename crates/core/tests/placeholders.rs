@@ -350,7 +350,7 @@ async fn overwrite_rename_does_not_lose_the_destination() {
         fx.store
             .snapshot()
             .by_path
-            .contains_key(&"filler9.bin".to_string())
+            .contains_key("filler9.bin")
     })
     .await;
     fx.store.begin_hydrate("model.plasticity");
@@ -370,11 +370,35 @@ async fn overwrite_rename_does_not_lose_the_destination() {
         .to_path_buf();
     std::fs::write(backing_dir.join(tmp), b"v2 content").unwrap();
     fx.store.record_write(tmp);
-    // 2. rename tmp → model.plasticity: VFS queues destination delete
-    //    (record_delete of model.plasticity) then record_rename(tmp → …).
+    // 2. rename tmp → model.plasticity: the VFS queues the destination
+    //    delete and the rename atomically (record_overwrite).
     std::fs::rename(backing_dir.join(tmp), backing_dir.join("model.plasticity")).unwrap();
-    fx.store.record_delete("model.plasticity");
-    fx.store.record_rename(tmp, "model.plasticity");
+    fx.store.record_overwrite("model.plasticity", tmp, "model.plasticity");
+
+    // Settle before asserting remote state: the overwrite delete resolves
+    // as a tombstone that the in-place upload cancels, or that drains —
+    // either way the assertions below must observe the FINAL state, not a
+    // mid-flight one (an early version of this test asserted while the
+    // stale tombstone could still land after the upload, ~30% flaky).
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let (deletes, renames, writes) = fx.store.pending_counts();
+        let tombstones = fx
+            .handle
+            .status()
+            .await
+            .map(|s| s.queued_tombstones)
+            .unwrap_or(usize::MAX);
+        if deletes == 0 && renames == 0 && writes == 0 && tombstones == 0 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "engine did not settle in time (deletes={deletes}, renames={renames}, \
+             writes={writes}, tombstones={tombstones})"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 
     // The single delete plus the write/rename must land on their own: the
     // guard no longer trips with the filler files present. The tmp must

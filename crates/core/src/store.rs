@@ -81,6 +81,15 @@ struct Inner {
     next_generation: u64,
 }
 
+/// One unit of local work for the engine's main loop, popped atomically
+/// from the store's queues with delete → rename → write priority
+/// ([`Store::next_work_request`]).
+pub enum WorkRequest {
+    Delete(String),
+    Rename(String, String),
+    Write(String),
+}
+
 /// Engine ↔ VFS shared state. Cheap to clone (`Arc`).
 #[derive(Clone)]
 pub struct Store {
@@ -350,9 +359,101 @@ impl Store {
         }
     }
 
+    /// Queue an overwrite-rename atomically: `dest` is replaced by a rename
+    /// of `old_rel` onto `new_rel` (VFS rename over an existing destination).
+    /// Equivalent to `record_delete(dest)` + `record_rename(old, new)` under
+    /// a single lock with a single wake-up, so the engine can never drain
+    /// the delete before the rename is queued (it would see no inbound
+    /// rename and tear down the content the rename is delivering).
+    pub fn record_overwrite(&self, dest_rel: &str, old_rel: &str, new_rel: &str) {
+        let mut inner = self.lock();
+        let dest = dest_rel.to_string();
+        if !inner.pending_deletes.contains(&dest) {
+            inner.pending_deletes.push_back(dest.clone());
+        }
+        inner.deleted.insert(dest);
+
+        let old = old_rel.to_string();
+        let new = new_rel.to_string();
+        // Re-key queued renames whose destination is this source: the
+        // file they describe is the one now moving again.
+        for r in inner.pending_renames.iter_mut() {
+            if r.1 == old {
+                r.1 = new.clone();
+            }
+        }
+        // A pair renamed back onto itself cancels.
+        inner.pending_renames.retain(|(o, n)| o != n);
+        // The overwrite delivers NEW content to the destination, so its
+        // upload must follow the pair: drop the source's queued upload (its
+        // row follows the rename; the content now lives at the destination)
+        // and queue the destination. Queue even while a destination upload
+        // is in flight — next_write_request holds in-flight entries until
+        // they finish, then this entry delivers the fresh content. Without
+        // the unconditional queue, an overwrite arriving after the source's
+        // write already drained (vanished tmp) queued nothing and the new
+        // content never reached the remote.
+        inner.pending_writes.retain(|w| *w != old && *w != new);
+        inner.pending_writes.push_back(new.clone());
+        if inner.pending_renames.iter().any(|(o, n)| o == &old && n == &new) {
+            // Already queued; the delete above is the only new work.
+        } else {
+            inner.pending_renames.push_back((old, new));
+        }
+        drop(inner);
+        self.notify.notify_one();
+    }
+
+    /// Queue depths for tests and diagnostics: (delete requests, rename
+    /// requests, write requests). The queues are in-memory only.
+    pub fn pending_counts(&self) -> (usize, usize, usize) {
+        let inner = self.lock();
+        (
+            inner.pending_deletes.len(),
+            inner.pending_renames.len(),
+            inner.pending_writes.len(),
+        )
+    }
+
     /// Next path to delete remotely (engine), oldest first.
     pub fn next_delete_request(&self) -> Option<String> {
         self.lock().pending_deletes.pop_front()
+    }
+
+    /// One structural/unit-of-work pop for the engine's main loop, with the
+    /// full delete → rename → write priority resolved ATOMICALLY under a
+    /// single lock. The three queues are fed by concurrent producers (VFS
+    /// threads); separate per-queue pops let a producer's multi-queue
+    /// operation land between two pops and invert the priority — an
+    /// overwrite-rename (delete + rename + write queued together) draining
+    /// its write BEFORE its delete trashed the destination node it had just
+    /// uploaded (observed: v2 lands, then `trashed remotely`). A single pop
+    /// cannot interleave with a producer's locked queueing, so the triple
+    /// always drains delete → rename → write. Write entries whose upload is
+    /// in flight stay queued (same rule as `next_write_request`).
+    pub fn next_work_request(&self) -> Option<WorkRequest> {
+        let mut inner = self.lock();
+        if let Some(rel) = inner.pending_deletes.pop_front() {
+            return Some(WorkRequest::Delete(rel));
+        }
+        if let Some((old, new)) = inner.pending_renames.pop_front() {
+            return Some(WorkRequest::Rename(old, new));
+        }
+        let mut skipped = Vec::new();
+        let mut result = None;
+        while let Some(rel) = inner.pending_writes.pop_front() {
+            if inner.uploading.contains(&rel) {
+                skipped.push(rel);
+            } else {
+                inner.uploading.insert(rel.clone());
+                result = Some(WorkRequest::Write(rel));
+                break;
+            }
+        }
+        for rel in skipped.into_iter().rev() {
+            inner.pending_writes.push_front(rel);
+        }
+        result
     }
 
     /// True if `rel` has a delete queued (or in flight) from the mount.
