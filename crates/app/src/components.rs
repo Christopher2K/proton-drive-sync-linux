@@ -103,6 +103,7 @@ pub fn toggle_switch<V: 'static>(
         .id(id)
         .flex()
         .items_center()
+        .flex_shrink_0()
         .w(px(38.0))
         .h(px(22.0))
         .p(px(2.0))
