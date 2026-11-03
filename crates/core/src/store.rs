@@ -62,6 +62,14 @@ struct Inner {
     /// The engine turns each into a remote `renameNode` (never a
     /// trash+re-upload), re-keying the DB rows beneath the paths.
     pending_renames: VecDeque<(String, String)>,
+    /// Paths deleted through the mount that the served snapshot may still
+    /// list until the engine drains their tombstones and republishes.
+    /// Outlives `pending_deletes` (which the engine pops immediately);
+    /// cleared when a published snapshot no longer contains the path, or
+    /// the path is re-created. The VFS's rmdir emptiness check ignores
+    /// these — without that, `rm -rf` hits ENOTEMPTY milliseconds after
+    /// its last unlink.
+    deleted: HashSet<String>,
     /// Last access per hydrated rel (LRU order for eviction; M3.2).
     /// Monotonic counter, not wall time: avoids clock skew and gives a
     /// total order even for same-second reads.
@@ -119,6 +127,16 @@ impl Store {
             children,
             by_path,
         };
+        // Deletes the new snapshot has absorbed are settled; forget them.
+        let absorbed: Vec<String> = inner
+            .deleted
+            .iter()
+            .filter(|rel| !inner.snapshot.by_path.contains_key(*rel))
+            .cloned()
+            .collect();
+        for rel in absorbed {
+            inner.deleted.remove(&rel);
+        }
     }
 
     /// Register a hydrated backing file (engine, after a download lands).
@@ -219,6 +237,9 @@ impl Store {
         let first = {
             let mut inner = self.lock();
             let rel = rel.to_string();
+            // Re-created after a delete: drop the stale snapshot mark
+            // (same reasoning as record_mkdir).
+            inner.deleted.remove(&rel);
             if inner.pending_writes.contains(&rel) {
                 false
             } else {
@@ -281,8 +302,11 @@ impl Store {
             let rel = rel.to_string();
             let first = !inner.pending_mkdirs.contains(&rel);
             if first {
-                inner.pending_mkdirs.push_back(rel);
+                inner.pending_mkdirs.push_back(rel.clone());
             }
+            // Re-created after a delete: the stale tombstone snapshot mark
+            // (if any) no longer describes this path.
+            inner.deleted.remove(&rel);
             first
         };
         if first {
@@ -316,8 +340,9 @@ impl Store {
             let rel = rel.to_string();
             let first = !inner.pending_deletes.contains(&rel);
             if first {
-                inner.pending_deletes.push_back(rel);
+                inner.pending_deletes.push_back(rel.clone());
             }
+            inner.deleted.insert(rel);
             first
         };
         if first {
@@ -328,6 +353,16 @@ impl Store {
     /// Next path to delete remotely (engine), oldest first.
     pub fn next_delete_request(&self) -> Option<String> {
         self.lock().pending_deletes.pop_front()
+    }
+
+    /// True if `rel` has a delete queued (or in flight) from the mount.
+    /// The VFS uses this to answer rmdir's emptiness check for children
+    /// that are gone on disk but still served by the last snapshot until
+    /// the engine drains their tombstones — without it, an `rm -rf` gets
+    /// ENOTEMPTY milliseconds after the last unlink.
+    pub fn has_pending_delete(&self, rel: &str) -> bool {
+        let inner = self.lock();
+        inner.pending_deletes.iter().any(|p| p == rel) || inner.deleted.contains(rel)
     }
 
     /// Queue a rename made through the mount (VFS `rename`). Chained

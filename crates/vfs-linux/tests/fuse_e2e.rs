@@ -543,6 +543,59 @@ async fn fuse_mount_serves_placeholders_and_hydrates() {
     }
     assert!(!mock.trashed_uids().contains(&uid_docs_a));
 
+    // 9c. Regression: `rm -rf` of a folder with contents through the
+    // mount. The child unlinks queue deletes but the children stay in
+    // the served snapshot until the engine drains their tombstones and
+    // republishes; rmdir milliseconds later used to hit them in
+    // dir_is_empty and fail with ENOTEMPTY.
+    std::fs::write(mnt.join("docs").join("b.md"), b"# bye").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if mock.uploaded_names().iter().any(|n| n == "b.md") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "b.md upload never happened: uploads {:?}",
+            mock.uploaded_names(),
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    // Both children synced and served by the snapshot before we delete
+    // (docs/a.md was renamed to moved.md in step 9b; only b.md remains
+    // alongside the folder row itself).
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let snap = store.snapshot();
+        if snap.by_path.get("docs").is_some_and(|n| n.is_dir)
+            && snap.by_path.get("docs/b.md").is_some()
+        {
+            break;
+        }
+        assert!(Instant::now() < deadline, "docs children never snapshotted");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    std::fs::remove_dir_all(mnt.join("docs")).expect(
+        "rm -rf of a snapshot-backed folder must not fail ENOTEMPTY while child deletes are still queued",
+    );
+    // Everything under docs/ trashes remotely (children + folder). The
+    // mass-deletion guard may pause on this small tree; keep resuming —
+    // resume only approves tombstones the engine has already received.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let kids = mock.child_names(&docs_uid);
+        if kids.is_empty() && !mock.child_names("root").iter().any(|n| n == "docs") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "rm -rf never trashed remotely: docs children {kids:?}, trashed {:?}",
+            mock.trashed_uids(),
+        );
+        handle.resume().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
     handle.shutdown().await.ok();
     drop(session);
     let _ = engine_task.await;
