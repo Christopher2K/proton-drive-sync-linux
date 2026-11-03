@@ -568,7 +568,7 @@ async fn fuse_mount_serves_placeholders_and_hydrates() {
     loop {
         let snap = store.snapshot();
         if snap.by_path.get("docs").is_some_and(|n| n.is_dir)
-            && snap.by_path.get("docs/b.md").is_some()
+            && snap.by_path.contains_key("docs/b.md")
         {
             break;
         }

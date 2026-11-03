@@ -32,7 +32,7 @@ use crate::conflict::conflict_name;
 use crate::db::{Db, NodeRow, SyncState, Tombstone};
 use crate::guard::DeleteGuard;
 use crate::mode::SyncMode;
-use crate::store::{Store, VNode};
+use crate::store::{Store, VNode, WorkRequest};
 
 /// Name of the engine-private directory inside the sync root (DB, socket).
 pub const STATE_DIR: &str = ".pds";
@@ -752,31 +752,39 @@ impl<S: SidecarApi + 'static> Engine<S> {
                 // path. If the rename ran first, the stale delete would
                 // trash the just-renamed node (observed: the destination's
                 // DB row vanishing while each save's tmp uploads as a
-                // separate remote file).
-                if let Some(rel) = store.next_delete_request() {
-                    if let Err(e) = self.handle_local_delete(&rel).await {
-                        warn!(path = %rel, error = %e, "write-through delete failed");
+                // separate remote file). The priority is resolved
+                // atomically in the pop: the VFS queues the triple under
+                // one lock, and a single pop cannot interleave with it —
+                // separate per-queue pops let the write drain before the
+                // delete when the triple lands between two pops (observed:
+                // v2 uploaded, then `trashed remotely` on the same node).
+                match store.next_work_request() {
+                    Some(WorkRequest::Delete(rel)) => {
+                        if let Err(e) = self.handle_local_delete(&rel).await {
+                            warn!(path = %rel, error = %e, "write-through delete failed");
+                        }
+                        if let Err(e) = self.publish_vfs_snapshot(&store) {
+                            warn!(error = %e, "post-delete VFS snapshot failed");
+                        }
+                        continue;
                     }
-                    if let Err(e) = self.publish_vfs_snapshot(&store) {
-                        warn!(error = %e, "post-delete VFS snapshot failed");
+                    Some(WorkRequest::Rename(old, new)) => {
+                        if let Err(e) = self.apply_local_rename(&store, &old, &new).await {
+                            warn!(from = %old, to = %new, error = %e, "write-through rename failed");
+                            store.finish_rename(&old, &new, false);
+                        } else {
+                            store.finish_rename(&old, &new, true);
+                        }
+                        if let Err(e) = self.publish_vfs_snapshot(&store) {
+                            warn!(error = %e, "post-rename VFS snapshot failed");
+                        }
+                        continue;
                     }
-                    continue;
-                }
-                if let Some((old, new)) = store.next_rename_request() {
-                    if let Err(e) = self.apply_local_rename(&store, &old, &new).await {
-                        warn!(from = %old, to = %new, error = %e, "write-through rename failed");
-                        store.finish_rename(&old, &new, false);
-                    } else {
-                        store.finish_rename(&old, &new, true);
+                    Some(WorkRequest::Write(rel)) => {
+                        self.upload_write_one(&store, &rel).await;
+                        continue;
                     }
-                    if let Err(e) = self.publish_vfs_snapshot(&store) {
-                        warn!(error = %e, "post-rename VFS snapshot failed");
-                    }
-                    continue;
-                }
-                if let Some(rel) = store.next_write_request() {
-                    self.upload_write_one(&store, &rel).await;
-                    continue;
+                    None => {}
                 }
             }
             // F4: when running, pump queued work (tombstones → uploads → events).
@@ -1509,6 +1517,46 @@ impl<S: SidecarApi + 'static> Engine<S> {
             debug!(path = %old_rel, "rename of unknown local item: no remote action");
             return Ok(());
         };
+
+        // Overwrite-rename (tmp → existing destination) whose source never
+        // reached the remote: a racing write-upload created a `pending:`
+        // row for the tmp just before the rename drained. The generic
+        // re-key below would move that row onto the destination path,
+        // clobbering the destination's synced row — the content would
+        // upload as a BRAND-NEW node while the overwrite delete's
+        // tombstone trashes the destination's real node. The file's
+        // identity (node uid, share links, revisions) dies, and a tombstone
+        // draining after the upload loses the file entirely. Instead the
+        // destination's row wins: drop the never-synced source row, mark
+        // the destination dirty, and let its queued write deliver the
+        // content as a revision of the EXISTING node. The destination's
+        // overwrite-delete tombstone (deletes drain first) is cancelled
+        // once that revision upload lands (cancel_stale_tombstone).
+        if row.is_file()
+            && row.node_uid.starts_with("pending:")
+            && let Some(dest) = self.db.node_by_path(new_rel)?
+            && dest.is_file()
+        {
+            self.db.remove_node(old_rel)?;
+            let uid = dest.node_uid.clone();
+            self.db.upsert_node(&NodeRow {
+                sync_state: SyncState::Dirty,
+                ..dest
+            })?;
+            // The VFS queued the destination write with the
+            // overwrite pair; record_write is a dedup'ing no-op in
+            // that case and the sole queue source when the racing
+            // tmp upload already drained (and dropped its request).
+            store.record_write(new_rel);
+            info!(
+                from = %old_rel,
+                to = %new_rel,
+                uid = %uid,
+                "overwrite rename merged into the existing node"
+            );
+            return Ok(());
+        }
+
         let new_name = new_rel
             .rsplit('/')
             .next()
@@ -2064,13 +2112,18 @@ impl<S: SidecarApi + 'static> Engine<S> {
         // A vanished backing file usually means the file was renamed or
         // deleted through the mount while this upload was queued/in flight;
         // those queue entries own the path now. Re-queueing would hot-loop
-        // "backing file vanished" forever (the file never comes back at
-        // this path). Brief grace first: a rename queued a heartbeat ago
-        // may not have re-keyed the write queue yet, and the rename's own
-        // upload will carry the content.
-        let vanished = result
-            .as_ref()
-            .is_err_and(|e| e.chain().any(|c| c.to_string() == "backing file vanished"));
+        // forever (the file never comes back at this path). Detect both the
+        // explicit "backing file vanished" context (metadata probe) and a
+        // raw NotFound from the hash/read racing the rename. Brief grace
+        // first: a rename queued a heartbeat ago may not have re-keyed the
+        // write queue yet, and the rename's own upload will carry the
+        // content.
+        let vanished = result.as_ref().is_err_and(|e| {
+            e.chain().any(|c| c.to_string() == "backing file vanished")
+                || e.chain()
+                    .filter_map(|c| c.downcast_ref::<std::io::Error>())
+                    .any(|io| io.kind() == std::io::ErrorKind::NotFound)
+        });
         if vanished {
             let first_seen = self
                 .vanished_writes
@@ -2085,6 +2138,33 @@ impl<S: SidecarApi + 'static> Engine<S> {
         store.finish_write(rel, result.is_ok() || vanished);
         if let Err(e) = self.publish_vfs_snapshot(store) {
             warn!(error = %e, "post-write VFS snapshot failed");
+        }
+    }
+
+    /// A tombstone names a node queued for trash. When a write pushes new
+    /// content onto that very node, the delete that queued the tombstone is
+    /// stale: an overwrite-rename whose rename half found no tracked source
+    /// row ("rename of unknown local item") updates the destination row in
+    /// place, so the destination's queued delete still points at the node
+    /// the write just delivered. Trashing it would destroy the file. Drop
+    /// the tombstone instead. When the rename re-keyed a tracked source
+    /// onto the path, the tombstone's uid differs from the uploaded node's
+    /// and the old node's trash correctly stands.
+    fn cancel_stale_tombstone(&self, rel: &str, uploaded_uid: &str) {
+        let Ok(tombstones) = self.db.tombstones() else { return };
+        let Some(t) = tombstones.iter().find(|t| t.local_path == rel) else {
+            return;
+        };
+        if t.node_uid != uploaded_uid {
+            return;
+        }
+        match self.db.remove_tombstone(rel) {
+            Ok(()) => info!(
+                path = %rel,
+                uid = %uploaded_uid,
+                "cancelled stale tombstone: in-place update superseded the queued delete"
+            ),
+            Err(e) => warn!(path = %rel, error = %e, "failed to cancel stale tombstone"),
         }
     }
 
@@ -2107,6 +2187,12 @@ impl<S: SidecarApi + 'static> Engine<S> {
         let (parent_uid, node_uid, synced_sha1) = match self.db.node_by_path(rel)? {
             Some(row) => {
                 if row.sync_state == SyncState::Synced && row.sha1.as_deref() == Some(&sha1) {
+                    // Content identical to the synced revision. A queued
+                    // delete for this node is stale (an overwrite-rename
+                    // delivering identical content); the file demonstrably
+                    // still exists with its known content, so the newest
+                    // signal — the write — wins over the older delete.
+                    self.cancel_stale_tombstone(rel, &row.node_uid);
                     return Ok(()); // content unchanged (spurious close)
                 }
                 // Revision of an existing (possibly pending) node. A pending
@@ -2171,7 +2257,7 @@ impl<S: SidecarApi + 'static> Engine<S> {
         if let Some(row) = self.db.node_by_path(rel)? {
             self.db.upsert_node(&NodeRow {
                 local_path: rel.to_string(),
-                node_uid: node_uid.unwrap_or_else(|| row.node_uid.clone()),
+                node_uid: node_uid.clone().unwrap_or_else(|| row.node_uid.clone()),
                 parent_uid: parent_uid.or(row.parent_uid.clone()),
                 name: row.name.clone(),
                 kind: NodeKind::File,
@@ -2191,6 +2277,11 @@ impl<S: SidecarApi + 'static> Engine<S> {
                 return Ok(());
             }
             self.upload_one(rel).await?;
+            // A revision just landed on an existing remote node; see the
+            // helper for why a same-node tombstone is stale.
+            if let Some(uid) = &node_uid {
+                self.cancel_stale_tombstone(rel, uid);
+            }
         }
         Ok(())
     }

@@ -983,7 +983,11 @@ impl fuser::Filesystem for PdsFs {
 
         // Destination handling per rename(2)/renameat2 semantics: a file
         // replaces a file, a dir replaces an EMPTY dir, anything else is an
-        // error. The replaced destination is mirrored as a remote delete.
+        // error. The replaced destination is mirrored as a remote delete —
+        // queued together with the rename at the end (record_overwrite), so
+        // the engine can never drain the delete without seeing the inbound
+        // rename and tear down the content the rename is delivering.
+        let mut replaced = false;
         if let Some((dst_is_dir, _, _, _)) = self.node_meta(&new_rel) {
             if flags.contains(fuser::RenameFlags::RENAME_NOREPLACE) {
                 return reply.error(Errno::EEXIST);
@@ -997,6 +1001,7 @@ impl fuser::Filesystem for PdsFs {
             if src_is_dir && dst_is_dir && !self.dir_is_empty(&new_rel) {
                 return reply.error(Errno::ENOTEMPTY);
             }
+            replaced = true;
             self.overlay.lock().expect("overlay mutex").remove(&new_rel);
             let abs = to_abs(&self.backing_dir, &new_rel);
             if dst_is_dir {
@@ -1006,7 +1011,6 @@ impl fuser::Filesystem for PdsFs {
                 std::fs::remove_file(&abs).ok();
                 self.store.forget(&new_rel);
             }
-            self.store.record_delete(&new_rel);
         }
 
         // 1. Move the backing content (hydrated or write-created). A pure
@@ -1071,9 +1075,15 @@ impl fuser::Filesystem for PdsFs {
             }
         }
 
-        // 3. Queue the remote rename (engine re-keys rows, renameNode /
-        //    moveNodes remotely, re-registers backing paths).
-        self.store.record_rename(&old_rel, &new_rel);
+        // 3. Queue the remote work (engine re-keys rows, renameNode /
+        //    moveNodes remotely, re-registers backing paths). An
+        //    overwrite-rename queues the destination delete and the rename
+        //    atomically so the engine always sees the pair together.
+        if replaced {
+            self.store.record_overwrite(&new_rel, &old_rel, &new_rel);
+        } else {
+            self.store.record_rename(&old_rel, &new_rel);
+        }
         debug!(from = %old_rel, to = %new_rel, "vfs: rename queued");
         reply.ok();
     }
