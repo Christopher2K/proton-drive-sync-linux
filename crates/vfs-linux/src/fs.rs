@@ -217,12 +217,17 @@ impl PdsFs {
     /// overlay has no snapshot children by definition.
     fn dir_is_empty(&self, rel: &str) -> bool {
         let prefix = format!("{rel}/");
+        // Children with a queued delete are gone on disk; the snapshot
+        // keeps serving them only until the engine drains the tombstone
+        // and republishes. Counting them would hand an `rm -rf` an
+        // ENOTEMPTY milliseconds after its last unlink.
+        let pending_delete =
+            |c: &String| -> bool { self.store.has_pending_delete(c) };
         let snapshot_child = match self.tree.ino_of_opt(rel) {
-            Some(ino) => self
-                .tree
-                .children(ino)
-                .map(|c| !c.is_empty())
-                .unwrap_or(false),
+            Some(ino) => match self.tree.children(ino) {
+                Some(children) => children.iter().any(|c| !pending_delete(c)),
+                None => false,
+            },
             None => false,
         };
         if snapshot_child {
@@ -234,7 +239,7 @@ impl PdsFs {
             .expect("overlay mutex")
             .by_rel
             .keys()
-            .any(|c| c.starts_with(&prefix))
+            .any(|c| c.starts_with(&prefix) && !pending_delete(c))
     }
 
     /// Metadata for an overlay entry (file or dir), if `rel` is one.
