@@ -314,6 +314,8 @@ pub fn render(view: &mut AppView, cx: &mut Context<AppView>) -> AnyElement {
                         .flex()
                         .flex_col()
                         .gap_1()
+                        .flex_1()
+                        .min_w_0()
                         .child(
                             div()
                                 .text_sm()
