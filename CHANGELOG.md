@@ -5,6 +5,14 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## v0.5.4 - 2026-11-03
+
+
+### Fixed
+
+- Start-at-login toggle no longer collapses at narrow window widths (#28)
+- Stop losing the destination of an overwrite-rename (#30)
+
 ## v0.5.3 - 2026-11-03
 
 
