@@ -208,6 +208,24 @@ async fn engine_session(
         SyncMode::default()
     };
 
+    // TG-30: a previous crash can leave the FUSE mount attached with no
+    // serving process. Every access then blocks or fails ENOTCONN; mounting
+    // again is impossible and syncing through it would wedge the app. Check
+    // before creating/migrating anything in the root, and refuse with an
+    // actionable message instead of proceeding silently.
+    if mode == SyncMode::Placeholders
+        && let Err(e) = pds_vfs_linux::mount::ensure_placeholder_mountpoint(
+            &root,
+            Duration::from_secs(2),
+        )
+    {
+        warn!(root = %root.display(), error = %e, "refusing to start with an unusable placeholder mountpoint");
+        let _ = updates.send(AppUpdate::MountUnavailable {
+            error: e.to_string(),
+        });
+        return EngineExit::Quit(e.to_string());
+    }
+
     let layout = match prepare_layout(&root) {
         Ok(l) => l,
         Err(e) => return EngineExit::Quit(format!("{e:#}")),
@@ -260,13 +278,24 @@ async fn engine_session(
         match mount_placeholder_view(&layout, &handle) {
             Ok(session) => mount = Some(session),
             Err(e) => {
+                // Re-inspect the mountpoint: between the preflight and
+                // `Session::new`, another process may have mounted it (or a
+                // leftover dead mount may have surfaced). Prefer the typed,
+                // actionable message over the bare mount error.
+                let failure = pds_vfs_linux::mount::ensure_placeholder_mountpoint(
+                    &layout.root,
+                    Duration::from_secs(1),
+                )
+                .err()
+                .map(|m| m.to_string())
+                .unwrap_or_else(|| format!("{e:#}"));
                 warn!(
                     root = %layout.root.display(),
                     error = %e,
                     "placeholder mount failed after the FUSE probe"
                 );
                 let _ = updates.send(AppUpdate::MountUnavailable {
-                    error: format!("{e:#}"),
+                    error: failure.clone(),
                 });
                 // No safe fallback: a mirror rebuild would never receive
                 // remote events (the notification stream is spent), and a
@@ -274,11 +303,9 @@ async fn engine_session(
                 // writes. Stop and let the user retry (Restart button).
                 let _ = handle.shutdown().await;
                 let _ = engine_task.await;
-                return EngineExit::Quit(
-                    "The placeholder view could not be mounted even though FUSE is available; \
-                     restart the app to retry"
-                        .into(),
-                );
+                return EngineExit::Quit(format!(
+                    "{failure} Restart the app after resolving the mount problem."
+                ));
             }
         }
     }

@@ -1410,6 +1410,85 @@ async fn unusual_names_are_identical_in_snapshot_db_and_backing_cache() {
 }
 
 // ---------------------------------------------------------------------------
+// Wave 4b — large sparse placeholders (TG-16)
+// ---------------------------------------------------------------------------
+
+/// TG-16: a ~5 GiB remote placeholder reports its true size, hydrates to a
+/// sparse backing file, serves bytes beyond the 4 GiB boundary, and evicts /
+/// rehydrates without assuming a 32-bit size. No multi-GB data is materialized.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn large_sparse_remote_placeholder_hydrates_evicts_and_rehydrates() {
+    use std::io::{Read as _, Seek as _, SeekFrom};
+    use std::os::unix::fs::MetadataExt as _;
+
+    const SIZE: u64 = 5 * 1024 * 1024 * 1024;
+    const TAIL: &[u8] = b"PDS-5G-TAIL";
+    const BOUNDARY: u64 = 4 * 1024 * 1024 * 1024 - 4;
+
+    let fx = start().await;
+    let tail_offset = SIZE - TAIL.len() as u64;
+    fx.mock
+        .remote_create_sparse_file("root", "huge.bin", SIZE, &[(BOUNDARY, b"BND!"), (tail_offset, TAIL)]);
+    wait_for(|| {
+        fx.store
+            .snapshot()
+            .by_path
+            .get("huge.bin")
+            .is_some_and(|n| n.size == SIZE)
+    })
+    .await;
+    assert!(!fx.store.snapshot().by_path["huge.bin"].content_ready);
+
+    assert!(fx.store.begin_hydrate("huge.bin"));
+    wait_for(|| fx.store.backing_path("huge.bin").is_some()).await;
+    let backing = fx.store.backing_path("huge.bin").unwrap();
+    let meta = std::fs::metadata(&backing).unwrap();
+    assert_eq!(meta.len(), SIZE, "backing file keeps the full length");
+    assert!(
+        meta.blocks() * 512 < 64 * 1024 * 1024,
+        "backing file must stay sparse: {} bytes on disk",
+        meta.blocks() * 512
+    );
+
+    // Read at both sides of the 4 GiB boundary; offsets are u64 end-to-end.
+    let mut file = std::fs::File::open(&backing).unwrap();
+    file.seek(SeekFrom::Start(BOUNDARY)).unwrap();
+    let mut boundary = [0u8; 4];
+    file.read_exact(&mut boundary).unwrap();
+    assert_eq!(&boundary, b"BND!");
+    file.seek(SeekFrom::Start(tail_offset)).unwrap();
+    let mut tail = vec![0u8; TAIL.len()];
+    file.read_exact(&mut tail).unwrap();
+    assert_eq!(tail, TAIL);
+
+    wait_for(|| fx.store.snapshot().by_path["huge.bin"].content_ready).await;
+    assert_eq!(fx.store.snapshot().by_path["huge.bin"].size, SIZE);
+
+    // Eviction must account with u64 bytes and keep the placeholder.
+    fx.handle.set_cache_cap(Some(0)).await.unwrap();
+    wait_for(|| fx.store.backing_path("huge.bin").is_none()).await;
+    assert_eq!(fx.store.snapshot().by_path["huge.bin"].size, SIZE);
+    assert!(!fx.store.snapshot().by_path["huge.bin"].content_ready);
+    assert!(!backing.exists());
+
+    // Rehydration works from the same >4 GiB placeholder.
+    assert!(fx.store.begin_hydrate("huge.bin"));
+    wait_for(|| {
+        fx.store
+            .backing_path("huge.bin")
+            .is_some_and(|p| p.is_file())
+    })
+    .await;
+    let mut file = std::fs::File::open(fx.store.backing_path("huge.bin").unwrap()).unwrap();
+    file.seek(SeekFrom::Start(tail_offset)).unwrap();
+    let mut tail = vec![0u8; TAIL.len()];
+    file.read_exact(&mut tail).unwrap();
+    assert_eq!(tail, TAIL);
+    fx.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------
 // Wave 3a — environment resilience in placeholder mode (TG-19)
 // ---------------------------------------------------------------------------
 
