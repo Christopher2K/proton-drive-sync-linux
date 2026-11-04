@@ -72,6 +72,32 @@ pub fn wide_button<V: 'static>(
         .hover(|s| s.opacity(0.9))
 }
 
+/// A small square icon button for the app-drawn titlebar (close, minimize).
+/// `hover_bg`/`hover_fg` let the close affordance turn red on hover, the way
+/// a window manager's close button does.
+pub fn window_button<V: 'static>(
+    id: impl Into<ElementId>,
+    glyph: impl Into<SharedString>,
+    hover_bg: u32,
+    hover_fg: u32,
+    cx: &mut Context<V>,
+    on_click: impl Fn(&mut V, &ClickEvent, &mut Window, &mut Context<V>) + 'static,
+) -> Stateful<Div> {
+    div()
+        .id(id)
+        .flex()
+        .items_center()
+        .justify_center()
+        .size(px(26.0))
+        .rounded(px(6.0))
+        .text_base()
+        .text_color(rgb(theme::MUTED))
+        .cursor_pointer()
+        .hover(move |s| s.bg(rgb(hover_bg)).text_color(rgb(hover_fg)))
+        .on_click(cx.listener(on_click))
+        .child(glyph.into())
+}
+
 /// A quiet text button (footer links, inline actions).
 pub fn text_button<V: 'static>(
     id: impl Into<ElementId>,

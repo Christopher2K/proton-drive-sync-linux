@@ -10,8 +10,8 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use gpui::{
-    Context, Div, FocusHandle, FontWeight, KeyBinding, Task, Window, div, prelude::*,
-    px, rgb, rgba,
+    App, Context, Div, FocusHandle, FontWeight, KeyBinding, MouseButton, Task, Window,
+    div, prelude::*, px, rgb, rgba,
 };
 use pds_core::EngineState;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
@@ -254,17 +254,19 @@ impl AppView {
     }
 
     /// Close the window. Mirrors the window manager's close request: with a
-    /// tray available the window is hidden (restorable from the tray);
-    /// otherwise the app quits. Bound to ctrl-w, which is the only way to
-    /// close the window on compositors (e.g. niri) that show no decorations.
+    /// tray to restore from and a compositor that keeps a minimized state,
+    /// the window is hidden; otherwise the app quits. Bound to ctrl-w.
+    ///
+    /// Minimizing is only a real "hide" where the compositor implements it
+    /// (GNOME, KDE, X11 WMs). Tiling compositors advertise no `minimize`
+    /// capability (niri) or ignore `xdg_toplevel.set_minimized` (sway), so
+    /// there a minimize would leave the window on screen and the close
+    /// button looking broken — hence the capability check.
     pub(crate) fn close_window(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.state.quitting {
             return;
         }
-        let tray_available = cx
-            .try_global::<crate::tray::TrayAvailable>()
-            .is_some_and(|flag| flag.0);
-        if tray_available {
+        if close_hides(window, cx) {
             window.minimize_window();
         } else {
             self.request_quit(cx);
@@ -294,6 +296,51 @@ impl AppView {
     }
 
     // -- rendering --------------------------------------------------------
+
+    /// The app-drawn titlebar: app name (drag handle) and a close button.
+    ///
+    /// GPUI windows are client-decorated, and the decoration-mode protocol
+    /// cannot tell us whether the compositor actually draws chrome: niri and
+    /// sway both report server-side decorations while drawing no titlebar at
+    /// all, leaving the window with no visible close affordance. So the bar
+    /// is always drawn rather than guessed at.
+    fn render_window_bar(&self, cx: &mut Context<Self>) -> Div {
+        div()
+            .flex()
+            .items_center()
+            .justify_between()
+            .flex_shrink_0()
+            .h(px(34.0))
+            .px_3()
+            .bg(rgb(theme::BG))
+            .border_b_1()
+            .border_color(rgb(theme::BORDER))
+            .child(
+                // Empty stretch of bar doubles as the drag handle.
+                div()
+                    .flex()
+                    .flex_1()
+                    .h_full()
+                    .items_center()
+                    .on_mouse_down(MouseButton::Left, |_, window, _| {
+                        window.start_window_move()
+                    })
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(theme::FAINT))
+                            .child(APP_TITLE),
+                    ),
+            )
+            .child(components::window_button(
+                "window-close",
+                "×",
+                theme::DANGER_SOFT,
+                theme::DANGER,
+                cx,
+                |this, _, window, cx| this.close_window(window, cx),
+            ))
+    }
 
     fn render_sidebar(&self, cx: &mut Context<Self>) -> Div {
         let mut nav = div().flex().flex_col().gap_1().mt_6();
@@ -958,6 +1005,17 @@ impl AppView {
     }
 }
 
+/// Whether a close request can hide the dashboard (minimize) rather than
+/// stop the app. Hiding needs something to restore the window from (a tray
+/// host) and a compositor that keeps a minimized state; niri does not
+/// advertise minimize at all, so close has to quit there.
+pub(crate) fn close_hides(window: &Window, cx: &App) -> bool {
+    let tray_available = cx
+        .try_global::<crate::tray::TrayAvailable>()
+        .is_some_and(|flag| flag.0);
+    tray_available && window.window_controls().minimize
+}
+
 impl Render for AppView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let body = match self.state.phase {
@@ -970,6 +1028,8 @@ impl Render for AppView {
         let mut root = div()
             .size_full()
             .relative()
+            .flex()
+            .flex_col()
             .bg(rgb(theme::BG))
             .text_color(rgb(theme::TEXT))
             .text_sm()
@@ -982,8 +1042,10 @@ impl Render for AppView {
             .on_action(cx.listener(|this, _: &ShowOverview, _, cx| this.set_page(Page::Overview, cx)))
             .on_action(cx.listener(|this, _: &ShowActivity, _, cx| this.set_page(Page::Activity, cx)))
             .on_action(cx.listener(|this, _: &ShowConflicts, _, cx| this.set_page(Page::Conflicts, cx)))
-            .on_action(cx.listener(|this, _: &ShowSettings, _, cx| this.set_page(Page::Settings, cx)))
-            .child(body);
+            .on_action(cx.listener(|this, _: &ShowSettings, _, cx| this.set_page(Page::Settings, cx)));
+
+        root = root.child(self.render_window_bar(cx));
+        root = root.child(div().flex_1().min_h(px(0.0)).child(body));
 
         if self.state.sign_out != SignOutState::None {
             root = root.child(self.render_sign_out_modal(cx));
