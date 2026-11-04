@@ -5,6 +5,66 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## v0.5.7 - 2026-11-04
+
+
+### Added
+
+- Preserve file mtime and executable bit locally
+- Refuse busy and stale placeholder mounts
+- Honor POSIX semantics for mmap, writes, statfs, and special files
+
+### Fixed
+
+- Re-key remote renames and keep both on collisions
+- Preserve node identity across local lifecycle events
+- Keep syncing through environment failures
+- Park sync work across session expiry and sidecar loss
+- Preserve name identity for case-only renames and long paths
+- Persist download state and recover interrupted downloads
+- Index ancestor folder inodes before rename detection
+- Close mass-delete, eviction, and reserved-name gaps
+- Harden conflict naming and mid-flight settings
+- Draw a titlebar with a close button
+
+### Other
+
+- Merge main into t3/fd82cb41
+- Relax conflict dedupe assertion across minute boundaries
+- Merge main into t3/9d0fbfc9
+- Merge main into t3/ea63b762
+- Merge commit 'f5d7b0b' into t3/ea63b762
+- Merge main into t3/9d0fbfc9
+- Merge main into t3/f0c8bcce
+- Merge main into t3/f40a2442
+- Merge remote-tracking branch 'origin/main' into t3/f0c8bcce
+- Merge main into t3/9df11324
+- Merge main into t3/2f9c704f
+- Merge remote-tracking branch 'origin/main' into t3/2f9c704f
+- Merge remote-tracking branch 'origin/main' into t3/9df11324
+- Merge main into t3/9df11324
+
+### Testing
+
+- Cover large sparse files and many-file convergence
+- Wait for pause to apply before re-creating file
+- Wait for parent rows after folder re-key
+- Wait for cursor advance after trash and restore
+- Wait for pause to apply before re-creating file
+- Wait for parent rows after folder re-key
+- Wait for cursor advance after trash and restore
+- Cover session expiry and sidecar crash mid-transfer
+- Wait for pause to apply before re-creating file
+- Wait for parent rows after folder re-key
+- Wait for cursor advance after trash and restore
+- Wait for pause to apply before re-creating file
+- Wait for parent rows after folder re-key
+- Wait for cursor advance after trash and restore
+- Cover wave 5b scale, settings, and conflict gaps
+- Wait for pause to apply before re-creating file
+- Wait for parent rows after folder re-key
+- Wait for cursor advance after trash and restore
+
 ## v0.5.6 - 2026-11-04
 
 
