@@ -899,6 +899,47 @@ async fn remote_create_over_untracked_local_keeps_both() {
     fx.shutdown().await;
 }
 
+/// A keep-both copy created under a skewed clock never reuses or overwrites
+/// an existing conflict-style name. Pre-existing future and past copies stay
+/// byte-identical while the engine generates a fresh copy for a real conflict.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn conflict_copies_from_skewed_clocks_all_survive() {
+    let fx = start().await;
+    let future = fx.root.join("hello (conflict 2035-06-01 1200).txt");
+    let past = fx.root.join("hello (conflict 1999-01-01 0000).txt");
+    std::fs::write(&future, b"from the future").unwrap();
+    std::fs::write(&past, b"from the past").unwrap();
+
+    fx.handle.pause().await.unwrap();
+    // Wait for the watcher to record the local edit before the remote head
+    // moves; resume then applies the remote event to a known-dirty file.
+    std::fs::write(fx.root.join("hello.txt"), b"local one").unwrap();
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    fx.mock.remote_update_file("node-hello", b"remote one");
+    fx.handle.resume().await.unwrap();
+
+    wait_for(|| {
+        std::fs::read(fx.root.join("hello.txt")).unwrap_or_default() == b"remote one"
+            && std::fs::read_dir(&fx.root)
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .any(|e| {
+                    let name = e.file_name().to_string_lossy().to_string();
+                    name.starts_with("hello (conflict ")
+                        && e.path() != future
+                        && e.path() != past
+                        && std::fs::read(e.path()).unwrap_or_default() == b"local one"
+                })
+    })
+    .await;
+
+    assert_eq!(std::fs::read(&future).unwrap(), b"from the future");
+    assert_eq!(std::fs::read(&past).unwrap(), b"from the past");
+    assert!(fx.mock.trashed_uids().is_empty());
+    fx.shutdown().await;
+}
+
 // ---------------------------------------------------------------------------
 // F2 — upload retry policy + 409 keep-both safety net (bug #1 follow-up)
 // ---------------------------------------------------------------------------
@@ -3942,6 +3983,214 @@ async fn replayed_event_after_reconnect_does_not_duplicate_downloads() {
     assert_eq!(rows[0].node_uid, uid);
     assert_ne!(fx.db.event_cursor("scope-1").unwrap().unwrap(), cursor);
     fx.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------
+// Wave 5b — settings changes mid-flight (TG-32)
+// ---------------------------------------------------------------------------
+
+/// Mode conversion with a queued upload: the dirty row and its content
+/// survive the move, a crash before the conversion marker is re-run safely,
+/// and the pending upload drains normally afterwards.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn mode_conversion_preserves_pending_upload_across_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("root");
+    let state = dir.path().join("state");
+    let backing = state.join("backing");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::create_dir_all(&state).unwrap();
+    std::fs::write(root.join("draft.txt"), b"pending bytes").unwrap();
+
+    let db_path = state.join("state.db");
+    let db = Db::open(&db_path).unwrap();
+    let (sha1, size) = pds_core::sha1_file(&root.join("draft.txt")).unwrap();
+    db.upsert_node(&pds_core::NodeRow {
+        local_path: "draft.txt".into(),
+        node_uid: "pending:draft.txt".into(),
+        parent_uid: Some("root".into()),
+        name: "draft.txt".into(),
+        kind: pds_sidecar_client::NodeKind::File,
+        size: Some(size as i64),
+        sha1: Some(sha1),
+        mtime: None,
+        mode: None,
+        sync_state: pds_core::SyncState::Dirty,
+        pinned: false,
+        synced_sha1: None,
+    })
+    .unwrap();
+    db.set_meta("initial_sync_done", "1").unwrap();
+    drop(db);
+
+    let config = |backing: &std::path::Path| EngineConfig {
+        root: root.clone(),
+        db_path: db_path.clone(),
+        retry_base: pds_core::RETRY_BASE_DEFAULT,
+        placeholders: true,
+        eviction_cap: None,
+        backing_dir: Some(backing.to_path_buf()),
+        watch_local_writes: false,
+    };
+
+    // First construction performs the conversion, then "crashes" before the
+    // marker is written.
+    let (client1, _mock1) = MockSidecar::new().connect();
+    let (engine1, _handle1) = Engine::new(
+        Arc::new(client1),
+        tokio::sync::mpsc::channel(1).1,
+        config(&backing),
+    )
+    .unwrap();
+    drop(engine1);
+    assert_eq!(
+        std::fs::read(backing.join("draft.txt")).unwrap(),
+        b"pending bytes"
+    );
+    assert!(!root.join("draft.txt").exists());
+    std::fs::remove_file(backing.join(".layout-converted")).unwrap();
+
+    // A fresh engine re-runs the interrupted pass: content stays exactly
+    // once in the backing cache, still dirty.
+    let (mut client2, mock2) = MockSidecar::new().connect();
+    let notifications = client2.take_notifications();
+    let (engine2, handle) =
+        Engine::new(Arc::new(client2), notifications, config(&backing)).unwrap();
+    let db = Db::open(&db_path).unwrap();
+    let row = db.node_by_path("draft.txt").unwrap().unwrap();
+    assert_eq!(row.sync_state, pds_core::SyncState::Dirty);
+    assert_eq!(row.node_uid, "pending:draft.txt");
+    assert_eq!(
+        std::fs::read(backing.join("draft.txt")).unwrap(),
+        b"pending bytes"
+    );
+
+    let engine_task = tokio::spawn(engine2.run());
+    wait_for(|| mock2.uploaded_names().iter().any(|n| n == "draft.txt")).await;
+    wait_for_synced(&db, "draft.txt").await;
+    assert_eq!(
+        mock2
+            .file_content(&mock2.find_uid("root", "draft.txt").expect("uploaded draft"))
+            .as_deref(),
+        Some(b"pending bytes".as_slice())
+    );
+
+    handle.shutdown().await.unwrap();
+    let _ = engine_task.await;
+}
+
+/// A mode switch while the mass-delete guard is paused: the engine restarts
+/// in placeholder mode, the pause is restored from SQLite, every queued
+/// tombstone survives, and the layout conversion moves untouched content
+/// without trashing anything.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn mode_switch_while_guard_paused_keeps_tombstones_and_trashes_nothing() {
+    let fx = start().await;
+
+    // A single delete trips the ratio limb on this tiny tree (2 synced
+    // nodes → 1 > 25%).
+    std::fs::remove_file(fx.root.join("hello.txt")).unwrap();
+    wait_for(|| {
+        futures::executor::block_on(fx.handle.status())
+            .map(|s| s.state == EngineState::GuardPaused)
+            .unwrap_or(false)
+    })
+    .await;
+    assert_eq!(fx.db.tombstones().unwrap().len(), 1);
+    assert_eq!(fx.db.meta("guard_paused").unwrap().as_deref(), Some("1"));
+    assert!(fx.mock.trashed_uids().is_empty());
+
+    // Content queued while the guard is paused (here: local-only files
+    // waiting for their first upload) must survive the conversion too.
+    for i in 0..3 {
+        std::fs::write(fx.root.join(format!("filler-{i}.txt")), format!("keep {i}")).unwrap();
+    }
+    for i in 0..3 {
+        let rel = format!("filler-{i}.txt");
+        wait_for(|| {
+            fx.db
+                .node_by_path(&rel)
+                .ok()
+                .flatten()
+                .is_some_and(|r| r.sync_state == pds_core::SyncState::Dirty)
+        })
+        .await;
+    }
+
+    // The desktop app persists the new mode, shuts the engine down and
+    // builds a fresh one with an external backing cache.
+    pds_core::set_sync_mode(&fx.db, pds_core::SyncMode::Placeholders).unwrap();
+    let temp = fx._dir.path().to_path_buf();
+    let root = fx.root.clone();
+    let db_path = root.join(STATE_DIR).join("state.db");
+    fx.shutdown_keep_dir().await;
+
+    let backing = temp.join("backing");
+    let (mut client2, mock2) = MockSidecar::new().connect();
+    let notifications = client2.take_notifications();
+    let (engine, handle) = Engine::new(
+        Arc::new(client2),
+        notifications,
+        EngineConfig {
+            root: root.clone(),
+            db_path,
+            retry_base: pds_core::RETRY_BASE_DEFAULT,
+            placeholders: true,
+            eviction_cap: None,
+            backing_dir: Some(backing.clone()),
+            watch_local_writes: false,
+        },
+    )
+    .unwrap();
+    let engine_task = tokio::spawn(engine.run());
+
+    wait_for(|| {
+        futures::executor::block_on(handle.status())
+            .map(|s| s.state == EngineState::GuardPaused)
+            .unwrap_or(false)
+    })
+    .await;
+    // Conversion moved the survivors into the backing cache; the pause
+    // held back the tombstone.
+    for i in 0..3 {
+        assert_eq!(
+            std::fs::read(backing.join(format!("filler-{i}.txt"))).unwrap(),
+            format!("keep {i}").as_bytes()
+        );
+        assert!(!root.join(format!("filler-{i}.txt")).exists());
+    }
+    assert_eq!(handle.status().await.unwrap().queued_tombstones, 1);
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    assert!(
+        mock2.trashed_uids().is_empty(),
+        "paused engine trashed something"
+    );
+
+    // Explicit resume is the approval: exactly the one queued tombstone is
+    // trashed, none of the converted files.
+    handle.resume().await.unwrap();
+    wait_for(|| mock2.trashed_uids() == vec!["node-hello".to_string()]).await;
+    wait_for(|| {
+        futures::executor::block_on(handle.status())
+            .map(|s| s.state == EngineState::Running && s.queued_tombstones == 0)
+            .unwrap_or(false)
+    })
+    .await;
+    assert_eq!(mock2.trashed_uids(), vec!["node-hello".to_string()]);
+    assert_eq!(handle_meta(&root, "guard_paused"), None);
+
+    handle.shutdown().await.unwrap();
+    let _ = engine_task.await;
+}
+
+/// Read a `meta` value from the state DB at the classic in-root path.
+fn handle_meta(root: &std::path::Path, key: &str) -> Option<String> {
+    Db::open(&root.join(STATE_DIR).join("state.db"))
+        .ok()?
+        .meta(key)
+        .ok()?
 }
 
 // ---------------------------------------------------------------------------

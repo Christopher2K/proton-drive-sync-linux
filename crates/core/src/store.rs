@@ -680,6 +680,12 @@ impl Store {
         self.lock().snapshot.clone()
     }
 
+    /// Monotonic snapshot generation (cheap; no map clone). Tests use it to
+    /// wait for a publish without copying the whole tree.
+    pub fn generation(&self) -> u64 {
+        self.lock().snapshot.generation
+    }
+
     /// Queue an open of a not-yet-hydrated file. Returns `true` when this
     /// caller is the first requester (the engine gets one wake for many).
     pub fn begin_hydrate(&self, rel: &str) -> bool {

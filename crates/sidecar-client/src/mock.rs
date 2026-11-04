@@ -83,6 +83,9 @@ struct State {
     /// Read/hash uploads incrementally instead of `fs::read`-ing the whole
     /// file. Tests enable this for multi-GiB sparse files.
     stream_uploads: bool,
+    /// Artificial delay before a `drive.download` writes its content. Lets
+    /// tests act while a hydration is genuinely in flight.
+    download_delay: Duration,
     /// Scripted `transfer.error`s for revision uploads, per node uid; popped
     /// one per `drive.upload` attempt (content is NOT applied on failure).
     upload_failures: HashMap<String, ScriptedFailures>,
@@ -528,6 +531,12 @@ impl MockHandle {
         }));
     }
 
+    /// Delay every `drive.download` response by `delay` (test-only; lets a
+    /// test act while a hydration request is in flight).
+    pub fn set_download_delay(&self, delay: Duration) {
+        self.state.lock().unwrap().download_delay = delay;
+    }
+
     /// Uids passed to `drive.download`, in call order.
     pub fn downloaded_uids(&self) -> Vec<String> {
         self.state
@@ -883,6 +892,7 @@ impl MockSidecar {
                 upload_sizes: Vec::new(),
                 upload_buffered_bytes: 0,
                 stream_uploads: false,
+                download_delay: Duration::ZERO,
                 upload_failures: HashMap::new(),
                 download_failures: HashMap::new(),
                 get_root_failures: 0,
@@ -1316,6 +1326,15 @@ impl MockSidecar {
                 let uid = node_uid.clone();
                 let path = pstr("path");
                 st.calls.push(("download".into(), vec![node_uid.clone()]));
+                let delay = st.download_delay;
+                // Deliberately block this test-only server while the
+                // download is "in flight"; the state lock is released so
+                // assertions can still inspect calls.
+                if !delay.is_zero() {
+                    drop(st);
+                    std::thread::sleep(delay);
+                    st = self.state.lock().unwrap();
+                }
                 let transfer_id = format!("transfer-{}", st.next_transfer);
                 // Scripted failure (local ENOSPC/EACCES reported by the
                 // sidecar, or a transient transport error): respond with the

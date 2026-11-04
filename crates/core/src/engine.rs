@@ -44,9 +44,9 @@ const META_INITIAL_SYNC_DONE: &str = "initial_sync_done";
 /// placeholders to mirror later re-triggers materialization exactly once.
 const META_MATERIALIZED_FOR_MODE: &str = "materialized_for_mirror";
 /// The mass-delete guard auto-paused and the user has not approved the
-/// pending tombstones yet. Durable so a restart cannot quietly drain a
-/// guard-blocked delete wave: the fresh engine comes back paused until an
-/// explicit resume (F3.3).
+/// pending tombstones yet. Durable so a restart (including a mode-switch
+/// restart) cannot quietly drain a guard-blocked delete wave: the fresh
+/// engine comes back paused until an explicit resume (F3.3).
 const META_GUARD_PAUSED: &str = "guard_paused";
 
 /// First backoff delay after a retryable upload failure (F2).
@@ -484,6 +484,10 @@ pub struct Engine<S: SidecarApi> {
     backing_dir_is_engine: bool,
     /// Backing-cache size cap (placeholder mode). `None` disables eviction.
     eviction_cap: Option<u64>,
+    /// A cap change arrived while a hydration was in flight. Re-run the
+    /// eviction pass once that hydration lands so the new cap also applies
+    /// to the freshly downloaded file (TG-32).
+    eviction_recheck: bool,
     /// The effective sync mode (F5), resolved once at construction
     /// (`$PDS_SYNC_MODE` > persisted `sync_mode` > caller default). The DB
     /// remains the source for FUTURE runs; this field answers "what mode am
@@ -640,6 +644,7 @@ impl<S: SidecarApi + 'static> Engine<S> {
             state_dir_is_engine,
             backing_dir_is_engine,
             eviction_cap: config.eviction_cap,
+            eviction_recheck: false,
             mode,
             watch_local_writes: config.watch_local_writes,
             notifications,
@@ -746,7 +751,7 @@ impl<S: SidecarApi + 'static> Engine<S> {
         // 1b. A guard pause is durable: the previous run auto-paused with
         // tombstones still queued. Come back paused and wait for the same
         // explicit user confirmation, instead of letting a fresh guard
-        // window silently drain the first batch (TG-24).
+        // window silently drain the first batch (TG-24/TG-32).
         if self.db.meta(META_GUARD_PAUSED)? == Some("1".into()) {
             self.state = EngineState::GuardPaused;
             warn!("restored mass-deletion guard pause from previous run");
@@ -1162,6 +1167,12 @@ impl<S: SidecarApi + 'static> Engine<S> {
                     // Hydration may have pushed the cache over the cap;
                     // the fresh file itself is protected from eviction.
                     self.maybe_evict(&store, &rel);
+                    if self.eviction_recheck {
+                        // A cap change landed mid-hydration; apply it now,
+                        // without the just-hydrated-file protection.
+                        self.eviction_recheck = false;
+                        self.maybe_evict(&store, "");
+                    }
                     continue;
                 }
                 // Folders created through the mount with nothing inside
@@ -4116,6 +4127,11 @@ impl<S: SidecarApi + 'static> Engine<S> {
                 // usage should reclaim space now, not on the next idle tick.
                 if let Some(store) = self.store.clone() {
                     self.maybe_evict(&store, "");
+                    if store.hydrating_count() > 0 {
+                        // The download is still in flight and was not part of
+                        // this pass; re-check when it completes.
+                        self.eviction_recheck = true;
+                    }
                 }
                 info!(cap = cap.map(|c| c.to_string()).unwrap_or_else(|| "unlimited".into()), "cache cap changed");
                 let _ = reply.send(Ok(()));
@@ -4799,14 +4815,14 @@ fn with_suffix_before_ext(name: &str, suffix: &str) -> String {
 /// Never overwrites an existing file or tracked row. `base` is the content
 /// root whose namespace the candidate must not collide with.
 fn local_free_conflict_rel_in(db: &Db, base: &Path, rel: &str) -> Result<String> {
-    local_free_conflict_rel_at(db, base, rel, chrono::Local::now())
+    local_free_conflict_rel_at(db, base, rel, chrono::Utc::now())
 }
 
 fn local_free_conflict_rel_at(
     db: &Db,
     base: &Path,
     rel: &str,
-    at: chrono::DateTime<chrono::Local>,
+    at: chrono::DateTime<chrono::Utc>,
 ) -> Result<String> {
     let name = rel.rsplit('/').next().unwrap_or(rel);
     let stamped = conflict_name(name, at);
@@ -4984,7 +5000,7 @@ mod tests {
         use chrono::TimeZone;
         let dir = tempfile::tempdir().unwrap();
         let db = Db::open_memory().unwrap();
-        let at = chrono::Local
+        let at = chrono::Utc
             .with_ymd_and_hms(2026, 10, 24, 9, 30, 0)
             .unwrap();
         let stamped = conflict_name("a.txt", at);
@@ -5003,12 +5019,57 @@ mod tests {
         );
     }
 
+    /// A backwards clock correction must not reuse or overwrite an existing
+    /// conflict copy; the same instant dedupes with ` (2)`, ` (3)`, ….
+    #[test]
+    fn conflict_names_stay_unique_across_backward_clock_jump() {
+        use chrono::TimeZone;
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open_memory().unwrap();
+
+        let later = chrono::Utc.with_ymd_and_hms(2026, 11, 1, 12, 0, 0).unwrap();
+        let earlier = later - chrono::Duration::hours(1);
+        let later_name = local_free_conflict_rel_at(&db, dir.path(), "a.txt", later).unwrap();
+        std::fs::write(dir.path().join(&later_name), b"first").unwrap();
+
+        // Clock jumps backwards: a fresh name is still generated and the
+        // older (by wall clock) file is never reused.
+        let earlier_name = local_free_conflict_rel_at(&db, dir.path(), "a.txt", earlier).unwrap();
+        assert_ne!(earlier_name, later_name);
+        assert!(
+            std::fs::read(dir.path().join(&later_name)).unwrap() == b"first",
+            "existing copy must be untouched"
+        );
+        std::fs::write(dir.path().join(&earlier_name), b"second").unwrap();
+
+        // The same (later) instant a second time collides and dedupes.
+        let second = local_free_conflict_rel_at(&db, dir.path(), "a.txt", later).unwrap();
+        assert_eq!(second, with_suffix_before_ext(&later_name, " (2)"));
+        std::fs::write(dir.path().join(&second), b"third").unwrap();
+        let third = local_free_conflict_rel_at(&db, dir.path(), "a.txt", later).unwrap();
+        assert_eq!(third, with_suffix_before_ext(&later_name, " (3)"));
+        std::fs::write(dir.path().join(&third), b"fourth").unwrap();
+
+        let mut names = [later_name, earlier_name, second, third];
+        names.sort();
+        assert!(
+            names.windows(2).all(|pair| pair[0] != pair[1]),
+            "each conflict must get its own path"
+        );
+        for name in &names {
+            assert!(
+                !std::fs::read(dir.path().join(name)).unwrap().is_empty(),
+                "{name} must still hold content"
+            );
+        }
+    }
+
     #[test]
     fn conflict_name_colliding_with_itself_gets_a_free_sibling() {
         use chrono::TimeZone;
         let dir = tempfile::tempdir().unwrap();
         let db = Db::open_memory().unwrap();
-        let at = chrono::Local
+        let at = chrono::Utc
             .with_ymd_and_hms(2026, 1, 1, 12, 0, 0)
             .unwrap();
         // The user already has a file named exactly like a conflict copy,
@@ -5124,6 +5185,100 @@ mod tests {
             "placeholders"
         );
         assert_eq!(std::fs::read(backing.join("docs/a.txt")).unwrap(), b"tracked");
+    }
+
+    /// Switching mode must not lose a queued upload: a dirty row keeps its
+    /// pending state (and uploads under the same name once the engine runs).
+    #[test]
+    fn convert_layout_keeps_pending_uploads_dirty() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root");
+        let backing = dir.path().join("backing");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("draft.txt"), b"un-uploaded").unwrap();
+
+        let db = Db::open_memory().unwrap();
+        let (sha1, size) = sha1_file(&root.join("draft.txt")).unwrap();
+        db.upsert_node(&NodeRow {
+            local_path: "draft.txt".into(),
+            node_uid: "pending:draft.txt".into(),
+            parent_uid: Some("root".into()),
+            name: "draft.txt".into(),
+            kind: NodeKind::File,
+            size: Some(size as i64),
+            sha1: Some(sha1),
+            mtime: None,
+            mode: None,
+            sync_state: SyncState::Dirty,
+            pinned: false,
+            synced_sha1: None,
+        })
+        .unwrap();
+
+        convert_layout(&db, &root, &backing, SyncMode::Placeholders).unwrap();
+        assert_eq!(
+            std::fs::read(backing.join("draft.txt")).unwrap(),
+            b"un-uploaded"
+        );
+        let row = db.node_by_path("draft.txt").unwrap().unwrap();
+        assert_eq!(row.sync_state, SyncState::Dirty);
+        assert_eq!(row.node_uid, "pending:draft.txt");
+
+        // A restart mid-conversion re-runs the pass; it must stay a no-op
+        // for the already-moved content and keep the pending upload.
+        std::fs::remove_file(backing.join(LAYOUT_CONVERTED)).unwrap();
+        convert_layout(&db, &root, &backing, SyncMode::Placeholders).unwrap();
+        assert_eq!(
+            std::fs::read(backing.join("draft.txt")).unwrap(),
+            b"un-uploaded"
+        );
+        assert!(!root.join("draft.txt").exists());
+        assert_eq!(
+            db.node_by_path("draft.txt").unwrap().unwrap().sync_state,
+            SyncState::Dirty
+        );
+    }
+
+    /// A crash can interrupt the moves before the marker is written. A
+    /// rerun must finish the remaining files without duplicating, deleting,
+    /// or stranding either copy.
+    #[test]
+    fn convert_layout_finishes_an_interrupted_conversion() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root");
+        let backing = dir.path().join("backing");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&backing).unwrap();
+        std::fs::write(root.join("a.txt"), b"alpha").unwrap();
+        std::fs::write(root.join("b.txt"), b"bravo").unwrap();
+        std::fs::write(root.join("leftover.txt"), b"adopt me").unwrap();
+
+        let db = Db::open_memory().unwrap();
+        for (name, body) in [("a.txt", "alpha"), ("b.txt", "bravo")] {
+            let (sha1, _) = sha1_file(&root.join(name)).unwrap();
+            db.upsert_node(&tracked_row(name, Some(sha1))).unwrap();
+            assert_eq!(std::fs::read(root.join(name)).unwrap(), body.as_bytes());
+        }
+
+        // Simulate the crash: the first file already moved, no marker yet.
+        std::fs::rename(root.join("a.txt"), backing.join("a.txt")).unwrap();
+
+        convert_layout(&db, &root, &backing, SyncMode::Placeholders).unwrap();
+        assert_eq!(std::fs::read(backing.join("a.txt")).unwrap(), b"alpha");
+        assert_eq!(std::fs::read(backing.join("b.txt")).unwrap(), b"bravo");
+        assert_eq!(
+            std::fs::read(backing.join("leftover.txt")).unwrap(),
+            b"adopt me"
+        );
+        assert!(!root.join("a.txt").exists());
+        assert!(!root.join("b.txt").exists());
+        assert!(!root.join("leftover.txt").exists());
+        assert_eq!(db.all_nodes().unwrap().len(), 3, "no duplicate rows");
+        assert_eq!(
+            db.node_by_path("leftover.txt").unwrap().unwrap().sync_state,
+            SyncState::Dirty,
+            "untracked content is adopted as a pending upload"
+        );
     }
 
     /// Switching back to mirror moves hydrated content into the root.
