@@ -145,6 +145,12 @@ pub enum ActivityKind {
     GuardPaused,
     /// Upload failed terminally (non-retryable, or retries exhausted).
     UploadErrored,
+    /// Download/hydration failed (permissions, no space, transport) and is
+    /// waiting for a retry. Existing content is never touched.
+    DownloadErrored,
+    /// The sidecar could not be reached during startup/initial sync; the
+    /// engine stays alive and retries with backoff.
+    ConnectionError,
     /// A local item cannot be represented remotely (e.g. a non-UTF-8
     /// filename) and was deliberately left alone (never uploaded/deleted).
     Skipped,
@@ -469,7 +475,12 @@ impl<S: SidecarApi + 'static> Engine<S> {
         mut config: EngineConfig,
     ) -> Result<(Self, EngineHandle)> {
         std::fs::create_dir_all(&config.root)?;
-        let db = Db::open(&config.db_path)?;
+        let db = Db::open(&config.db_path).with_context(|| {
+            format!(
+                "open state DB {} (if it is corrupt, move it aside to rebuild the sync index; local files are never deleted)",
+                config.db_path.display()
+            )
+        })?;
         let (tx, cmd_rx) = mpsc::channel(64);
         let (activity_tx, _) = broadcast::channel(256);
         // F5 mode resolution (single writer): `$PDS_SYNC_MODE` > persisted
@@ -567,49 +578,19 @@ impl<S: SidecarApi + 'static> Engine<S> {
     /// Run until shutdown. Consumes the engine.
     pub async fn run(mut self) -> Result<()> {
         self.started.store(true, Ordering::SeqCst);
-        // 1. Initial sync (first run only; F1).
-        let root_node = self.sidecar.get_root().await.context("drive.getRoot")?;
-        self.scope_id = Some(root_node.tree_event_scope_id.clone());
-        self.db.set_meta("root_uid", &root_node.uid)?;
-        if self.db.meta(META_INITIAL_SYNC_DONE)? != Some("1".into()) {
-            info!(root = %self.root.display(), "initial sync: enumerating remote tree");
-            self.initial_sync(&root_node).await?;
-            self.db.set_meta(META_INITIAL_SYNC_DONE, "1")?;
-            info!("initial sync complete");
-        } else if !self.placeholders
-            && self.db.meta(META_MATERIALIZED_FOR_MODE)? != Some("1".into())
-        {
-            // The root synced in placeholder mode before and the user
-            // switched to mirror: materialize now (the conversion moved any
-            // hydrated copies back; fetch the rest). Cheap check per start.
-            info!("mirror mode: materializing files not yet on disk");
-            let files = self.remote_files_needing_download()?;
-            for (rel, uid) in files {
-                if let Some(reason) = self.unmaterializable_reason(&rel) {
-                    self.report_unmaterializable(&rel, &reason);
-                    continue;
-                }
-                let abs = to_abs(&self.root, &rel);
-                if let Some(dir) = abs.parent() {
-                    std::fs::create_dir_all(dir)?;
-                }
-                self.download_file(&uid, &rel).await?;
-            }
-        }
-        self.db.set_meta(META_MATERIALIZED_FOR_MODE, if self.placeholders { "0" } else { "1" })?;
-        // Remember every existing directory/file's inode so a later local
-        // rename (reported by the watcher as "old gone + new appeared") can be
-        // paired without guessing from names or content (TG-06/TG-12).
-        if !self.placeholders {
-            self.index_local_inodes();
-        }
+        // 1. Initial sync (first run only; F1). Offline/transport failures
+        // must not kill the run loop (TG-22): report, back off, and retry
+        // until the sidecar is reachable. Control commands (status/pause/
+        // shutdown) stay serviceable during the backoff.
+        let Some(root_node) = self.bootstrap().await? else {
+            return Ok(()); // shutdown while offline
+        };
 
-        // 2. Resume the event stream from the persisted cursor (F6).
-        let cursor = self.db.event_cursor(&root_node.tree_event_scope_id)?;
-        self.sidecar
-            .events_start(&root_node.tree_event_scope_id, cursor.as_deref())
-            .await
-            .context("drive.events.start")?;
+        // 2. Resume the event stream from the persisted cursor (F6). Starting
+        // the stream can hit the same transport failure; retry it too.
+        if !self.start_event_stream_with_retry(&root_node).await? {
+            return Ok(()); // shutdown while retrying
+        }
 
         // 3. Crash recovery (M4): transfers interrupted by a previous run
         // leave rows stuck in `Uploading` (never drained: upload_one
@@ -657,6 +638,132 @@ impl<S: SidecarApi + 'static> Engine<S> {
             let _ = self.sidecar.events_stop(scope).await;
         }
         result
+    }
+
+    /// Fetch the root and finish first-run setup, retrying transient
+    /// transport failures with exponential backoff. Returns `None` when
+    /// shutdown arrived while waiting.
+    async fn bootstrap(&mut self) -> Result<Option<Node>> {
+        let mut attempt = 0;
+        loop {
+            match self.try_bootstrap_once().await {
+                Ok(root) => {
+                    if attempt > 0 {
+                        info!("sidecar reachable again; continuing startup");
+                    }
+                    return Ok(Some(root));
+                }
+                Err(e) => {
+                    attempt += 1;
+                    let backoff = retry_backoff(self.retry_base, attempt);
+                    warn!(
+                        attempt,
+                        error = %e,
+                        backoff = ?backoff,
+                        "startup/initial sync failed; retrying"
+                    );
+                    self.emit_activity(
+                        ActivityKind::ConnectionError,
+                        "",
+                        Some(format!("{e:#}; retrying in {backoff:?}")),
+                    );
+                    if !self.wait_with_commands(backoff).await? {
+                        return Ok(None);
+                    }
+                }
+            }
+        }
+    }
+
+    async fn try_bootstrap_once(&mut self) -> Result<Node> {
+        let root_node = self.sidecar.get_root().await.context("drive.getRoot")?;
+        self.scope_id = Some(root_node.tree_event_scope_id.clone());
+        self.db.set_meta("root_uid", &root_node.uid)?;
+        if self.db.meta(META_INITIAL_SYNC_DONE)? != Some("1".into()) {
+            info!(root = %self.root.display(), "initial sync: enumerating remote tree");
+            self.initial_sync(&root_node).await?;
+            self.db.set_meta(META_INITIAL_SYNC_DONE, "1")?;
+            info!("initial sync complete");
+        } else if !self.placeholders
+            && self.db.meta(META_MATERIALIZED_FOR_MODE)? != Some("1".into())
+        {
+            // The root synced in placeholder mode before and the user
+            // switched to mirror: materialize now (the conversion moved any
+            // hydrated copies back; fetch the rest). Cheap check per start.
+            info!("mirror mode: materializing files not yet on disk");
+            let files = self.remote_files_needing_download()?;
+            for (rel, uid) in files {
+                self.download_file(&uid, &rel).await?;
+            }
+        }
+        self.db.set_meta(
+            META_MATERIALIZED_FOR_MODE,
+            if self.placeholders { "0" } else { "1" },
+        )?;
+        // Remember every existing directory's inode so a later local rename
+        // (reported by the watcher as "old gone + new appeared") can be
+        // paired without guessing from names or content (TG-06).
+        if !self.placeholders {
+            self.index_local_inodes();
+        }
+        Ok(root_node)
+    }
+
+    async fn start_event_stream_with_retry(&mut self, root_node: &Node) -> Result<bool> {
+        let cursor = self.db.event_cursor(&root_node.tree_event_scope_id)?;
+        let mut attempt = 0;
+        loop {
+            match self
+                .sidecar
+                .events_start(&root_node.tree_event_scope_id, cursor.as_deref())
+                .await
+            {
+                Ok(()) => {
+                    if attempt > 0 {
+                        info!("event stream started after retry");
+                    }
+                    return Ok(true);
+                }
+                Err(e) => {
+                    attempt += 1;
+                    let backoff = retry_backoff(self.retry_base, attempt);
+                    warn!(
+                        attempt,
+                        error = %e,
+                        backoff = ?backoff,
+                        "starting the event stream failed; retrying"
+                    );
+                    self.emit_activity(
+                        ActivityKind::ConnectionError,
+                        "",
+                        Some(format!("drive.events.start failed: {e}; retrying in {backoff:?}")),
+                    );
+                    if !self.wait_with_commands(backoff).await? {
+                        return Ok(false);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Sleep for `wait` while still servicing control commands. Returns
+    /// `false` when shutdown arrived (the caller should exit cleanly).
+    async fn wait_with_commands(&mut self, wait: Duration) -> Result<bool> {
+        let deadline = tokio::time::Instant::now() + wait;
+        loop {
+            tokio::select! {
+                cmd = self.cmd_rx.recv() => {
+                    match cmd {
+                        Some(Command::Shutdown) | None => {
+                            self.shutting_down = true;
+                            return Ok(false);
+                        }
+                        Some(c) => self.handle_command(c)?,
+                    }
+                }
+                _ = tokio::time::sleep_until(deadline) => return Ok(true),
+            }
+        }
     }
 
     /// Recover transfers a previous run left interrupted (M4 hardening):
@@ -980,14 +1087,6 @@ impl<S: SidecarApi + 'static> Engine<S> {
         // Mirror: materialize every remote file that is missing or changed.
         let files = self.remote_files_needing_download()?;
         for (rel, uid) in files {
-            if let Some(reason) = self.unmaterializable_reason(&rel) {
-                self.report_unmaterializable(&rel, &reason);
-                continue;
-            }
-            let abs = to_abs(&self.root, &rel);
-            if let Some(dir) = abs.parent() {
-                std::fs::create_dir_all(dir)?;
-            }
             self.download_file(&uid, &rel).await?;
         }
 
@@ -1565,7 +1664,15 @@ impl<S: SidecarApi + 'static> Engine<S> {
             Ok(m) => m,
             Err(_) => return Ok(()), // vanished again — delete path handles it
         };
-        let (sha1, size) = sha1_file(&abs)?;
+        let (sha1, size) = match sha1_file(&abs) {
+            Ok(v) => v,
+            Err(e) => {
+                return self.record_local_upload_failure(
+                    rel,
+                    anyhow::Error::new(e).context(format!("read local file {}", abs.display())),
+                );
+            }
+        };
         let mtime = file_mtime(&meta);
         let mode = file_mode(&meta);
         let name = rel.rsplit('/').next().unwrap_or(rel).to_string();
@@ -1829,6 +1936,14 @@ impl<S: SidecarApi + 'static> Engine<S> {
     /// Perform the actual upload transfer for a dirty row.
     async fn upload_row(&mut self, rel: &str, row: &NodeRow) -> Result<()> {
         let abs = self.content_path(rel);
+        // Never send a path the sidecar may read as empty: an unreadable
+        // local source must not overwrite the remote revision (TG-19).
+        if let Err(e) = std::fs::File::open(&abs) {
+            return self.record_local_upload_failure(
+                rel,
+                anyhow::Error::new(e).context(format!("read local file {}", abs.display())),
+            );
+        }
         let params = upload_params(row, &abs);
         self.db.set_sync_state(rel, SyncState::Uploading)?;
         let sidecar = Arc::clone(&self.sidecar);
@@ -1939,6 +2054,20 @@ impl<S: SidecarApi + 'static> Engine<S> {
                 .insert(rel.to_string(), Instant::now() + backoff);
             info!(path = %rel, count, backoff = ?backoff, server_hint = retry_after.is_some(), "retryable upload error; backing off");
         }
+        Ok(())
+    }
+
+    /// A local source could not be read. Never contact the uploader with it
+    /// (an empty/partial read would destroy the remote copy): surface the
+    /// error, leave the row dirty-but-parked, and let a fresh edit clear the
+    /// failure through the normal `upsert_local_file` path.
+    fn record_local_upload_failure(&mut self, rel: &str, error: anyhow::Error) -> Result<()> {
+        let message = format!("{error:#}");
+        self.db.set_sync_state(rel, SyncState::Dirty)?;
+        self.db.mark_upload_errored(rel, &message)?;
+        self.retry_at.remove(rel);
+        warn!(path = %rel, error = %message, "local upload source unreadable; node marked errored");
+        self.emit_activity(ActivityKind::UploadErrored, rel, Some(message));
         Ok(())
     }
 
@@ -2520,9 +2649,6 @@ impl<S: SidecarApi + 'static> Engine<S> {
             self.upsert_from_node(&node, &rel, SyncState::Synced)?;
             return Ok(());
         }
-        if let Some(dir) = abs.parent() {
-            std::fs::create_dir_all(dir)?;
-        }
         self.download_file(uid, &rel).await
     }
 
@@ -2911,12 +3037,29 @@ impl<S: SidecarApi + 'static> Engine<S> {
             store.finish_hydrate(rel, false);
             return;
         };
+        if matches!(row.sync_state, SyncState::Synced | SyncState::Downloading)
+            && let Err(e) = self.db.set_sync_state(rel, SyncState::Downloading)
+        {
+            warn!(path = %rel, error = %e, "failed to mark hydration in progress");
+        }
         match self
             .download_to_backing(&row.node_uid, rel, row.mtime, row.mode)
             .await
         {
             Ok(()) => {
                 store.set_backing(rel, to_abs(&self.backing_dir, rel));
+                // Hydration only owns the download direction: never rewrite a
+                // row that has pending local changes (`Dirty`/`Uploading`).
+                let state = self.db.node_by_path(rel).ok().flatten().map(|r| r.sync_state);
+                if matches!(state, Some(SyncState::Downloading | SyncState::Synced)) {
+                    if let Err(e) = self.db.set_sync_state(rel, SyncState::Synced) {
+                        warn!(path = %rel, error = %e, "failed to mark hydration complete");
+                    }
+                    if let Err(e) = self.clear_upload_blocks(rel) {
+                        warn!(path = %rel, error = %e, "failed to clear hydration error");
+                    }
+                    self.retry_at.remove(rel);
+                }
                 if let Err(e) = self.publish_vfs_snapshot(store) {
                     warn!(path = %rel, error = %e, "post-hydrate snapshot failed");
                 }
@@ -2924,6 +3067,9 @@ impl<S: SidecarApi + 'static> Engine<S> {
             }
             Err(e) => {
                 warn!(path = %rel, error = %e, "hydration failed");
+                if !self.shutting_down {
+                    self.record_download_failure(rel, &e);
+                }
             }
         }
         store.finish_hydrate(rel, true);
@@ -3012,12 +3158,27 @@ impl<S: SidecarApi + 'static> Engine<S> {
             std::fs::create_dir_all(dir)?;
         }
         let tmp = to_abs(&self.backing_dir, &transfer_temp_rel(rel));
+        // Surface an unwritable backing dir before the transfer (see
+        // `try_download_file`); this is also the temp the transfer writes.
+        std::fs::File::create(&tmp)
+            .with_context(|| format!("prepare hydration target {}", abs.display()))?;
         let sidecar = Arc::clone(&self.sidecar);
-        let outcome = self
+        let outcome = match self
             .run_transfer("download", Some(rel), sidecar.download(uid, &tmp))
-            .await?;
+            .await
+        {
+            Ok(outcome) => outcome,
+            Err(e) => {
+                let _ = std::fs::remove_file(&tmp);
+                return Err(anyhow::Error::new(e).context(format!("hydrate `{rel}`")));
+            }
+        };
         let _ = outcome;
-        std::fs::rename(&tmp, &abs)?;
+        if let Err(e) = std::fs::rename(&tmp, &abs) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(anyhow::Error::new(e)
+                .context(format!("install hydrated file {}", abs.display())));
+        }
         apply_file_metadata(&abs, mtime, mode);
         Ok(())
     }
@@ -3104,6 +3265,18 @@ impl<S: SidecarApi + 'static> Engine<S> {
     /// instead and re-keys the row).
     async fn write_upload_row(&mut self, rel: &str) -> Result<()> {
         let abs = to_abs(&self.backing_dir, rel);
+        // Unreadable backing content is a local environment failure, not a
+        // vanished file: surface it and let `upload_write_one` drop the
+        // queue entry (a fresh write heals it), never upload empty bytes.
+        if let Err(e) = std::fs::File::open(&abs) {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                return Err(anyhow::Error::new(e).context("backing file vanished"));
+            }
+            return self.record_local_upload_failure(
+                rel,
+                anyhow::Error::new(e).context(format!("read local file {}", abs.display())),
+            );
+        }
         let meta = std::fs::metadata(&abs).context("backing file vanished")?;
         let (sha1, size) = sha1_file(&abs)?;
         let mtime = file_mtime(&meta);
@@ -3220,55 +3393,60 @@ impl<S: SidecarApi + 'static> Engine<S> {
         Ok(())
     }
 
-    /// Download `uid` to `rel` and mark the row synced.
+    /// Download `uid` to `rel`. A local/transport failure never fails the
+    /// caller (an event, an enumeration pass, or the retry pump): it parks
+    /// the row as `Downloading` with the error and a backoff, leaving any
+    /// existing local content untouched (TG-19).
     async fn download_file(&mut self, uid: &str, rel: &str) -> Result<()> {
         if let Some(reason) = self.unmaterializable_reason(rel) {
             self.report_unmaterializable(rel, &reason);
             return Ok(());
         }
+        match self.try_download_file(uid, rel).await {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                // A shutdown/cancel is not an environment failure: leave the
+                // row alone and let the next run recover it.
+                if !self.shutting_down {
+                    self.record_download_failure(rel, &e);
+                }
+                Ok(())
+            }
+        }
+    }
+
+    async fn try_download_file(&mut self, uid: &str, rel: &str) -> Result<()> {
         let abs = self.content_path(rel);
         let node = self.sidecar.get_node(uid).await.ok();
+        // Make the row visible to the retry pump before the transfer: a
+        // brand-new node (created by an event) needs a row to record the
+        // failure against.
+        if self.db.node_by_path(rel)?.is_none()
+            && let Some(node) = &node
+        {
+            self.upsert_from_node(node, rel, SyncState::Downloading)?;
+        }
+        let state = self.db.node_by_path(rel)?.map(|r| r.sync_state);
+        if matches!(state, None | Some(SyncState::Synced | SyncState::Downloading)) {
+            self.db.set_sync_state(rel, SyncState::Downloading)?;
+        }
         // Mode is local-only (D2): the remote has none, but a row that
         // already knows the user's `chmod` keeps it across re-downloads.
         let existing_mode = self.db.node_by_path(rel)?.and_then(|r| r.mode);
         let remote_mtime = node.as_ref().and_then(|n| n.mtime);
         let tmp_rel = transfer_temp_rel(rel);
         let tmp = self.content_path(&tmp_rel);
-
-        // Persist the download intent BEFORE the transfer (TG-17): an
-        // interrupted transfer must leave a recoverable row, never a row that
-        // claims to be Synced with a hash whose bytes never landed. A path
-        // with no row yet (remote create event) gets one so a crash is just
-        // as recoverable.
-        let mut prior_state = None;
-        let mut created_row = false;
-        match self.db.node_by_path(rel)? {
-            Some(row) if row.node_uid == uid => {
-                prior_state = Some(row.sync_state);
-                self.db.set_sync_state(rel, SyncState::Downloading)?;
-            }
-            Some(_) => {} // another node owns this path; collision handling ran first
-            None => {
-                if let Some(node) = &node {
-                    self.db.upsert_node(&NodeRow {
-                        local_path: rel.to_string(),
-                        node_uid: uid.to_string(),
-                        parent_uid: node.parent_uid.clone(),
-                        name: rel.rsplit('/').next().unwrap_or(rel).to_string(),
-                        kind: NodeKind::File,
-                        size: node.size,
-                        sha1: node.sha1.clone(),
-                        mtime: node.mtime,
-                        sync_state: SyncState::Downloading,
-                        pinned: false,
-                        synced_sha1: node.sha1.clone(),
-                        mode: existing_mode,
-                    })?;
-                    created_row = true;
-                }
-            }
+        if let Some(dir) = abs.parent() {
+            std::fs::create_dir_all(dir)
+                .with_context(|| format!("create directory for {}", abs.display()))?;
         }
-
+        // Fail with the OS cause *before* the transfer when the target is not
+        // writable: the sidecar reports its own write errors, but not every
+        // transport surfaces one, and a missing temp afterwards would hide
+        // the real reason (a bare rename ENOENT). `*.pds-part` is a transfer
+        // temp, ignored by the watcher.
+        std::fs::File::create(&tmp)
+            .with_context(|| format!("prepare download target {}", abs.display()))?;
         let sidecar = Arc::clone(&self.sidecar);
         let outcome = match self
             .run_transfer("download", Some(rel), sidecar.download(uid, &tmp))
@@ -3276,21 +3454,16 @@ impl<S: SidecarApi + 'static> Engine<S> {
         {
             Ok(outcome) => outcome,
             Err(e) => {
-                // A live failure restores the previous state so reconciliation
-                // can retry later; a shutdown leaves `Downloading` for startup
-                // recovery to finish.
-                if !self.shutting_down {
-                    if let Some(state) = prior_state {
-                        self.db.set_sync_state(rel, state)?;
-                    } else if created_row {
-                        self.db.remove_node(rel)?;
-                    }
-                }
-                return Err(e.into());
+                let _ = std::fs::remove_file(&tmp);
+                return Err(anyhow::Error::new(e).context(format!("download `{rel}`")));
             }
         };
         let _ = outcome;
-        std::fs::rename(&tmp, &abs)?;
+        if let Err(e) = std::fs::rename(&tmp, &abs) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(anyhow::Error::new(e)
+                .context(format!("install downloaded file {}", abs.display())));
+        }
         apply_file_metadata(&abs, remote_mtime, existing_mode);
         self.db.upsert_node(&NodeRow {
             local_path: rel.to_string(),
@@ -3307,10 +3480,34 @@ impl<S: SidecarApi + 'static> Engine<S> {
             synced_sha1: node.as_ref().and_then(|n| n.sha1.clone()),
         })?;
         self.clear_upload_blocks(rel)?;
+        self.retry_at.remove(rel);
         self.remember_file_inode(rel);
         info!(path = %rel, "downloaded");
         self.emit_activity(ActivityKind::Downloaded, rel, None);
         Ok(())
+    }
+
+    /// Record a failed download/hydration: keep the row visible as errored,
+    /// leave the previous local copy in place, and schedule an exponential
+    /// retry (an explicit resume clears the backoff for "try now").
+    fn record_download_failure(&mut self, rel: &str, error: &anyhow::Error) {
+        let message = format!("{error:#}");
+        let current = self.db.node_by_path(rel).ok().flatten().map(|r| r.sync_state);
+        if matches!(current, None | Some(SyncState::Synced | SyncState::Downloading))
+            && let Err(e) = self.db.set_sync_state(rel, SyncState::Downloading)
+        {
+            warn!(path = %rel, error = %e, "failed to mark download as errored");
+        }
+        // `last_error`/`retry_count` are direction-agnostic storage: the same
+        // columns back upload and download failure bookkeeping.
+        let count = self.db.record_retryable_failure(rel).unwrap_or(1);
+        if let Err(e) = self.db.mark_upload_errored(rel, &message) {
+            warn!(path = %rel, error = %e, "failed to persist download error");
+        }
+        let backoff = retry_backoff(self.retry_base, count);
+        self.retry_at.insert(rel.to_string(), Instant::now() + backoff);
+        warn!(path = %rel, error = %message, backoff = ?backoff, "download failed; keeping local content and retrying");
+        self.emit_activity(ActivityKind::DownloadErrored, rel, Some(message));
     }
 
     /// Issue a transfer request, then await its completion notification while
@@ -3581,6 +3778,24 @@ impl<S: SidecarApi + 'static> Engine<S> {
         }
         if let Some(ev) = self.buffered_events.pop_front() {
             self.apply_event(ev).await?;
+            return Ok(true);
+        }
+        // Failed downloads/hydrations: retry once their backoff matures (an
+        // explicit resume clears it). Mirror downloads go to the visible
+        // root; placeholder mode hydrates into the backing cache.
+        let now = Instant::now();
+        if let Some(row) = self
+            .db
+            .nodes_with_state(SyncState::Downloading)?
+            .into_iter()
+            .find(|r| self.retry_at.get(&r.local_path).is_none_or(|t| *t <= now))
+        {
+            if let Some(store) = self.store.clone() {
+                self.hydrate_one(&store, &row.local_path).await;
+                self.maybe_evict(&store, &row.local_path);
+            } else {
+                self.download_file(&row.node_uid, &row.local_path).await?;
+            }
             return Ok(true);
         }
         // Uploads: skip terminally errored / remote-conflicted nodes and

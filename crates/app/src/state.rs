@@ -94,7 +94,11 @@ impl ActivityFilter {
             ActivityFilter::Problems => {
                 matches!(
                     kind,
-                    ActivityKind::UploadErrored | ActivityKind::GuardPaused | ActivityKind::Skipped
+                    ActivityKind::UploadErrored
+                        | ActivityKind::DownloadErrored
+                        | ActivityKind::ConnectionError
+                        | ActivityKind::GuardPaused
+                        | ActivityKind::Skipped
                 )
             }
         }
@@ -436,6 +440,8 @@ pub fn kind_label(kind: ActivityKind) -> &'static str {
         ActivityKind::Conflict => "Conflict",
         ActivityKind::GuardPaused => "Guard paused",
         ActivityKind::UploadErrored => "Upload error",
+        ActivityKind::DownloadErrored => "Download error",
+        ActivityKind::ConnectionError => "Connection error",
         ActivityKind::Skipped => "Skipped",
     }
 }
