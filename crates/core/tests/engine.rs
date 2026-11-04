@@ -4,8 +4,12 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use pds_core::{ActivityKind, Db, Engine, EngineConfig, EngineState, STATE_DIR};
-use pds_sidecar_client::{DriveEvent, EventKind, MockHandle, MockSidecar, SidecarClient};
+use pds_core::{
+    ActivityKind, Db, Engine, EngineConfig, EngineState, NodeRow, STATE_DIR, SyncState,
+};
+use pds_sidecar_client::{
+    DriveEvent, EventKind, MockHandle, MockSidecar, NodeKind, SidecarClient,
+};
 use serial_test::serial;
 
 struct Fixture {
@@ -1789,6 +1793,7 @@ async fn local_folder_rename_and_move_preserves_uids() {
     std::fs::rename(fx.root.join("Renamed"), fx.root.join("Archive/Renamed")).unwrap();
     wait_for(|| {
         fx.db.node_by_path("Archive/Renamed/sub/c.txt").ok().flatten().is_some()
+            && fx.db.node_by_path("Archive/Renamed").ok().flatten().is_some()
             && fx.db.node_by_path("Renamed").ok().flatten().is_none()
     })
     .await;
@@ -1813,6 +1818,7 @@ async fn local_folder_rename_and_move_preserves_uids() {
     std::fs::rename(fx.root.join("Archive/Renamed"), fx.root.join("Renamed")).unwrap();
     wait_for(|| {
         fx.db.node_by_path("Renamed/sub/c.txt").ok().flatten().is_some()
+            && fx.db.node_by_path("Renamed").ok().flatten().is_some()
             && fx.db
                 .node_by_path("Archive/Renamed")
                 .ok()
@@ -2062,6 +2068,623 @@ async fn child_update_before_moved_parent_lands_at_final_path() {
         "child must have exactly one row"
     );
     assert!(fx.mock.trashed_uids().is_empty());
+    fx.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------
+// TG-12 — case-only renames and case collisions
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn remote_case_only_rename_rekeys_row_and_preserves_identity() {
+    let fx = start().await;
+    fx.mock
+        .remote_create_file("root", "README.md", b"read me");
+    wait_for_synced(&fx.db, "README.md").await;
+    let uid = fx.mock.find_uid("root", "README.md").unwrap();
+    let downloads = fx.mock.downloaded_uids().len();
+
+    // Case-only remote rename: the row is resolved by uid, so this is a
+    // pure relocation (no conflict, no trash, no re-download).
+    fx.mock.remote_rename(&uid, "readme.md");
+
+    wait_for(|| {
+        fx.db
+            .node_by_path("readme.md")
+            .ok()
+            .flatten()
+            .is_some_and(|r| r.node_uid == uid)
+            && fx.db.node_by_path("README.md").ok().flatten().is_none()
+    })
+    .await;
+    assert_eq!(
+        std::fs::read(fx.root.join("readme.md")).unwrap(),
+        b"read me"
+    );
+    assert!(!fx.root.join("README.md").exists());
+    assert_eq!(
+        fx.db
+            .all_nodes()
+            .unwrap()
+            .iter()
+            .filter(|r| r.node_uid == uid)
+            .count(),
+        1,
+        "the renamed node must keep exactly one row"
+    );
+    assert!(
+        entry_with_prefix(&fx.root, "readme (conflict ").is_none(),
+        "a case-only rename must not create a conflict copy"
+    );
+    assert!(fx.mock.trashed_uids().is_empty());
+    assert_eq!(fx.mock.downloaded_uids().len(), downloads);
+    fx.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn local_case_only_rename_preserves_identity_and_renames_remotely() {
+    let fx = start().await;
+    std::fs::write(fx.root.join("README.md"), b"read me").unwrap();
+    wait_for_synced(&fx.db, "README.md").await;
+    let uid = fx.mock.find_uid("root", "README.md").unwrap();
+    let uploads = fx.mock.uploaded_names().len();
+    let renames = fx.mock.renames().len();
+
+    std::fs::rename(fx.root.join("README.md"), fx.root.join("readme.md")).unwrap();
+
+    wait_for(|| {
+        fx.db
+            .node_by_path("readme.md")
+            .ok()
+            .flatten()
+            .is_some_and(|r| r.node_uid == uid)
+            && fx.db.node_by_path("README.md").ok().flatten().is_none()
+    })
+    .await;
+    wait_for(|| fx.mock.renames().len() > renames).await;
+    assert!(
+        fx.mock
+            .renames()
+            .iter()
+            .any(|(u, name)| u == &uid && name == "readme.md"),
+        "case-only rename must reach the remote as a rename: {:?}",
+        fx.mock.renames()
+    );
+    assert_eq!(
+        fx.mock.uploaded_names().len(),
+        uploads,
+        "a rename must not re-upload the content"
+    );
+    assert!(fx.mock.trashed_uids().is_empty());
+    assert_eq!(
+        fx.db
+            .all_nodes()
+            .unwrap()
+            .iter()
+            .filter(|r| r.node_uid == uid)
+            .count(),
+        1,
+        "the renamed node must keep exactly one row"
+    );
+    assert_eq!(
+        std::fs::read(fx.root.join("readme.md")).unwrap(),
+        b"read me"
+    );
+    assert!(!fx.root.join("README.md").exists());
+    assert!(entry_with_prefix(&fx.root, "readme (conflict ").is_none());
+    fx.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn local_case_only_folder_rename_keeps_subtree_and_uses_inode_pairing() {
+    let fx = start().await;
+    std::fs::create_dir(fx.root.join("Docs")).unwrap();
+    std::fs::write(fx.root.join("Docs/a.txt"), b"alpha").unwrap();
+    wait_for_synced(&fx.db, "Docs/a.txt").await;
+    wait_for(|| fx.mock.find_uid("root", "Docs").is_some()).await;
+    let docs_uid = fx.mock.find_uid("root", "Docs").unwrap();
+    let a_uid = fx.mock.find_uid(&docs_uid, "a.txt").unwrap();
+    let uploads = fx.mock.uploaded_names().len();
+
+    // A case-only directory rename must be paired by inode (Wave 1a), never
+    // mistaken for "delete the folder + create a new one".
+    std::fs::rename(fx.root.join("Docs"), fx.root.join("docs")).unwrap();
+
+    wait_for(|| {
+        fx.db
+            .node_by_path("docs/a.txt")
+            .ok()
+            .flatten()
+            .is_some_and(|r| r.node_uid == a_uid)
+            && fx.db.node_by_path("docs").ok().flatten().is_some()
+            && fx.db.node_by_path("Docs").ok().flatten().is_none()
+    })
+    .await;
+    wait_for(|| fx.mock.find_uid("root", "docs").as_deref() == Some(docs_uid.as_str())).await;
+    assert_eq!(
+        fx.mock.find_uid(&docs_uid, "a.txt").as_deref(),
+        Some(a_uid.as_str())
+    );
+    assert_eq!(
+        std::fs::read(fx.root.join("docs/a.txt")).unwrap(),
+        b"alpha"
+    );
+    assert!(!fx.root.join("Docs").exists());
+    assert!(fx.mock.trashed_uids().is_empty());
+    assert_eq!(fx.mock.uploaded_names().len(), uploads);
+    assert_eq!(
+        fx.db
+            .all_nodes()
+            .unwrap()
+            .iter()
+            .filter(|r| r.node_uid == docs_uid || r.node_uid == a_uid)
+            .count(),
+        2,
+        "folder and child must keep exactly one row each"
+    );
+    fx.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn case_differing_remote_siblings_stay_distinct() {
+    // The mock (like a Linux filesystem) accepts names differing only by
+    // case. The engine must track them as two nodes and never let the second
+    // overwrite the first's row or file (no collapse, no conflict copy).
+    let fx = start().await;
+    let lower = fx
+        .mock
+        .remote_create_file("root", "case.txt", b"lower bytes");
+    wait_for_synced(&fx.db, "case.txt").await;
+    let upper = fx
+        .mock
+        .remote_create_file("root", "Case.txt", b"UPPER bytes");
+    wait_for_synced(&fx.db, "Case.txt").await;
+
+    assert_eq!(
+        std::fs::read(fx.root.join("case.txt")).unwrap(),
+        b"lower bytes"
+    );
+    assert_eq!(
+        std::fs::read(fx.root.join("Case.txt")).unwrap(),
+        b"UPPER bytes"
+    );
+    assert_eq!(
+        fx.db.node_by_path("case.txt").unwrap().unwrap().node_uid,
+        lower
+    );
+    assert_eq!(
+        fx.db.node_by_path("Case.txt").unwrap().unwrap().node_uid,
+        upper
+    );
+    assert_ne!(lower, upper);
+    assert_eq!(
+        fx.db
+            .all_nodes()
+            .unwrap()
+            .iter()
+            .filter(|r| r.node_uid == lower || r.node_uid == upper)
+            .count(),
+        2
+    );
+    assert!(fx.mock.trashed_uids().is_empty());
+    assert!(entry_with_prefix(&fx.root, "case (conflict ").is_none());
+    assert!(entry_with_prefix(&fx.root, "Case (conflict ").is_none());
+    fx.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------
+// TG-13 — Unicode, emoji, and odd-but-legal names
+// ---------------------------------------------------------------------------
+
+/// Names Linux accepts and the Drive protocol must carry byte-for-byte.
+/// NFC and NFD are deliberately both present: they render the same but are
+/// distinct filesystem names.
+const UNUSUAL_NAMES: &[&str] = &[
+    "caf\u{e9}.txt",          // NFC
+    "cafe\u{301}.txt",        // NFD
+    "rocket \u{1f680}.txt",   // emoji
+    "with space.txt",
+    "it's \"quoted\".txt",
+    "line\nbreak.txt",
+    "trailing dot.",
+    "trailing space ",
+    "~leading.txt",
+];
+
+/// The conflict-copy prefix for a name, matching `conflict_name`'s
+/// extension handling (dotfiles/extension-less names keep the suffix whole).
+fn conflict_prefix(name: &str) -> String {
+    match name.rsplit_once('.') {
+        Some((stem, _)) if !stem.is_empty() => format!("{stem} (conflict "),
+        _ => format!("{name} (conflict "),
+    }
+}
+
+fn entries_with_prefix(dir: &std::path::Path, prefix: &str) -> Vec<std::path::PathBuf> {
+    std::fs::read_dir(dir)
+        .map(|entries| {
+            entries
+                .filter_map(|e| e.ok())
+                .map(|e| e.path())
+                .filter(|p| {
+                    p.file_name()
+                        .is_some_and(|n| n.to_string_lossy().starts_with(prefix))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn unusual_names_upload_round_trip_exactly() {
+    let fx = start().await;
+    for name in UNUSUAL_NAMES {
+        std::fs::write(fx.root.join(name), format!("upload:{name}").as_bytes()).unwrap();
+    }
+    for name in UNUSUAL_NAMES {
+        wait_for_synced(&fx.db, name).await;
+        assert!(
+            fx.mock.uploaded_names().iter().any(|n| n == name),
+            "name {name:?} must reach the remote byte-for-byte, got {:?}",
+            fx.mock.uploaded_names()
+        );
+        let row = fx
+            .db
+            .node_by_path(name)
+            .unwrap()
+            .unwrap_or_else(|| panic!("missing row for {name:?}"));
+        assert_eq!(row.local_path, *name);
+        assert_eq!(row.name, *name);
+        assert_eq!(
+            std::fs::read(fx.root.join(name)).unwrap(),
+            format!("upload:{name}").as_bytes()
+        );
+        assert_eq!(
+            fx.mock.find_uid("root", name).as_deref(),
+            Some(row.node_uid.as_str())
+        );
+    }
+    assert!(fx.mock.trashed_uids().is_empty());
+    fx.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn unusual_names_download_round_trip_exactly() {
+    let fx = start().await;
+    let mut uids = Vec::new();
+    for name in UNUSUAL_NAMES {
+        let uid = fx.mock.remote_create_file(
+            "root",
+            name,
+            format!("remote:{name}").as_bytes(),
+        );
+        uids.push((*name, uid));
+    }
+    for (name, uid) in &uids {
+        // The file appears before its row is committed; wait for both so the
+        // lookup below cannot observe the download mid-flight.
+        wait_for_synced(&fx.db, name).await;
+        assert_eq!(
+            std::fs::read(fx.root.join(name)).unwrap(),
+            format!("remote:{name}").as_bytes(),
+            "downloaded bytes for {name:?}"
+        );
+        let row = fx
+            .db
+            .node_by_path(name)
+            .unwrap()
+            .unwrap_or_else(|| panic!("missing row for {name:?}"));
+        assert_eq!(row.node_uid, *uid);
+        assert_eq!(row.name, *name);
+    }
+    // The local namespace keeps NFC and NFD as distinct files (Linux does
+    // not normalise), so the snapshots agree on nine paths, not eight.
+    assert_eq!(
+        fx.db
+            .all_nodes()
+            .unwrap()
+            .iter()
+            .filter(|r| UNUSUAL_NAMES.contains(&r.local_path.as_str()))
+            .count(),
+        UNUSUAL_NAMES.len()
+    );
+    assert!(fx.mock.trashed_uids().is_empty());
+    fx.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn conflict_copies_for_unusual_names_are_valid_siblings() {
+    let fx = start().await;
+    // One fixture, sequential collisions: each local original is displaced
+    // by a remote node of the same name, then must survive as a sibling.
+    let names = [
+        "report.txt",
+        "trailing dot.",
+        "line\nbreak.txt",
+        "cafe\u{301}.txt",
+    ];
+    for name in names {
+        let local = format!("local:{name}");
+        std::fs::write(fx.root.join(name), local.as_bytes()).unwrap();
+        wait_for_synced(&fx.db, name).await;
+
+        let remote_uid = fx
+            .mock
+            .remote_create_file("root", name, format!("remote:{name}").as_bytes());
+        let prefix = conflict_prefix(name);
+        wait_for(|| {
+            let sibling = entries_with_prefix(&fx.root, &prefix);
+            let sibling_ready = sibling.first().is_some_and(|p| {
+                std::fs::read(p).ok().as_deref() == Some(local.as_bytes())
+                    && p.file_name()
+                        .and_then(|n| n.to_str())
+                        .is_some_and(|n| {
+                            fx.db.node_by_path(n).ok().flatten().is_some()
+                        })
+            });
+            sibling_ready
+                && std::fs::read(fx.root.join(name)).ok().as_deref()
+                    == Some(format!("remote:{name}").as_bytes())
+                && fx
+                    .db
+                    .node_by_path(name)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|row| row.node_uid == remote_uid)
+        })
+        .await;
+
+        // The incoming node keeps the original path; the displaced node
+        // keeps its identity under a conflict sibling with the extension
+        // intact (never corrupting the original).
+        assert_eq!(
+            fx.db.node_by_path(name).unwrap().unwrap().node_uid,
+            remote_uid
+        );
+        let sibling = entries_with_prefix(&fx.root, &prefix);
+        assert_eq!(sibling.len(), 1, "one conflict sibling for {name:?}");
+        let sibling_name = sibling[0]
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        if let Some((_, ext)) = name.rsplit_once('.')
+            && !name.starts_with('.')
+            && !name[..name.len() - ext.len() - 1].is_empty()
+        {
+            assert!(
+                sibling_name.ends_with(&format!(".{ext}")),
+                "extension must survive conflict naming for {name:?}: {sibling_name:?}"
+            );
+        }
+        assert!(fx.db.node_by_path(&sibling_name).unwrap().is_some());
+    }
+
+    // Dedup: a second collision for the same name must pick a NEW sibling
+    // instead of overwriting the first conflict copy.
+    std::fs::write(fx.root.join("report.txt"), b"local once more").unwrap();
+    wait_for_synced(&fx.db, "report.txt").await;
+    fx.mock
+        .remote_create_file("root", "report.txt", b"remote once more");
+    wait_for(|| {
+        let siblings = entries_with_prefix(&fx.root, "report (conflict ");
+        siblings.len() == 2
+            && siblings.iter().all(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| fx.db.node_by_path(n).ok().flatten().is_some())
+            })
+    })
+    .await;
+    let siblings = entries_with_prefix(&fx.root, "report (conflict ");
+    assert_eq!(siblings.len(), 2, "dedup must not overwrite a sibling");
+    assert!(
+        siblings.iter().any(|p| p
+            .file_name()
+            .is_some_and(|n| n.to_string_lossy().contains(" (2)"))),
+        "second conflict copy must be deduped with a numeric suffix: {siblings:?}"
+    );
+    assert!(fx.mock.trashed_uids().is_empty());
+    fx.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------
+// TG-14 — long paths and deep nesting
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn max_length_component_name_round_trips() {
+    let fx = start().await;
+    // 255 bytes is the Linux NAME_MAX: "x" * 251 + ".txt".
+    let long_upload = format!("{}.txt", "x".repeat(251));
+    assert_eq!(long_upload.len(), 255);
+    std::fs::write(fx.root.join(&long_upload), b"long upload").unwrap();
+    wait_for_synced(&fx.db, &long_upload).await;
+    assert!(
+        fx.mock.uploaded_names().iter().any(|n| n == &long_upload),
+        "255-byte name must reach the remote intact"
+    );
+    assert_eq!(
+        fx.db.node_by_path(&long_upload).unwrap().unwrap().name,
+        long_upload
+    );
+
+    // And the download direction.
+    let long_download = format!("{}.bin", "y".repeat(251));
+    assert_eq!(long_download.len(), 255);
+    fx.mock
+        .remote_create_file("root", &long_download, b"long download");
+    wait_for_synced(&fx.db, &long_download).await;
+    assert_eq!(
+        std::fs::read(fx.root.join(&long_download)).unwrap(),
+        b"long download"
+    );
+    assert_eq!(
+        fx.db.node_by_path(&long_download).unwrap().unwrap().name,
+        long_download
+    );
+    assert!(fx.mock.trashed_uids().is_empty());
+    fx.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn deep_nesting_beyond_64_levels_keeps_the_full_path() {
+    let fx = start().await;
+    // 70 nested remote folders, announced only through one leaf event: the
+    // engine has to fetch the ancestors and derive the FULL path. The old
+    // `depth > 64` cap anchored the leaf six levels too deep.
+    let mut parent_uid = "root".to_string();
+    let mut parts = Vec::new();
+    for i in 0..70 {
+        let name = format!("d{i:02}");
+        parent_uid = fx
+            .mock
+            .remote_create_folder_silent(&parent_uid, &name);
+        parts.push(name);
+    }
+    let deep_rel = parts.join("/");
+    let leaf_uid = fx
+        .mock
+        .remote_create_file(&parent_uid, "leaf.txt", b"deep bytes");
+    let leaf_rel = format!("{deep_rel}/leaf.txt");
+
+    wait_for_synced(&fx.db, &leaf_rel).await;
+    assert_eq!(
+        std::fs::read(fx.root.join(&leaf_rel)).unwrap(),
+        b"deep bytes"
+    );
+    let row = fx
+        .db
+        .node_by_path(&leaf_rel)
+        .unwrap()
+        .expect("leaf row must use the full 70-level path");
+    assert_eq!(row.node_uid, leaf_uid);
+    assert_eq!(row.local_path, leaf_rel);
+    // Every ancestor row also carries its full prefix, not a root anchor.
+    for i in 0..parts.len() {
+        let prefix = parts[..=i].join("/");
+        assert!(
+            fx.db.node_by_path(&prefix).unwrap().is_some(),
+            "missing ancestor row {prefix:?}"
+        );
+    }
+    assert!(fx.mock.trashed_uids().is_empty());
+    fx.shutdown().await;
+}
+
+/// A save whose raised row is never emitted: DB bookkeeping only.
+fn folder_row(local_path: &str, uid: &str, parent_uid: Option<&str>) -> NodeRow {
+    NodeRow {
+        local_path: local_path.to_string(),
+        node_uid: uid.to_string(),
+        parent_uid: parent_uid.map(str::to_string),
+        name: local_path.rsplit('/').next().unwrap_or(local_path).to_string(),
+        kind: NodeKind::Folder,
+        size: None,
+        sha1: None,
+        mtime: Some(1_700_000_000),
+        sync_state: SyncState::Synced,
+        pinned: false,
+        synced_sha1: None,
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn overlong_path_fails_cleanly_and_sync_continues() {
+    let fx = start().await;
+    // 70 folders x 60-byte names = a >4096-byte materialized path. The rows
+    // exist (as a restart would leave them) but nothing is on disk; the
+    // engine must reject the leaf BEFORE creating a partial chain or
+    // downloading, and surface a visible skip.
+    let mut parent_uid = "root".to_string();
+    let mut parts = Vec::new();
+    for i in 0..70 {
+        let name = format!("d{i:02}-{}", "x".repeat(56));
+        assert_eq!(name.len(), 60);
+        let uid = format!("deep-{i:02}");
+        let rel = if parts.is_empty() {
+            name.clone()
+        } else {
+            format!("{}/{}", parts.join("/"), name)
+        };
+        let parent = if i == 0 {
+            "root".to_string()
+        } else {
+            format!("deep-{:02}", i - 1)
+        };
+        fx.db
+            .upsert_node(&folder_row(&rel, &uid, Some(&parent)))
+            .unwrap();
+        parts.push(name);
+        parent_uid = uid;
+    }
+    let deep_rel = parts.join("/");
+    let leaf_rel = format!("{deep_rel}/big.bin");
+    assert!(
+        fx.root.join(&leaf_rel).as_os_str().len() >= 4096,
+        "fixture path must exceed PATH_MAX"
+    );
+
+    let mut activity = fx.handle.subscribe_activity();
+    let leaf_uid = fx
+        .mock
+        .remote_create_file(&parent_uid, "big.bin", b"too long");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut skipped = None;
+    while Instant::now() < deadline {
+        for item in drain_activity(&mut activity) {
+            if item.kind == ActivityKind::Skipped && item.path == leaf_rel {
+                skipped = Some(item);
+            }
+        }
+        if skipped.is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let skipped = skipped.expect("over-long path must surface as a visible skip");
+    assert!(
+        skipped
+            .detail
+            .as_deref()
+            .is_some_and(|d| d.contains("PATH_MAX") || d.contains("too long")),
+        "detail must explain the path limit, got {:?}",
+        skipped.detail
+    );
+
+    // No half-written row, no download attempt, no directory chain.
+    assert!(fx.db.node_by_path(&leaf_rel).unwrap().is_none());
+    assert!(fx.db.node_by_uid(&leaf_uid).unwrap().is_none());
+    assert!(
+        !fx.mock.downloaded_uids().contains(&leaf_uid),
+        "the engine must not start a doomed transfer"
+    );
+    assert!(!fx.root.join(&parts[0]).exists());
+    assert!(fx.mock.trashed_uids().is_empty());
+    assert!(fx.mock.uploaded_names().is_empty());
+
+    // The rest of the sync continues: a later, normal remote file lands.
+    fx.mock
+        .remote_create_file("root", "after-skip.txt", b"still syncing");
+    wait_for(|| fx.root.join("after-skip.txt").is_file()).await;
+    assert_eq!(
+        std::fs::read(fx.root.join("after-skip.txt")).unwrap(),
+        b"still syncing"
+    );
+    assert!(
+        !fx.mock.downloaded_uids().contains(&leaf_uid),
+        "no retry storm after the skip"
+    );
     fx.shutdown().await;
 }
 
