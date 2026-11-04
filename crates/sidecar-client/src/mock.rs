@@ -57,6 +57,8 @@ struct State {
     scope_id: String,
     /// Call log for assertions: ("trash", uids), ("upload", name), ...
     calls: Vec<(String, Vec<String>)>,
+    /// `(name, mtime)` of every `drive.upload` request, in call order.
+    upload_mtimes: Vec<(String, i64)>,
     /// Scripted `transfer.error`s for revision uploads, per node uid; popped
     /// one per `drive.upload` attempt (content is NOT applied on failure).
     upload_failures: HashMap<String, ScriptedFailures>,
@@ -170,6 +172,21 @@ impl MockHandle {
             .filter(|(m, _)| m == "upload")
             .flat_map(|(_, u)| u.clone())
             .collect()
+    }
+
+    /// `(name, mtime)` of every `drive.upload` request, in call order.
+    pub fn uploaded_mtimes(&self) -> Vec<(String, i64)> {
+        self.state.lock().unwrap().upload_mtimes.clone()
+    }
+
+    /// Current mtime of a remote node (Unix seconds).
+    pub fn node_mtime(&self, uid: &str) -> Option<i64> {
+        self.state
+            .lock()
+            .unwrap()
+            .nodes
+            .get(uid)
+            .and_then(|n| n.mtime)
     }
 
     /// Current (non-trashed) remote children names of a folder.
@@ -612,6 +629,7 @@ impl MockSidecar {
                 next_event: 0,
                 scope_id,
                 calls: Vec::new(),
+                upload_mtimes: Vec::new(),
                 upload_failures: HashMap::new(),
                 download_holds: HashMap::new(),
                 held_downloads: HashMap::new(),
@@ -893,7 +911,12 @@ impl MockSidecar {
                     .get("parentUid")
                     .and_then(Value::as_str)
                     .map(str::to_string);
+                let mtime = params
+                    .get("mtime")
+                    .and_then(Value::as_i64)
+                    .unwrap_or(1_700_000_000);
                 st.calls.push(("upload".into(), vec![name.clone()]));
+                st.upload_mtimes.push((name.clone(), mtime));
 
                 // Scripted failure (e.g. the 409 stale-revision class):
                 // respond with the transfer id, then a transfer.error —
@@ -925,6 +948,7 @@ impl MockSidecar {
                     if let Some(n) = st.nodes.get_mut(&existing) {
                         n.size = Some(content.len() as i64);
                         n.sha1 = Some(hex_sha1(&content));
+                        n.mtime = Some(mtime);
                         n.content = Some(Arc::new(content));
                         n.trashed = false;
                     }
@@ -939,7 +963,7 @@ impl MockSidecar {
                             name,
                             kind: "file",
                             size: Some(content.len() as i64),
-                            mtime: Some(1_700_000_000),
+                            mtime: Some(mtime),
                             sha1: Some(hex_sha1(&content)),
                             content: Some(Arc::new(content)),
                             trashed: false,

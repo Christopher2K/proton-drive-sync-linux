@@ -803,6 +803,12 @@ impl<S: SidecarApi + 'static> Engine<S> {
                     let _ = req.reply.send(result);
                     continue;
                 }
+                // Metadata-only changes (`setattr` mtime/mode): update the
+                // row + served snapshot, never the remote (hash unchanged).
+                if let Some((rel, mtime, mode)) = store.next_metadata_request() {
+                    self.apply_metadata_update(&store, &rel, mtime, mode);
+                    continue;
+                }
                 if let Some(rel) = store.next_hydrate_request() {
                     self.hydrate_one(&store, &rel).await;
                     // Hydration may have pushed the cache over the cap;
@@ -1000,6 +1006,9 @@ impl<S: SidecarApi + 'static> Engine<S> {
     }
 
     fn upsert_from_node(&self, node: &Node, rel: &str, state: SyncState) -> Result<()> {
+        // Mode is local-only (D2): a remote update must not wipe a mode the
+        // user set on the local copy.
+        let mode = self.db.node_by_path(rel)?.and_then(|r| r.mode);
         self.db.upsert_node(&NodeRow {
             local_path: rel.to_string(),
             node_uid: node.uid.clone(),
@@ -1009,6 +1018,7 @@ impl<S: SidecarApi + 'static> Engine<S> {
             size: node.size,
             sha1: node.sha1.clone(),
             mtime: node.mtime,
+            mode,
             sync_state: state,
             pinned: false,
             synced_sha1: node.sha1.clone(),
@@ -1408,11 +1418,8 @@ impl<S: SidecarApi + 'static> Engine<S> {
             Err(_) => return Ok(()), // vanished again — delete path handles it
         };
         let (sha1, size) = sha1_file(&abs)?;
-        let mtime = meta
-            .modified()
-            .ok()
-            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|d| d.as_secs() as i64);
+        let mtime = file_mtime(&meta);
+        let mode = file_mode(&meta);
         let name = rel.rsplit('/').next().unwrap_or(rel).to_string();
 
         let (parent_uid, node_uid, synced_sha1, fresh_content) = match self.db.node_by_path(rel)? {
@@ -1425,7 +1432,14 @@ impl<S: SidecarApi + 'static> Engine<S> {
                     self.cancel_stale_tombstone(rel, &row.node_uid);
                 }
                 if row.sync_state == SyncState::Synced && row.sha1.as_deref() == Some(&sha1) {
-                    return Ok(()); // content unchanged
+                    // Content unchanged; a local `chmod` still updates the
+                    // persisted mode (D2) without touching the remote.
+                    if row.mode != mode {
+                        let mut updated = row;
+                        updated.mode = mode;
+                        self.db.upsert_node(&updated)?;
+                    }
+                    return Ok(());
                 }
                 // A fresh local edit resets failure bookkeeping (the user
                 // may have fixed the cause); re-hashes of an already-dirty
@@ -1475,6 +1489,7 @@ impl<S: SidecarApi + 'static> Engine<S> {
             size: Some(size as i64),
             sha1: Some(sha1.clone()),
             mtime,
+            mode,
             sync_state: SyncState::Dirty,
             pinned: false,
             // The dirty rewrite above tracks LOCAL content in `sha1`; keep
@@ -1616,6 +1631,7 @@ impl<S: SidecarApi + 'static> Engine<S> {
         )
         .await?;
         std::fs::rename(&tmp, &abs)?;
+        apply_file_metadata(&abs, node.mtime, None);
         let (sha1, size) = sha1_file(&abs)?;
         self.db.upsert_node(&NodeRow {
             local_path: conflict_rel.clone(),
@@ -1630,6 +1646,7 @@ impl<S: SidecarApi + 'static> Engine<S> {
             size: Some(size as i64),
             sha1: Some(sha1),
             mtime: node.mtime,
+            mode: None,
             sync_state: SyncState::Dirty,
             pinned: false,
             synced_sha1: None,
@@ -2670,12 +2687,48 @@ impl<S: SidecarApi + 'static> Engine<S> {
                     is_dir: !row.is_file(),
                     size: row.size.unwrap_or(0).max(0) as u64,
                     mtime: row.mtime.unwrap_or(0),
+                    mode: if row.is_file() {
+                        row.mode.unwrap_or(0o644) & 0o777
+                    } else {
+                        0o755
+                    },
                     content_ready: to_abs(&self.backing_dir, &row.local_path).is_file(),
                 },
             );
         }
         store.publish_snapshot(by_path);
         Ok(())
+    }
+
+    /// Apply a VFS `setattr` metadata change to the row and snapshot.
+    /// Timestamp-only changes do NOT queue an upload: the content hash is
+    /// unchanged, and a metadata-only revision would be remote churn. The
+    /// stored mtime is preserved and rides along on the next real edit
+    /// (`upload_params` reads the row). An overlay-only file has no row
+    /// yet; its upload captures the on-disk mtime/mode.
+    fn apply_metadata_update(
+        &mut self,
+        store: &Store,
+        rel: &str,
+        mtime: Option<i64>,
+        mode: Option<u32>,
+    ) {
+        let Some(mut row) = self.db.node_by_path(rel).ok().flatten() else {
+            return;
+        };
+        if let Some(mtime) = mtime {
+            row.mtime = Some(mtime);
+        }
+        if let Some(mode) = mode {
+            row.mode = Some(mode & 0o777);
+        }
+        if let Err(e) = self.db.upsert_node(&row) {
+            warn!(path = %rel, error = %e, "metadata update failed");
+            return;
+        }
+        if let Err(e) = self.publish_vfs_snapshot(store) {
+            warn!(path = %rel, error = %e, "post-metadata VFS snapshot failed");
+        }
     }
 
     /// Hydrate one requested placeholder: download to the backing dir,
@@ -2686,7 +2739,10 @@ impl<S: SidecarApi + 'static> Engine<S> {
             store.finish_hydrate(rel, false);
             return;
         };
-        match self.download_to_backing(&row.node_uid, rel).await {
+        match self
+            .download_to_backing(&row.node_uid, rel, row.mtime, row.mode)
+            .await
+        {
             Ok(()) => {
                 store.set_backing(rel, to_abs(&self.backing_dir, rel));
                 if let Err(e) = self.publish_vfs_snapshot(store) {
@@ -2762,7 +2818,13 @@ impl<S: SidecarApi + 'static> Engine<S> {
 
     /// Download a node into the backing dir (placeholder mode). Same atomic
     /// tmp+rename pattern as [`Engine::download_file`], different target.
-    async fn download_to_backing(&mut self, uid: &str, rel: &str) -> Result<()> {
+    async fn download_to_backing(
+        &mut self,
+        uid: &str,
+        rel: &str,
+        mtime: Option<i64>,
+        mode: Option<u32>,
+    ) -> Result<()> {
         let abs = to_abs(&self.backing_dir, rel);
         if abs.is_file() {
             return Ok(()); // already hydrated (lost wake-up)
@@ -2777,6 +2839,7 @@ impl<S: SidecarApi + 'static> Engine<S> {
             .await?;
         let _ = outcome;
         std::fs::rename(&tmp, &abs)?;
+        apply_file_metadata(&abs, mtime, mode);
         Ok(())
     }
 
@@ -2864,11 +2927,8 @@ impl<S: SidecarApi + 'static> Engine<S> {
         let abs = to_abs(&self.backing_dir, rel);
         let meta = std::fs::metadata(&abs).context("backing file vanished")?;
         let (sha1, size) = sha1_file(&abs)?;
-        let mtime = meta
-            .modified()
-            .ok()
-            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|d| d.as_secs() as i64);
+        let mtime = file_mtime(&meta);
+        let mode = file_mode(&meta);
         let name = rel.rsplit('/').next().unwrap_or(rel).to_string();
 
         let (parent_uid, node_uid, synced_sha1) = match self.db.node_by_path(rel)? {
@@ -2880,6 +2940,12 @@ impl<S: SidecarApi + 'static> Engine<S> {
                     // still exists with its known content, so the newest
                     // signal — the write — wins over the older delete.
                     self.cancel_stale_tombstone(rel, &row.node_uid);
+                    // A chmod may still have changed the local mode.
+                    if row.mode != mode {
+                        let mut updated = row;
+                        updated.mode = mode;
+                        self.db.upsert_node(&updated)?;
+                    }
                     return Ok(()); // content unchanged (spurious close)
                 }
                 // Revision of an existing (possibly pending) node. A pending
@@ -2930,6 +2996,7 @@ impl<S: SidecarApi + 'static> Engine<S> {
                     size: Some(size as i64),
                     sha1: Some(sha1.clone()),
                     mtime,
+                    mode,
                     sync_state: SyncState::Dirty,
                     pinned: false,
                     synced_sha1: None,
@@ -2951,6 +3018,7 @@ impl<S: SidecarApi + 'static> Engine<S> {
                 size: Some(size as i64),
                 sha1: Some(sha1),
                 mtime,
+                mode,
                 sync_state: SyncState::Dirty,
                 pinned: row.pinned,
                 synced_sha1,
@@ -2977,6 +3045,10 @@ impl<S: SidecarApi + 'static> Engine<S> {
     async fn download_file(&mut self, uid: &str, rel: &str) -> Result<()> {
         let abs = self.content_path(rel);
         let node = self.sidecar.get_node(uid).await.ok();
+        // Mode is local-only (D2): the remote has none, but a row that
+        // already knows the user's `chmod` keeps it across re-downloads.
+        let existing_mode = self.db.node_by_path(rel)?.and_then(|r| r.mode);
+        let remote_mtime = node.as_ref().and_then(|n| n.mtime);
         let tmp_rel = format!("{rel}.pds-part");
         let tmp = self.content_path(&tmp_rel);
 
@@ -3035,6 +3107,7 @@ impl<S: SidecarApi + 'static> Engine<S> {
         };
         let _ = outcome;
         std::fs::rename(&tmp, &abs)?;
+        apply_file_metadata(&abs, remote_mtime, existing_mode);
         self.db.upsert_node(&NodeRow {
             local_path: rel.to_string(),
             node_uid: uid.to_string(),
@@ -3043,7 +3116,8 @@ impl<S: SidecarApi + 'static> Engine<S> {
             kind: NodeKind::File,
             size: node.as_ref().and_then(|n| n.size),
             sha1: node.as_ref().and_then(|n| n.sha1.clone()),
-            mtime: node.as_ref().and_then(|n| n.mtime),
+            mtime: remote_mtime,
+            mode: existing_mode,
             sync_state: SyncState::Synced,
             pinned: false,
             synced_sha1: node.as_ref().and_then(|n| n.sha1.clone()),
@@ -3357,6 +3431,38 @@ fn now_unix() -> i64 {
         .unwrap_or(0)
 }
 
+/// Unix seconds from a file's modification time.
+fn file_mtime(meta: &std::fs::Metadata) -> Option<i64> {
+    meta.modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs() as i64)
+}
+
+/// POSIX permission bits (0o777 mask) of a file.
+fn file_mode(meta: &std::fs::Metadata) -> Option<u32> {
+    use std::os::unix::fs::PermissionsExt as _;
+    Some(meta.permissions().mode() & 0o777)
+}
+
+/// Apply a remote/row mtime and a locally persisted mode to a downloaded
+/// file (D6/D2). Times are set before permissions: a restrictive mode
+/// (e.g. 0444) would otherwise make the write-open needed for `set_times`
+/// fail. Missing files are ignored — callers only use this after a rename.
+fn apply_file_metadata(path: &Path, mtime: Option<i64>, mode: Option<u32>) {
+    if let Some(mtime) = mtime {
+        let when = std::time::UNIX_EPOCH + std::time::Duration::from_secs(mtime.max(0) as u64);
+        let times = std::fs::FileTimes::new().set_modified(when);
+        if let Ok(f) = std::fs::OpenOptions::new().write(true).open(path) {
+            let _ = f.set_times(times);
+        }
+    }
+    if let Some(mode) = mode {
+        use std::os::unix::fs::PermissionsExt as _;
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode & 0o777));
+    }
+}
+
 /// Recursive on-disk size of `dir` (regular files only, symlinks not
 /// followed). Missing dir → 0. Used for the backing-cache usage figure in
 /// [`EngineStatus`] — a walk beats summing DB rows because it reflects
@@ -3497,11 +3603,9 @@ fn convert_layout(db: &Db, root: &Path, backing_dir: &Path, target: SyncMode) ->
                             moved += 1;
                             let (sha1, size) =
                                 sha1_file(&dest).unwrap_or_else(|_| (String::new(), 0));
-                            let mtime = std::fs::metadata(&dest)
-                                .and_then(|m| m.modified())
-                                .ok()
-                                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                                .map(|d| d.as_secs() as i64);
+                            let meta = std::fs::metadata(&dest).ok();
+                            let mtime = meta.as_ref().and_then(file_mtime);
+                            let mode = meta.as_ref().and_then(file_mode);
                             let name =
                                 rel.rsplit('/').next().unwrap_or(&rel).to_string();
                             db.upsert_node(&NodeRow {
@@ -3513,6 +3617,7 @@ fn convert_layout(db: &Db, root: &Path, backing_dir: &Path, target: SyncMode) ->
                                 size: Some(size as i64),
                                 sha1: Some(sha1),
                                 mtime,
+                                mode,
                                 sync_state: SyncState::Dirty,
                                 pinned: false,
                                 synced_sha1: None,
@@ -3774,6 +3879,7 @@ mod tests {
             size: None,
             sha1: sha1.clone(),
             mtime: None,
+            mode: None,
             sync_state: SyncState::Synced,
             pinned: false,
             synced_sha1: sha1,
@@ -3791,6 +3897,7 @@ mod tests {
             size: None,
             sha1: None,
             mtime: None,
+            mode: None,
             sync_state: state,
             pinned: false,
             synced_sha1: None,
