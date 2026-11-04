@@ -2156,3 +2156,402 @@ mod futures {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Wave 3b — session expiry mid-sync and sign-out with pending work (TG-20).
+// ---------------------------------------------------------------------------
+
+// An upload rejected with 1002 parks the row (still Dirty, content intact)
+// and raises a sign-in-required signal. It must not enter the retry loop;
+// an explicit resume after re-authentication drains it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn session_expired_upload_parks_and_heals_after_reauthentication() {
+    let fx = start_with_retry_base(Duration::from_millis(20)).await;
+    let mut activity = fx.handle.subscribe_activity();
+    fx.mock
+        .inject_upload_failures("node-hello", &[(1002, "session expired", false)]);
+
+    std::fs::write(fx.root.join("hello.txt"), b"v2 after expiry").unwrap();
+    wait_for(|| {
+        futures::executor::block_on(fx.handle.status())
+            .map(|s| s.needs_sign_in)
+            .unwrap_or(false)
+    })
+    .await;
+
+    // Parked as Dirty (never stuck Uploading), content and identity intact.
+    let row = fx.db.node_by_path("hello.txt").unwrap().unwrap();
+    assert_eq!(row.sync_state, pds_core::SyncState::Dirty);
+    assert_eq!(row.node_uid, "node-hello");
+    assert_eq!(
+        std::fs::read(fx.root.join("hello.txt")).unwrap(),
+        b"v2 after expiry"
+    );
+    assert!(fx.db.tombstones().unwrap().is_empty());
+
+    // The failure is a sign-in problem, not a terminal per-file error.
+    let items = drain_activity(&mut activity);
+    assert!(
+        items
+            .iter()
+            .any(|i| i.kind == ActivityKind::SignInRequired),
+        "expected a sign-in-required activity entry, got {items:?}"
+    );
+    assert!(
+        !items
+            .iter()
+            .any(|i| i.kind == ActivityKind::UploadErrored),
+        "session expiry must not be reported as a terminal upload error"
+    );
+
+    // No retry storm while signed out.
+    assert_eq!(fx.mock.upload_attempts("hello.txt"), 1);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        fx.mock.upload_attempts("hello.txt"),
+        1,
+        "engine retried an expired session"
+    );
+
+    // Re-authenticated (the scripted failure is exhausted): resume drains it.
+    fx.handle.resume().await.unwrap();
+    wait_for_synced(&fx.db, "hello.txt").await;
+    assert_eq!(
+        fx.mock.file_content("node-hello").as_deref(),
+        Some(b"v2 after expiry".as_slice())
+    );
+    let st = fx.handle.status().await.unwrap();
+    assert!(!st.needs_sign_in);
+    assert_eq!(st.errored_nodes, 0);
+    fx.shutdown().await;
+}
+
+// A download rejected with 1002 parks the triggering event (cursor not
+// advanced) and raises the same sign-in signal; after re-auth the buffered
+// event retries and heals the file.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn session_expired_download_parks_event_and_heals_after_reauthentication() {
+    let fx = start().await;
+    let mut activity = fx.handle.subscribe_activity();
+    fx.mock
+        .inject_download_failures("node-hello", &[(1002, "session expired", false)]);
+    fx.mock.remote_update_file("node-hello", b"remote v2");
+
+    wait_for(|| {
+        futures::executor::block_on(fx.handle.status())
+            .map(|s| s.needs_sign_in)
+            .unwrap_or(false)
+    })
+    .await;
+    // Not materialized yet (and the old content was not clobbered).
+    assert_eq!(
+        std::fs::read(fx.root.join("hello.txt")).unwrap(),
+        b"hello drive"
+    );
+    let downloads = fx.mock.downloaded_uids().len();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        fx.mock.downloaded_uids().len(),
+        downloads,
+        "engine retried a download while signed out"
+    );
+    let items = drain_activity(&mut activity);
+    assert!(
+        items
+            .iter()
+            .any(|i| i.kind == ActivityKind::SignInRequired),
+        "expected a sign-in-required activity entry, got {items:?}"
+    );
+
+    fx.handle.resume().await.unwrap();
+    wait_for(|| {
+        std::fs::read(fx.root.join("hello.txt"))
+            .ok()
+            .as_deref()
+            == Some(b"remote v2".as_slice())
+    })
+    .await;
+    wait_for_synced(&fx.db, "hello.txt").await;
+    assert!(!fx.handle.status().await.unwrap().needs_sign_in);
+    fx.shutdown().await;
+}
+
+// Signing out (engine shutdown) with a tombstone and a dirty upload pending
+// must keep both in the DB/disk and make no further remote calls. A later
+// successful session drains them in the documented order: tombstones (guard)
+// before uploads.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn sign_out_keeps_pending_work_and_drains_after_reauthentication() {
+    let fx = start().await;
+    seed_synced_fillers(&fx, 10).await;
+    fx.handle.pause().await.unwrap();
+    wait_for(|| {
+        futures::executor::block_on(fx.handle.status())
+            .map(|s| s.state == EngineState::Paused)
+            .unwrap_or(false)
+    })
+    .await;
+
+    std::fs::write(fx.root.join("draft.txt"), b"pending local work").unwrap();
+    wait_for(|| {
+        fx.db
+            .node_by_path("draft.txt")
+            .ok()
+            .flatten()
+            .is_some_and(|r| r.sync_state == pds_core::SyncState::Dirty)
+    })
+    .await;
+    std::fs::remove_file(fx.root.join("hello.txt")).unwrap();
+    wait_for(|| {
+        fx.db
+            .tombstones()
+            .map(|t| t.iter().any(|t| t.local_path == "hello.txt"))
+            .unwrap_or(false)
+    })
+    .await;
+
+    let root = fx.root.clone();
+    let db_path = root.join(STATE_DIR).join("state.db");
+    let db = fx.db.clone();
+    let old_mock = fx.mock.clone();
+    let trashes_before = old_mock.trashed_uids().len();
+    let uploads_before = old_mock.uploaded_names().len();
+    fx.shutdown_keep_dir().await;
+
+    // No session: pending local work survives untouched and nothing reaches
+    // the (now stopped) sidecar.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        std::fs::read(root.join("draft.txt")).unwrap(),
+        b"pending local work"
+    );
+    assert!(
+        db.node_by_path("draft.txt")
+            .unwrap()
+            .is_some_and(|r| r.sync_state == pds_core::SyncState::Dirty)
+    );
+    assert!(
+        db.tombstones()
+            .unwrap()
+            .iter()
+            .any(|t| t.local_path == "hello.txt")
+    );
+    assert_eq!(old_mock.trashed_uids().len(), trashes_before);
+    assert_eq!(old_mock.uploaded_names().len(), uploads_before);
+
+    // "Re-login": a fresh sidecar session over the SAME DB. The pending
+    // queue must drain: tombstone first, then the upload.
+    // Start the mock's uid counters above the ids the first session already
+    // persisted (node-101..), or the upload would reuse a filler's node_uid.
+    let (client, mock) = MockSidecar::new_with_seq(1000).connect();
+    let mut client = client;
+    let notifications = client.take_notifications();
+    let (engine, handle) = Engine::new(
+        Arc::new(client),
+        notifications,
+        EngineConfig {
+            root: root.clone(),
+            db_path: db_path.clone(),
+            retry_base: pds_core::RETRY_BASE_DEFAULT,
+            placeholders: false,
+            eviction_cap: None,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let engine = tokio::spawn(engine.run());
+
+    wait_for(|| mock.trashed_uids().contains(&"node-hello".to_string())).await;
+    wait_for(|| mock.uploaded_names().contains(&"draft.txt".to_string())).await;
+    wait_for(|| {
+        db.tombstones().map(|t| t.is_empty()).unwrap_or(false)
+            && db
+                .node_by_path("draft.txt")
+                .ok()
+                .flatten()
+                .is_some_and(|r| r.sync_state == pds_core::SyncState::Synced)
+    })
+    .await;
+
+    let log = mock.call_log();
+    let trash_at = log
+        .iter()
+        .position(|(m, args)| m == "trash" && args.iter().any(|u| u == "node-hello"))
+        .expect("tombstone drained");
+    let upload_at = log
+        .iter()
+        .position(|(m, args)| m == "upload" && args.iter().any(|n| n == "draft.txt"))
+        .expect("draft uploaded");
+    assert!(
+        trash_at < upload_at,
+        "pending deletes must drain before uploads: {log:?}"
+    );
+    assert_eq!(
+        std::fs::read(root.join("draft.txt")).unwrap(),
+        b"pending local work"
+    );
+
+    handle.shutdown().await.unwrap();
+    let _ = engine.await;
+}
+
+// ---------------------------------------------------------------------------
+// Wave 3b — sidecar crash / restart mid-transfer (TG-21).
+// ---------------------------------------------------------------------------
+
+// The child process dying mid-upload (stdout EOF after the transfer started)
+// must leave the row recoverable (Dirty, not Uploading), surface an activity
+// entry, and keep the engine alive in a visible degraded state without a
+// retry spin. Recovery needs a host restart (no automatic respawn yet).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn sidecar_death_mid_upload_degrades_without_stuck_or_loop() {
+    let fx = start().await;
+    let mut activity = fx.handle.subscribe_activity();
+    fx.mock.crash_on_next_upload();
+
+    std::fs::write(fx.root.join("hello.txt"), b"v2 before crash").unwrap();
+    wait_for(|| {
+        futures::executor::block_on(fx.handle.status())
+            .map(|s| s.sidecar_unavailable)
+            .unwrap_or(false)
+    })
+    .await;
+
+    let st = fx.handle.status().await.unwrap();
+    assert!(st.sidecar_unavailable);
+    assert_eq!(st.state, EngineState::Running);
+    let row = fx.db.node_by_path("hello.txt").unwrap().unwrap();
+    assert_eq!(
+        row.sync_state,
+        pds_core::SyncState::Dirty,
+        "row left in a non-drainable transfer state"
+    );
+    assert_eq!(
+        std::fs::read(fx.root.join("hello.txt")).unwrap(),
+        b"v2 before crash"
+    );
+    let items = drain_activity(&mut activity);
+    assert!(
+        items
+            .iter()
+            .any(|i| i.kind == ActivityKind::SidecarUnavailable),
+        "expected a sidecar-unavailable activity entry, got {items:?}"
+    );
+
+    let attempts = fx.mock.upload_attempts("hello.txt");
+    assert_eq!(attempts, 1);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        fx.mock.upload_attempts("hello.txt"),
+        attempts,
+        "engine retried a dead sidecar"
+    );
+    assert!(
+        !fx.engine.is_finished(),
+        "engine should stay visible for status"
+    );
+    fx.shutdown().await;
+}
+
+// A sidecar outage while calls are being made is visible in status/activity;
+// pending tombstone + upload work stays intact, and the engine probes again
+// and drains the queues once calls succeed (mock "restarted").
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn sidecar_outage_is_visible_and_recovers_when_calls_succeed_again() {
+    let fx = start().await;
+    seed_synced_fillers(&fx, 10).await;
+    let mut activity = fx.handle.subscribe_activity();
+    fx.handle.pause().await.unwrap();
+    wait_for(|| {
+        futures::executor::block_on(fx.handle.status())
+            .map(|s| s.state == EngineState::Paused)
+            .unwrap_or(false)
+    })
+    .await;
+
+    std::fs::write(fx.root.join("deferred.txt"), b"waiting for sidecar").unwrap();
+    wait_for(|| {
+        fx.db
+            .node_by_path("deferred.txt")
+            .ok()
+            .flatten()
+            .is_some_and(|r| r.sync_state == pds_core::SyncState::Dirty)
+    })
+    .await;
+    std::fs::remove_file(fx.root.join("hello.txt")).unwrap();
+    wait_for(|| {
+        fx.db
+            .tombstones()
+            .map(|t| t.iter().any(|t| t.local_path == "hello.txt"))
+            .unwrap_or(false)
+    })
+    .await;
+
+    let calls_before = fx.mock.call_log().len();
+    fx.mock.set_offline(true);
+    fx.handle.resume().await.unwrap();
+
+    wait_for(|| {
+        futures::executor::block_on(fx.handle.status())
+            .map(|s| s.sidecar_unavailable)
+            .unwrap_or(false)
+    })
+    .await;
+    assert!(fx.handle.status().await.unwrap().sidecar_unavailable);
+    // Both queues survive; the failed calls were never dispatched remotely.
+    assert!(
+        fx.db
+            .tombstones()
+            .unwrap()
+            .iter()
+            .any(|t| t.local_path == "hello.txt")
+    );
+    assert!(fx.mock.trashed_uids().is_empty());
+    assert!(
+        !fx.mock
+            .uploaded_names()
+            .contains(&"deferred.txt".to_string())
+    );
+    let items = drain_activity(&mut activity);
+    assert!(
+        items
+            .iter()
+            .any(|i| i.kind == ActivityKind::SidecarUnavailable),
+        "expected a sidecar-unavailable activity entry, got {items:?}"
+    );
+
+    // The probe is delayed (no tight loop while the outage persists).
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(fx.mock.call_log().len(), calls_before);
+
+    // "Restart": calls answer again; the next probe drains tombstone→upload.
+    fx.mock.set_offline(false);
+    wait_for(|| fx.mock.trashed_uids().contains(&"node-hello".to_string())).await;
+    wait_for(|| {
+        fx.mock
+            .uploaded_names()
+            .contains(&"deferred.txt".to_string())
+    })
+    .await;
+    wait_for_synced(&fx.db, "deferred.txt").await;
+    let st = fx.handle.status().await.unwrap();
+    assert!(!st.sidecar_unavailable);
+    assert_eq!(st.queued_tombstones, 0);
+
+    let log = fx.mock.call_log();
+    let trash_at = log
+        .iter()
+        .position(|(m, args)| m == "trash" && args.iter().any(|u| u == "node-hello"))
+        .expect("tombstone drained after recovery");
+    let upload_at = log
+        .iter()
+        .position(|(m, args)| m == "upload" && args.iter().any(|n| n == "deferred.txt"))
+        .expect("pending upload drained after recovery");
+    assert!(trash_at < upload_at, "recovery order: {log:?}");
+    fx.shutdown().await;
+}
