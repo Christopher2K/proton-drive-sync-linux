@@ -1704,8 +1704,16 @@ async fn recreate_after_delete_drained_uploads_new_node() {
     wait_for(|| fx.db.node_by_path("churn.txt").unwrap().is_none()).await;
 
     // Re-create while paused so its upload cannot start yet: this is the
-    // "delete drained, upload not completed" window.
+    // "delete drained, upload not completed" window. `pause()` only enqueues
+    // the command, so wait until the engine loop has applied it — otherwise
+    // the re-create can race the pause and upload immediately.
     fx.handle.pause().await.unwrap();
+    wait_for(|| {
+        futures::executor::block_on(fx.handle.status())
+            .map(|s| s.state == EngineState::Paused)
+            .unwrap_or(false)
+    })
+    .await;
     std::fs::write(fx.root.join("churn.txt"), b"v2 replacement").unwrap();
     wait_for(|| {
         fx.db
