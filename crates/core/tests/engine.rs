@@ -2024,8 +2024,16 @@ async fn remote_trash_then_restore_round_trips_mirror() {
 
     fx.mock.remote_trash("node-hello");
     wait_for(|| {
+        // The cursor is persisted after the event is applied, so require it
+        // here too: the file/row can be gone a moment before the cursor write.
         !fx.root.join("hello.txt").exists()
             && fx.db.node_by_path("hello.txt").unwrap().is_none()
+            && fx
+                .db
+                .event_cursor("scope-1")
+                .unwrap()
+                .as_deref()
+                != cursor_before.as_deref()
     })
     .await;
     let cursor_trashed = fx.db.event_cursor("scope-1").unwrap();
@@ -2036,6 +2044,8 @@ async fn remote_trash_then_restore_round_trips_mirror() {
 
     fx.mock.remote_restore("node-hello");
     wait_for(|| {
+        // Same ordering as the trash event: wait for the cursor, not just the
+        // materialized file, before asserting that it advanced.
         std::fs::read(fx.root.join("hello.txt")).ok().as_deref() == Some(b"hello drive".as_slice())
             && fx
                 .db
@@ -2043,6 +2053,12 @@ async fn remote_trash_then_restore_round_trips_mirror() {
                 .ok()
                 .flatten()
                 .is_some_and(|r| r.node_uid == "node-hello")
+            && fx
+                .db
+                .event_cursor("scope-1")
+                .unwrap()
+                .as_deref()
+                != cursor_trashed.as_deref()
     })
     .await;
     let cursor_restored = fx.db.event_cursor("scope-1").unwrap();
