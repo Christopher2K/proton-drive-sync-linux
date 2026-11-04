@@ -15,7 +15,7 @@
 //! ```
 
 use std::collections::HashMap;
-use std::io::Write as _;
+use std::io::{BufRead as _, BufReader, Read as _, Seek as _, SeekFrom, Write as _};
 use std::os::unix::io::AsRawFd as _;
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
@@ -26,6 +26,9 @@ use fuser::{Config, MountOption};
 use pds_core::{Engine, EngineConfig, STATE_DIR, store::VNode};
 use pds_sidecar_client::MockSidecar;
 use pds_vfs_linux::PdsFs;
+use pds_vfs_linux::mount::{
+    MountState, MountpointError, ensure_placeholder_mountpoint, mountpoint_state,
+};
 
 /// Bounds the whole test: if anything wedges (typically std::fs blocked in
 /// the kernel FUSE queue, which no in-test timeout can interrupt), kill the
@@ -108,6 +111,41 @@ fn fuse_unavailable_reason() -> Option<String> {
             Some(format!("{helper} ran but exited with {status} (setuid bit missing?)"))
         }
         Err(e) => Some(format!("{helper} is not runnable: {e}")),
+    }
+}
+
+/// Best-effort lazy unmount used by the mount-safety tests (a stale mount has
+/// no session to drop, so it must be released through the helper).
+fn lazy_unmount(path: &std::path::Path) {
+    let target = path.to_string_lossy().into_owned();
+    let helper = std::env::var("FUSERMOUNT_PATH").unwrap_or_else(|_| "fusermount3".to_string());
+    let _ = Command::new(&helper)
+        .args(["-uz", &target])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    let _ = Command::new("fusermount")
+        .args(["-uz", &target])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+}
+
+fn wait_for_mount_state(
+    path: &std::path::Path,
+    pred: impl Fn(&MountState) -> bool,
+    timeout: Duration,
+) -> MountState {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let state = mountpoint_state(path, Duration::from_millis(500));
+        if pred(&state) {
+            return state;
+        }
+        if Instant::now() >= deadline {
+            panic!("mountpoint state never matched (last: {state:?})");
+        }
+        std::thread::sleep(Duration::from_millis(50));
     }
 }
 
@@ -805,4 +843,369 @@ async fn fuse_mount_over_nonempty_root_shadows_and_preserves_leftovers() {
         std::fs::read(root.join("old stuff").join("junk.bin")).unwrap(),
         b"junk"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Wave 4b — large sparse placeholders (TG-16)
+// ---------------------------------------------------------------------------
+
+/// TG-16: a ~5 GiB remote placeholder is served through a real kernel mount;
+/// reads at an offset beyond 4 GiB return the sparse backing file's markers,
+/// and the on-disk footprint stays sparse.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial_test::serial]
+async fn fuse_reads_large_sparse_placeholder_beyond_4gib() {
+    let _watchdog = Watchdog::arm(180);
+
+    if let Some(reason) = fuse_unavailable_reason() {
+        println!("skipping fuse_reads_large_sparse_placeholder_beyond_4gib: {reason}");
+        return;
+    }
+
+    const SIZE: u64 = 5 * 1024 * 1024 * 1024;
+    const TAIL: &[u8] = b"PDS-5G-TAIL";
+    const BOUNDARY: u64 = 4 * 1024 * 1024 * 1024 - 4;
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("sync");
+    std::fs::create_dir_all(&root).unwrap();
+    let mnt = dir.path().join("mnt");
+    std::fs::create_dir_all(&mnt).unwrap();
+
+    let (client, mock) = MockSidecar::new().connect();
+    let mut client = client;
+    mock.remote_create_sparse_file(
+        "root",
+        "huge.bin",
+        SIZE,
+        &[(BOUNDARY, b"BND!"), (SIZE - TAIL.len() as u64, TAIL)],
+    );
+    let notifications = client.take_notifications();
+
+    let (engine, handle) = Engine::new(
+        Arc::new(client),
+        notifications,
+        EngineConfig {
+            root: root.clone(),
+            db_path: root.join(STATE_DIR).join("state.db"),
+            retry_base: pds_core::RETRY_BASE_DEFAULT,
+            placeholders: true,
+            eviction_cap: None,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let store = handle.store().cloned().unwrap();
+    let engine_task = tokio::spawn(engine.run());
+
+    let fs = PdsFs::new(
+        store.clone(),
+        root.join(STATE_DIR),
+        root.join(".pds-vfs-backing"),
+    );
+    let mut cfg = Config::default();
+    cfg.mount_options = vec![
+        MountOption::FSName("pds-e2e-large".into()),
+        MountOption::Subtype("pds".into()),
+    ];
+    let mnt_for_thread = mnt.clone();
+    let session = tokio::task::spawn_blocking(move || {
+        fuser::spawn_mount(fs, &mnt_for_thread, &cfg).expect("FUSE mount")
+    })
+    .await
+    .unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !store
+        .snapshot()
+        .by_path
+        .get("huge.bin")
+        .is_some_and(|n| n.size == SIZE)
+    {
+        assert!(Instant::now() < deadline, "huge.bin never appeared in the snapshot");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    let meta = std::fs::metadata(mnt.join("huge.bin")).expect("stat huge.bin");
+    assert_eq!(meta.len(), SIZE, "placeholder reports the full 5 GiB");
+
+    let mut file = std::fs::File::open(mnt.join("huge.bin")).expect("open huge.bin");
+    file.seek(SeekFrom::Start(BOUNDARY)).unwrap();
+    let mut boundary = [0u8; 4];
+    file.read_exact(&mut boundary).unwrap();
+    assert_eq!(&boundary, b"BND!", "read across the 4 GiB boundary");
+    file.seek(SeekFrom::Start(SIZE - TAIL.len() as u64)).unwrap();
+    let mut tail = vec![0u8; TAIL.len()];
+    file.read_exact(&mut tail).unwrap();
+    assert_eq!(tail, TAIL, "tail marker beyond 4 GiB");
+
+    // Hydration stays outside the visible root and keeps the file sparse.
+    assert!(!root.join("huge.bin").exists());
+    let backing = store.backing_path("huge.bin").expect("backing entry");
+    use std::os::unix::fs::MetadataExt as _;
+    let backing_meta = std::fs::metadata(&backing).unwrap();
+    assert_eq!(backing_meta.len(), SIZE);
+    assert!(
+        backing_meta.blocks() * 512 < 64 * 1024 * 1024,
+        "backing file must stay sparse: {} bytes on disk",
+        backing_meta.blocks() * 512
+    );
+    assert_eq!(store.snapshot().by_path["huge.bin"].size, SIZE);
+
+    handle.shutdown().await.ok();
+    drop(session);
+    let _ = engine_task.await;
+}
+
+// ---------------------------------------------------------------------------
+// Wave 4b — stale/busy mounts (TG-30)
+// ---------------------------------------------------------------------------
+
+fn hello_snapshot(store: &pds_core::Store) {
+    let node = |rel: &str, is_dir: bool, size: u64| {
+        (
+            rel.to_string(),
+            VNode {
+                rel: rel.to_string(),
+                parent: String::new(),
+                name: rel.to_string(),
+                is_dir,
+                size,
+                mtime: 1_700_000_000,
+                mode: if is_dir { 0o755 } else { 0o644 },
+                content_ready: false,
+            },
+        )
+    };
+    store.publish_snapshot(HashMap::from([
+        node("hello.txt", false, 11),
+        node("Documents", true, 0),
+    ]));
+}
+
+/// TG-30.1: a second session on a busy/live mountpoint is refused quickly by
+/// the app preflight, and the kernel mount attempt itself fails (EBUSY)
+/// instead of hanging. The first session keeps serving.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial_test::serial]
+async fn second_session_on_live_mountpoint_fails_fast_and_first_keeps_serving() {
+    let _watchdog = Watchdog::arm(120);
+
+    if let Some(reason) = fuse_unavailable_reason() {
+        println!(
+            "skipping second_session_on_live_mountpoint_fails_fast_and_first_keeps_serving: {reason}"
+        );
+        return;
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let mnt = dir.path().join("mnt");
+    std::fs::create_dir_all(&mnt).unwrap();
+    let store = pds_core::Store::new();
+    hello_snapshot(&store);
+    let fs = PdsFs::new(store, dir.path().join("state"), dir.path().join("backing"));
+    let mut cfg = Config::default();
+    cfg.mount_options = vec![
+        MountOption::FSName("pds-e2e-busy".into()),
+        MountOption::Subtype("pds".into()),
+    ];
+    let mnt_for_thread = mnt.clone();
+    let first = tokio::task::spawn_blocking(move || {
+        fuser::spawn_mount(fs, &mnt_for_thread, &cfg).expect("first FUSE mount")
+    })
+    .await
+    .unwrap();
+    wait_for_mount_state(&mnt, |s| matches!(s, MountState::Live { .. }), Duration::from_secs(10));
+
+    // Production decision: refuse, with the actionable busy message, bounded.
+    let started = Instant::now();
+    let refusal = ensure_placeholder_mountpoint(&mnt, Duration::from_secs(2))
+        .expect_err("a live mount must not be reused");
+    assert!(matches!(refusal, MountpointError::Busy { .. }));
+    assert!(started.elapsed() < Duration::from_secs(5), "preflight must be bounded");
+    assert!(refusal.to_string().contains("already mounted"));
+
+    // A second real kernel session on the busy mountpoint. Hold the mount as
+    // a child's cwd so mount(2) reports EBUSY rather than stacking a mount.
+    let mut holder = Command::new("sh")
+        .arg("-c")
+        .arg("cd \"$1\" && exec sleep 120")
+        .arg("sh")
+        .arg(&mnt)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn cwd holder");
+    std::thread::sleep(Duration::from_millis(200));
+
+    let (tx, rx) = mpsc::channel();
+    let second_mnt = mnt.clone();
+    let second_dir = dir.path().to_path_buf();
+    std::thread::spawn(move || {
+        let store = pds_core::Store::new();
+        hello_snapshot(&store);
+        let fs = PdsFs::new(
+            store,
+            second_dir.join("state2"),
+            second_dir.join("backing2"),
+        );
+        let mut cfg = Config::default();
+        cfg.mount_options = vec![
+            MountOption::FSName("pds-e2e-second".into()),
+            MountOption::Subtype("pds".into()),
+        ];
+        let result = fuser::Session::new(fs, &second_mnt, &cfg).map(drop);
+        let _ = tx.send(result.map_err(|e| (e.kind(), e.raw_os_error(), e.to_string())));
+    });
+    let second = rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("second mount attempt must not hang");
+    // The kernel/helper must reject the second session promptly rather than
+    // stacking a mount. `fusermount3` reports the busy mountpoint through an
+    // exit status (fuser surfaces it as an `Other` io::Error), so assert the
+    // bounded failure plus a non-empty reason; the typed refusal is the
+    // `MountpointError::Busy` preflight assertion above.
+    match second {
+        Err((_kind, _code, message)) => {
+            assert!(!message.is_empty(), "refusal must carry a reason");
+        }
+        Ok(()) => panic!("a second mount on a busy mountpoint must fail"),
+    }
+
+    // The first session still answers.
+    let names: Vec<String> = std::fs::read_dir(&mnt)
+        .expect("first mount still serves")
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    assert!(names.iter().any(|n| n == "hello.txt"), "{names:?}");
+
+    let _ = holder.kill();
+    let _ = holder.wait();
+    drop(first);
+    lazy_unmount(&mnt);
+    wait_for_mount_state(&mnt, |s| matches!(s, MountState::Free), Duration::from_secs(10));
+}
+
+/// Child half of the unclean-shutdown test: mount, announce readiness, then
+/// sleep until the parent `SIGKILL`s this process (leaving a dead mount).
+#[test]
+#[ignore = "spawned by stale_mount_after_crashed_session_is_detected"]
+fn stale_mount_helper_child() {
+    let Ok(root) = std::env::var("PDS_STALE_MOUNT_HELPER_ROOT") else {
+        return;
+    };
+    if let Some(reason) = fuse_unavailable_reason() {
+        println!("SKIPPED: {reason}");
+        return;
+    }
+    let root = std::path::PathBuf::from(root);
+    let store = pds_core::Store::new();
+    hello_snapshot(&store);
+    let fs = PdsFs::new(
+        store,
+        root.join("state"),
+        root.join("backing"),
+    );
+    let mut cfg = Config::default();
+    cfg.mount_options = vec![
+        MountOption::FSName("pds-e2e-stale".into()),
+        MountOption::Subtype("pds".into()),
+    ];
+    let _session = match fuser::spawn_mount(fs, &root, &cfg) {
+        Ok(session) => session,
+        Err(e) => {
+            println!("SKIPPED: helper mount failed: {e}");
+            return;
+        }
+    };
+    println!("MOUNT_READY");
+    std::io::stdout().flush().ok();
+    std::thread::sleep(Duration::from_secs(300));
+}
+
+/// TG-30.2: kill a serving process without unmounting, then assert the next
+/// start detects the stale mount and refuses with an actionable message
+/// instead of hanging or writing into it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial_test::serial]
+async fn stale_mount_after_crashed_session_is_detected_and_refused() {
+    let _watchdog = Watchdog::arm(120);
+
+    if let Some(reason) = fuse_unavailable_reason() {
+        println!(
+            "skipping stale_mount_after_crashed_session_is_detected_and_refused: {reason}"
+        );
+        return;
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("stale");
+    std::fs::create_dir_all(&root).unwrap();
+
+    let mut child = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--ignored",
+            "--exact",
+            "stale_mount_helper_child",
+            "--nocapture",
+        ])
+        .env("PDS_STALE_MOUNT_HELPER_ROOT", &root)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn stale-mount helper");
+
+    let stdout = child.stdout.take().expect("helper stdout");
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines() {
+            let line = match line {
+                Ok(line) => line,
+                Err(_) => break,
+            };
+            if line.contains("MOUNT_READY") {
+                let _ = tx.send(true);
+                return;
+            }
+            if line.contains("SKIPPED") {
+                let _ = tx.send(false);
+                return;
+            }
+        }
+        let _ = tx.send(false);
+    });
+    let ready = rx.recv_timeout(Duration::from_secs(30)).unwrap_or(false);
+    if !ready {
+        let _ = child.kill();
+        let _ = child.wait();
+        lazy_unmount(&root);
+        println!("skipping stale-mount test: helper could not mount");
+        return;
+    }
+    wait_for_mount_state(&root, |s| matches!(s, MountState::Live { .. }), Duration::from_secs(10));
+
+    // Unclean shutdown: SIGKILL the serving process. The kernel keeps
+    // the mount, but the session is gone.
+    child.kill().expect("SIGKILL helper");
+    let _ = child.wait();
+    let stale = wait_for_mount_state(
+        &root,
+        |s| matches!(s, MountState::Stale { .. }),
+        Duration::from_secs(10),
+    );
+    let MountState::Stale { reason, .. } = &stale else {
+        panic!("expected a stale mount, got {stale:?}");
+    };
+
+    let refusal = ensure_placeholder_mountpoint(&root, Duration::from_secs(2))
+        .expect_err("a stale mount must be refused");
+    assert!(matches!(refusal, MountpointError::Stale { .. }));
+    let message = refusal.to_string();
+    assert!(message.contains("stale"), "{message}");
+    assert!(message.contains("fusermount3 -uz"), "{message}");
+    println!("stale mount detected ({reason}); app message: {message}");
+
+    lazy_unmount(&root);
+    wait_for_mount_state(&root, |s| matches!(s, MountState::Free), Duration::from_secs(10));
 }

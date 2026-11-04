@@ -317,6 +317,14 @@ async fn mount(
         std::fs::create_dir_all(&mountpoint)
             .with_context(|| format!("create mountpoint {}", mountpoint.display()))?;
     }
+    // TG-30: refuse a busy or dead (stale) mountpoint with a typed,
+    // actionable error instead of stacking a second session or hanging on
+    // the first directory access.
+    pds_vfs_linux::mount::ensure_placeholder_mountpoint(
+        &mountpoint,
+        std::time::Duration::from_secs(2),
+    )
+    .map_err(|e| anyhow!("{e}"))?;
 
     let (mut client, _child) = spawn::spawn_sidecar(sidecar_cmd)?;
     let st = client.auth_status().await.context("auth.status")?;

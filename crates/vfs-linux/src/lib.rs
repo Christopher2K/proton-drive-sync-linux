@@ -5,6 +5,7 @@
 //! `pds_core::engine`.
 
 pub mod fs;
+pub mod mount;
 pub mod tree;
 
 pub use fs::PdsFs;
