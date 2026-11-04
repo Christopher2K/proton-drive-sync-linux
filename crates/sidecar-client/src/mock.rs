@@ -69,6 +69,14 @@ struct State {
     get_root_failures: usize,
     /// Remaining `drive.listChildren` calls to reject with a transport error.
     list_children_failures: usize,
+    /// Simulated sidecar outage: every request fails with the client's own
+    /// "connection closed" RPC error (-32000) until cleared.
+    offline: bool,
+    /// The next `drive.upload` answers with a transfer id, then the server
+    /// exits WITHOUT sending `transfer.done` (mid-transfer process death).
+    crash_next_upload: bool,
+    /// Set by `crash_next_upload`; the serve loop exits after the response.
+    crashed: bool,
     /// Node uids whose next download stops after this many bytes until the
     /// matching `transfer.resume` arrives (or `transfer.cancel` drops it).
     download_holds: HashMap<String, usize>,
@@ -586,6 +594,27 @@ impl MockHandle {
             .count()
     }
 
+    /// Whole call log `(method, args)` in arrival order — for asserting
+    /// drain order (tombstones before uploads).
+    pub fn call_log(&self) -> Vec<(String, Vec<String>)> {
+        self.state.lock().unwrap().calls.clone()
+    }
+
+    /// Simulate a sidecar outage that keeps the process (and its streams)
+    /// alive: every request answers with the client-side -32000
+    /// "connection closed" error until cleared. Lets a test model
+    /// "subsequent calls fail, then the sidecar comes back".
+    pub fn set_offline(&self, offline: bool) {
+        self.state.lock().unwrap().offline = offline;
+    }
+
+    /// Crash the transport during the NEXT upload: respond with the transfer
+    /// id, then close the stream (no `transfer.done`), like a sidecar process
+    /// dying mid-transfer. One-shot.
+    pub fn crash_on_next_upload(&self) {
+        self.state.lock().unwrap().crash_next_upload = true;
+    }
+
     /// Emit a raw drive event (for custom scenarios).
     pub fn emit_event(&self, event: &DriveEvent) {
         let st = self.state.lock().unwrap();
@@ -691,6 +720,9 @@ impl MockSidecar {
                 download_failures: HashMap::new(),
                 get_root_failures: 0,
                 list_children_failures: 0,
+                offline: false,
+                crash_next_upload: false,
+                crashed: false,
                 download_holds: HashMap::new(),
                 held_downloads: HashMap::new(),
                 outbox,
@@ -702,6 +734,20 @@ impl MockSidecar {
         MockHandle {
             state: Arc::clone(&self.state),
         }
+    }
+
+    /// A mock whose node/transfer id counters start at `seq`. A fresh mock
+    /// used with a DB written by an earlier mock must not reissue ids that
+    /// are already persisted there (`node_uid` is UNIQUE); start the
+    /// counters above anything the previous session allocated.
+    pub fn new_with_seq(seq: u64) -> Self {
+        let mock = Self::new();
+        {
+            let mut st = mock.state.lock().unwrap();
+            st.next_node = seq;
+            st.next_transfer = seq;
+        }
+        mock
     }
 
     /// Connect a `SidecarClient` to this mock over an in-memory duplex stream
@@ -742,6 +788,9 @@ impl MockSidecar {
                                 }
                             }
                             let _ = writer.flush().await;
+                            if self.state.lock().unwrap().crashed {
+                                return; // simulated mid-transfer process death
+                            }
                         }
                         Ok(_) => return, // EOF
                         Err(_) => return,
@@ -768,6 +817,19 @@ impl MockSidecar {
         let id = msg.get("id").cloned().unwrap_or(Value::Null);
         let method = msg.get("method").and_then(Value::as_str).unwrap_or("");
         let params = msg.get("params").cloned().unwrap_or(Value::Null);
+
+        // Simulated outage: mirror the error `JsonRpcClient` synthesizes for
+        // in-flight requests when the child's stdout closes (-32000).
+        if self.state.lock().unwrap().offline {
+            return vec![
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "error": {"code": -32000, "message": "connection closed"},
+                })
+                .to_string(),
+            ];
+        }
 
         let ok = |result: Value| json!({"jsonrpc":"2.0","id":id,"result":result}).to_string();
         let err = |code: i64, message: &str| {
@@ -985,6 +1047,15 @@ impl MockSidecar {
                     .unwrap_or(1_700_000_000);
                 st.calls.push(("upload".into(), vec![name.clone()]));
                 st.upload_mtimes.push((name.clone(), mtime));
+
+                // Simulated process death mid-transfer: ack the request with
+                // a transfer id, then the serve loop closes the stream without
+                // ever sending `transfer.done`.
+                if st.crash_next_upload {
+                    st.crash_next_upload = false;
+                    st.crashed = true;
+                    return vec![ok(json!({"transferId": transfer_id}))];
+                }
 
                 // Scripted failure (e.g. the 409 stale-revision class):
                 // respond with the transfer id, then a transfer.error —
