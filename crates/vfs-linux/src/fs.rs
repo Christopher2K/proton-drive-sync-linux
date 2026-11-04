@@ -74,6 +74,7 @@ struct WriteEntry {
     ino: INodeNo,
     size: u64,
     mtime: i64,
+    mode: u32,
     is_dir: bool,
 }
 
@@ -135,6 +136,10 @@ impl PdsFs {
 
     fn attr_for(&self, ino: INodeNo, is_dir: bool, size: u64, mtime: i64) -> FileAttr {
         let when = unix_time(mtime);
+        let perm = self
+            .rel_of_any(ino)
+            .map(|rel| self.node_mode(&rel))
+            .unwrap_or(if is_dir { 0o755 } else { 0o644 });
         FileAttr {
             ino,
             size,
@@ -148,7 +153,7 @@ impl PdsFs {
             } else {
                 FileType::RegularFile
             },
-            perm: if is_dir { 0o755 } else { 0o644 },
+            perm: perm as u16,
             nlink: 1,
             uid: self.uid,
             gid: self.gid,
@@ -156,6 +161,18 @@ impl PdsFs {
             blksize: 4096,
             flags: 0,
         }
+    }
+
+    /// POSIX mode served for `rel`: overlay first (this session's writes),
+    /// then the persisted snapshot mode. Synthetic dirs are 0755.
+    fn node_mode(&self, rel: &str) -> u32 {
+        if let Some(e) = self.overlay_entry(rel) {
+            return e.mode;
+        }
+        if rel.is_empty() || rel == STATE_PROXY {
+            return 0o755;
+        }
+        self.tree.node(rel).map(|n| n.mode).unwrap_or(0o644)
     }
 
     /// Block until the backing file for `rel` exists or the deadline passes.
@@ -332,6 +349,20 @@ fn unix_time(secs: i64) -> std::time::SystemTime {
     } else {
         std::time::UNIX_EPOCH
     }
+}
+
+/// Set only the modification time on an existing file. `set_times` needs a
+/// writable fd on Linux; the backing files are ours, so this is safe.
+fn set_file_mtime(path: &std::path::Path, secs: i64) {
+    let times = std::fs::FileTimes::new().set_modified(unix_time(secs));
+    if let Ok(f) = std::fs::OpenOptions::new().write(true).open(path) {
+        f.set_times(times).ok();
+    }
+}
+
+fn set_file_mode(path: &std::path::Path, mode: u32) {
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode & 0o777)).ok();
 }
 
 /// `parent` ("" for root) + `name` → rel path.
@@ -930,8 +961,8 @@ impl fuser::Filesystem for PdsFs {
         _req: &Request,
         parent: INodeNo,
         name: &OsStr,
-        _mode: u32,
-        _umask: u32,
+        mode: u32,
+        umask: u32,
         flags: i32,
         reply: ReplyCreate,
     ) {
@@ -968,6 +999,17 @@ impl fuser::Filesystem for PdsFs {
                 return reply.error(Errno::EIO);
             }
         };
+        // Preserve the creator's requested mode locally (D2): an executable
+        // script created through the mount keeps `+x`.
+        let perm = if mode == 0 {
+            0o644
+        } else {
+            mode & !umask & 0o777
+        };
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&abs, std::fs::Permissions::from_mode(perm)).ok();
+        }
         let fh = self
             .next_fh
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -981,6 +1023,7 @@ impl fuser::Filesystem for PdsFs {
                 ino,
                 size: 0,
                 mtime,
+                mode: perm,
                 is_dir: false,
             },
         );
@@ -1056,6 +1099,7 @@ impl fuser::Filesystem for PdsFs {
                     ino,
                     size: 0,
                     mtime: self.now_secs(),
+                    mode: 0o755,
                     is_dir: true,
                 },
             );
@@ -1165,6 +1209,7 @@ impl fuser::Filesystem for PdsFs {
         //    (same inos, so kernel dentries stay valid). A snapshot-backed
         //    source gets a fresh overlay entry so the new path serves
         //    until the engine's next snapshot publish re-keys the rows.
+        let src_mode = self.node_mode(&old_rel);
         {
             let mut overlay = self.overlay.lock().expect("overlay mutex");
             let old_prefix = format!("{old_rel}/");
@@ -1203,6 +1248,7 @@ impl fuser::Filesystem for PdsFs {
                         ino: INodeNo(max_ino + 1),
                         size: src_size,
                         mtime: self.now_secs(),
+                        mode: src_mode,
                         is_dir: src_is_dir,
                     },
                 );
@@ -1284,7 +1330,7 @@ impl fuser::Filesystem for PdsFs {
         &self,
         _req: &Request,
         ino: INodeNo,
-        _mode: Option<u32>,
+        mode: Option<u32>,
         _uid: Option<u32>,
         _gid: Option<u32>,
         size: Option<u64>,
@@ -1304,6 +1350,9 @@ impl fuser::Filesystem for PdsFs {
         let Some((is_dir, mut cur_size, mut cur_mtime, _ready)) = self.node_meta(&rel) else {
             return reply.error(Errno::ENOENT);
         };
+        let mut cur_mode = self.node_mode(&rel);
+        let mtime_changed = mtime.is_some();
+        let mode_changed = mode.is_some();
         // truncate(2): resize the backing file. Overlay files created this
         // session are trivially writable; snapshot-backed files truncate in
         // place (M3.3 revision) — hydration must land first, and the
@@ -1367,6 +1416,21 @@ impl fuser::Filesystem for PdsFs {
                 fuser::TimeOrNow::Now => self.now_secs(),
             };
         }
+        if let Some(new_mode) = mode {
+            cur_mode = new_mode & 0o777;
+        }
+        // Apply the change to the backing content when present (hydrated
+        // placeholder or overlay file). Times go before permissions so a
+        // restrictive mode cannot block the write-open used for set_times.
+        if mtime_changed || mode_changed {
+            let abs = to_abs(&self.backing_dir, &rel);
+            if mtime_changed && abs.is_file() {
+                set_file_mtime(&abs, cur_mtime);
+            }
+            if mode_changed {
+                set_file_mode(&abs, cur_mode);
+            }
+        }
         if let Some(entry) = self
             .overlay
             .lock()
@@ -1376,8 +1440,21 @@ impl fuser::Filesystem for PdsFs {
         {
             entry.size = cur_size;
             entry.mtime = cur_mtime;
+            entry.mode = cur_mode;
+        } else if !rel.is_empty() && (mtime_changed || mode_changed) {
+            // Snapshot-backed row: persist in SQLite and republish. No
+            // content upload (hash-dedup/remote churn — see SPEC F5).
+            self.store.record_metadata(
+                &rel,
+                mtime_changed.then_some(cur_mtime),
+                mode_changed.then_some(cur_mode),
+            );
         }
-        reply.attr(&TTL, &self.attr_for(ino, is_dir, cur_size, cur_mtime));
+        let attr = FileAttr {
+            perm: cur_mode as u16,
+            ..self.attr_for(ino, is_dir, cur_size, cur_mtime)
+        };
+        reply.attr(&TTL, &attr);
     }
 
     fn getxattr(

@@ -2065,6 +2065,89 @@ async fn child_update_before_moved_parent_lands_at_final_path() {
     fx.shutdown().await;
 }
 
+// ---------------------------------------------------------------------------
+// TG-10/TG-11 — metadata fidelity (mtime, executable bit)
+// ---------------------------------------------------------------------------
+
+fn mtime_secs(path: &std::path::Path) -> Option<i64> {
+    std::fs::metadata(path)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs() as i64)
+}
+
+/// TG-10 (mirror): the remote mtime lands on the materialized file instead
+/// of "now", so build tools and `rsync` see the real timestamp.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn download_applies_remote_mtime_to_local_file() {
+    let fx = start().await;
+    let uid = fx.mock.find_uid("root", "hello.txt").expect("remote hello");
+    let remote_mtime = fx.mock.node_mtime(&uid).expect("mock mtime");
+    assert_eq!(remote_mtime, 1_700_000_000, "distinctive seeded mtime");
+
+    let local = fx.root.join("hello.txt");
+    wait_for(|| mtime_secs(&local) == Some(remote_mtime)).await;
+    fx.shutdown().await;
+}
+
+/// TG-10 (local): an explicit local mtime is what the upload carries and
+/// what the DB row records — not the wall clock at upload time.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn local_explicit_mtime_is_uploaded_and_stored() {
+    let fx = start().await;
+    let stamped: i64 = 1_650_000_000;
+    let path = fx.root.join("stamped.txt");
+    {
+        use std::io::Write as _;
+        let mut file = std::fs::File::create(&path).unwrap();
+        file.write_all(b"build output").unwrap();
+        file.set_times(
+            std::fs::FileTimes::new()
+                .set_modified(std::time::UNIX_EPOCH + Duration::from_secs(stamped as u64)),
+        )
+        .unwrap();
+    }
+
+    wait_for(|| {
+        fx.mock
+            .uploaded_mtimes()
+            .iter()
+            .any(|(name, mtime)| name == "stamped.txt" && *mtime == stamped)
+    })
+    .await;
+    wait_for_synced(&fx.db, "stamped.txt").await;
+
+    let row = fx.db.node_by_path("stamped.txt").unwrap().unwrap();
+    assert_eq!(row.mtime, Some(stamped));
+    let uid = fx.mock.find_uid("root", "stamped.txt").expect("uploaded");
+    assert_eq!(fx.mock.node_mtime(&uid), Some(stamped));
+    fx.shutdown().await;
+}
+
+/// TG-11 (mirror): a local `+x` script is captured in the row on upload.
+/// The mode never leaves the machine (Proton's node metadata has no POSIX
+/// mode field); only the local DB remembers it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn local_executable_bit_is_captured_on_upload() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let fx = start().await;
+    let path = fx.root.join("tool.sh");
+    std::fs::write(&path, b"#!/bin/sh\necho ok\n").unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    wait_for(|| fx.mock.uploaded_names().iter().any(|n| n == "tool.sh")).await;
+    wait_for_synced(&fx.db, "tool.sh").await;
+
+    let row = fx.db.node_by_path("tool.sh").unwrap().unwrap();
+    assert_eq!(row.mode, Some(0o755), "owner-exec is persisted locally");
+    fx.shutdown().await;
+}
+
 // Helper so tests can use `futures::executor::block_on` without an extra dep.
 mod futures {
     pub mod executor {

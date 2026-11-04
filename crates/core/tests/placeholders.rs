@@ -24,6 +24,8 @@ struct Fixture {
     handle: pds_core::EngineHandle,
     mock: MockHandle,
     store: Store,
+    db: pds_core::Db,
+    db_path: std::path::PathBuf,
     engine: tokio::task::JoinHandle<anyhow::Result<()>>,
 }
 
@@ -38,12 +40,13 @@ async fn start_with_cap(eviction_cap: Option<u64>) -> Fixture {
     std::fs::create_dir_all(&root).unwrap();
     let (mut client, mock) = MockSidecar::new().connect();
     let notifications = client.take_notifications();
+    let db_path = root.join(STATE_DIR).join("state.db");
     let (engine, handle) = Engine::new(
         Arc::new(client),
         notifications,
         EngineConfig {
             root: root.clone(),
-            db_path: root.join(STATE_DIR).join("state.db"),
+            db_path: db_path.clone(),
             retry_base: pds_core::RETRY_BASE_DEFAULT,
             placeholders: true,
             eviction_cap,
@@ -51,6 +54,7 @@ async fn start_with_cap(eviction_cap: Option<u64>) -> Fixture {
         },
     )
     .unwrap();
+    let db = pds_core::Db::open(&db_path).unwrap();
     // The engine publishes snapshots into its own store; grab the handle's
     // clone for assertions.
     let store = handle.store().cloned().expect("placeholder store");
@@ -61,6 +65,8 @@ async fn start_with_cap(eviction_cap: Option<u64>) -> Fixture {
         handle,
         mock,
         store,
+        db,
+        db_path,
         engine,
     }
 }
@@ -80,6 +86,14 @@ impl Fixture {
     async fn shutdown(self) {
         self.handle.shutdown().await.unwrap();
         let _ = self.engine.await;
+    }
+
+    /// Like [`Fixture::shutdown`], but keeps the temp dir on disk — for
+    /// restart/persistence assertions against the same DB file.
+    async fn shutdown_keep_dir(self) {
+        self.handle.shutdown().await.unwrap();
+        let _ = self.engine.await;
+        std::mem::forget(self._dir); // leaked on purpose; OS cleans /tmp
     }
 }
 
@@ -113,6 +127,7 @@ async fn external_backing_adopts_previously_materialized_content() {
         size: Some(11),
         sha1: None,
         mtime: Some(1_700_000_000),
+        mode: None,
         sync_state: pds_core::SyncState::Synced,
         pinned: false,
         synced_sha1: None,
@@ -974,6 +989,171 @@ async fn remote_trash_then_restore_round_trips_placeholders() {
     })
     .await;
     assert!(fx.mock.trashed_uids().is_empty());
+    fx.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------
+// TG-10/TG-11 — metadata fidelity (mtime, executable bit)
+// ---------------------------------------------------------------------------
+
+fn mtime_secs(path: &std::path::Path) -> Option<i64> {
+    std::fs::metadata(path)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs() as i64)
+}
+
+fn mode_of(path: &std::path::Path) -> Option<u32> {
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::metadata(path)
+        .ok()
+        .map(|m| m.permissions().mode() & 0o777)
+}
+
+/// TG-10 (placeholder): the remote mtime survives hydration, eviction and
+/// rehydration — the placeholder never falls back to "now".
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn placeholder_mtime_survives_hydrate_evict_rehydrate() {
+    let fx = start().await;
+    wait_for(|| fx.store.snapshot().by_path.contains_key("hello.txt")).await;
+    let uid = fx.mock.find_uid("root", "hello.txt").expect("remote hello");
+    let remote_mtime = fx.mock.node_mtime(&uid).expect("mock mtime");
+    assert_eq!(remote_mtime, 1_700_000_000, "distinctive seeded mtime");
+
+    assert!(fx.store.begin_hydrate("hello.txt"));
+    wait_for(|| {
+        fx.store
+            .backing_path("hello.txt")
+            .is_some_and(|p| p.is_file())
+    })
+    .await;
+    let backing = fx.store.backing_path("hello.txt").unwrap();
+    wait_for(|| mtime_secs(&backing) == Some(remote_mtime)).await;
+
+    // Evict everything, then hydrate again through the normal queue.
+    fx.handle.set_cache_cap(Some(0)).await.unwrap();
+    wait_for(|| fx.store.backing_path("hello.txt").is_none()).await;
+    assert!(!backing.exists());
+
+    assert!(fx.store.begin_hydrate("hello.txt"));
+    wait_for(|| {
+        fx.store
+            .backing_path("hello.txt")
+            .is_some_and(|p| p.is_file())
+    })
+    .await;
+    wait_for(|| mtime_secs(&backing) == Some(remote_mtime)).await;
+    fx.shutdown().await;
+}
+
+/// TG-10 (FUSE setattr path): a timestamp-only change updates the row and
+/// the served snapshot, survives a restart, and deliberately does NOT queue
+/// a new revision — the content hash is unchanged, so uploading would only
+/// create metadata churn. The next real edit still carries this mtime.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn setattr_mtime_updates_row_and_snapshot_without_upload_churn() {
+    let fx = start().await;
+    wait_for(|| fx.store.snapshot().by_path.contains_key("hello.txt")).await;
+    let stamped: i64 = 1_600_000_000;
+
+    fx.store.record_metadata("hello.txt", Some(stamped), None);
+    wait_for(|| {
+        fx.db
+            .node_by_path("hello.txt")
+            .ok()
+            .flatten()
+            .is_some_and(|r| r.mtime == Some(stamped))
+            && fx
+                .store
+                .snapshot()
+                .by_path
+                .get("hello.txt")
+                .is_some_and(|n| n.mtime == stamped)
+    })
+    .await;
+    assert!(
+        fx.mock.uploaded_names().is_empty(),
+        "timestamp-only change must not upload content: {:?}",
+        fx.mock.uploaded_names()
+    );
+    let row = fx.db.node_by_path("hello.txt").unwrap().unwrap();
+    assert_eq!(row.sync_state, pds_core::SyncState::Synced);
+
+    // The stored mtime is also what a later hydration applies locally.
+    assert!(fx.store.begin_hydrate("hello.txt"));
+    wait_for(|| {
+        fx.store
+            .backing_path("hello.txt")
+            .is_some_and(|p| p.is_file())
+    })
+    .await;
+    let backing = fx.store.backing_path("hello.txt").unwrap();
+    wait_for(|| mtime_secs(&backing) == Some(stamped)).await;
+
+    // Restart (fresh connection to the same DB file) still sees it.
+    let db_path = fx.db_path.clone();
+    fx.shutdown_keep_dir().await;
+    let db = pds_core::Db::open(&db_path).unwrap();
+    let row = db.node_by_path("hello.txt").unwrap().unwrap();
+    assert_eq!(row.mtime, Some(stamped));
+    assert_eq!(row.sync_state, pds_core::SyncState::Synced);
+}
+
+/// TG-11 (placeholder): `chmod +x` on a hydrated placeholder is persisted
+/// in the local row, exposed in the snapshot, and reapplied after eviction
+/// and rehydration. The mode is local-only (never sent to Drive).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn executable_bit_survives_evict_and_rehydrate() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let fx = start().await;
+    fx.mock
+        .remote_create_file("root", "script.sh", b"#!/bin/sh\necho ok\n");
+    wait_for(|| fx.store.snapshot().by_path.contains_key("script.sh")).await;
+
+    assert!(fx.store.begin_hydrate("script.sh"));
+    wait_for(|| {
+        fx.store
+            .backing_path("script.sh")
+            .is_some_and(|p| p.is_file())
+    })
+    .await;
+    let backing = fx.store.backing_path("script.sh").unwrap();
+    std::fs::set_permissions(&backing, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    // This is what the VFS `setattr(mode)` handler queues.
+    fx.store.record_metadata("script.sh", None, Some(0o755));
+    wait_for(|| {
+        fx.db
+            .node_by_path("script.sh")
+            .ok()
+            .flatten()
+            .is_some_and(|r| r.mode == Some(0o755))
+            && fx
+                .store
+                .snapshot()
+                .by_path
+                .get("script.sh")
+                .is_some_and(|n| n.mode & 0o111 == 0o111)
+    })
+    .await;
+
+    fx.handle.set_cache_cap(Some(0)).await.unwrap();
+    wait_for(|| fx.store.backing_path("script.sh").is_none()).await;
+
+    assert!(fx.store.begin_hydrate("script.sh"));
+    wait_for(|| {
+        fx.store
+            .backing_path("script.sh")
+            .is_some_and(|p| p.is_file())
+    })
+    .await;
+    let backing = fx.store.backing_path("script.sh").unwrap();
+    wait_for(|| mode_of(&backing) == Some(0o755)).await;
     fx.shutdown().await;
 }
 
