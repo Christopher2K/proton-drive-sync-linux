@@ -51,6 +51,13 @@ struct State {
     /// Scripted `transfer.error`s for revision uploads, per node uid; popped
     /// one per `drive.upload` attempt (content is NOT applied on failure).
     upload_failures: HashMap<String, ScriptedFailures>,
+    /// Scripted `transfer.error`s for downloads, per node uid; popped one per
+    /// `drive.download` attempt (nothing is written on failure).
+    download_failures: HashMap<String, ScriptedFailures>,
+    /// Remaining `drive.getRoot` calls to reject with a transport error.
+    get_root_failures: usize,
+    /// Remaining `drive.listChildren` calls to reject with a transport error.
+    list_children_failures: usize,
     /// Outbound notification queue (drained by the server task).
     outbox: mpsc::UnboundedSender<String>,
 }
@@ -462,6 +469,56 @@ impl MockHandle {
         );
     }
 
+    /// Script failures for the next download attempts of `node_uid`. Each
+    /// entry is `(code, message, retryable)` sent as a `transfer.error`
+    /// notification; the target file is NOT written on failure. Mirrors
+    /// [`MockHandle::inject_upload_failures`] for the download direction.
+    pub fn inject_download_failures(&self, node_uid: &str, failures: &[(i64, &str, bool)]) {
+        self.inject_download_failures_full(
+            node_uid,
+            &failures
+                .iter()
+                .map(|(c, m, r)| (*c, *m, *r, None))
+                .collect::<Vec<_>>(),
+        );
+    }
+
+    /// Like [`MockHandle::inject_download_failures`] with a server
+    /// `retryAfter` hint (seconds) per failure.
+    pub fn inject_download_failures_full(
+        &self,
+        node_uid: &str,
+        failures: &[(i64, &str, bool, Option<u64>)],
+    ) {
+        let mut st = self.state.lock().unwrap();
+        st.download_failures.insert(
+            node_uid.to_string(),
+            failures
+                .iter()
+                .map(|(c, m, r, ra)| {
+                    (
+                        *c,
+                        (*m).to_string(),
+                        *r,
+                        ra.map(std::time::Duration::from_secs),
+                    )
+                })
+                .collect(),
+        );
+    }
+
+    /// Reject the next `times` `drive.getRoot` calls with a transport error,
+    /// simulating starting offline / while the sidecar cannot reach Proton.
+    pub fn fail_get_root(&self, times: usize) {
+        self.state.lock().unwrap().get_root_failures = times;
+    }
+
+    /// Reject the next `times` `drive.listChildren` calls with a transport
+    /// error (initial enumeration cannot complete).
+    pub fn fail_list_children(&self, times: usize) {
+        self.state.lock().unwrap().list_children_failures = times;
+    }
+
     /// How many `drive.upload` calls (any outcome) were made for `name`.
     pub fn upload_attempts(&self, name: &str) -> usize {
         self.state
@@ -573,6 +630,9 @@ impl MockSidecar {
                 calls: Vec::new(),
                 upload_mtimes: Vec::new(),
                 upload_failures: HashMap::new(),
+                download_failures: HashMap::new(),
+                get_root_failures: 0,
+                list_children_failures: 0,
                 outbox,
             })),
         }
@@ -674,11 +734,19 @@ impl MockSidecar {
             "auth.status" => vec![ok(json!({"loggedIn": true, "email": "mock@proton.me"}))],
             "auth.logout" => vec![ok(json!({}))],
             "drive.getRoot" => {
-                let st = self.state.lock().unwrap();
+                let mut st = self.state.lock().unwrap();
+                if st.get_root_failures > 0 {
+                    st.get_root_failures -= 1;
+                    return vec![err(error_codes::INTERNAL, "transport error: getRoot failed")];
+                }
                 vec![ok(st.node_json(st.nodes.get("root").unwrap()))]
             }
             "drive.listChildren" => {
-                let st = self.state.lock().unwrap();
+                let mut st = self.state.lock().unwrap();
+                if st.list_children_failures > 0 {
+                    st.list_children_failures -= 1;
+                    return vec![err(error_codes::INTERNAL, "transport error: listChildren failed")];
+                }
                 let nodes: Vec<Value> = st
                     .children_of(&pstr("parentUid"))
                     .iter()
@@ -923,11 +991,32 @@ impl MockSidecar {
             "drive.download" => {
                 let mut st = self.state.lock().unwrap();
                 st.next_transfer += 1;
-                st.calls.push(("download".into(), vec![pstr("nodeUid")]));
+                let uid = pstr("nodeUid");
+                st.calls.push(("download".into(), vec![uid.clone()]));
                 let transfer_id = format!("transfer-{}", st.next_transfer);
+                // Scripted failure (local ENOSPC/EACCES reported by the
+                // sidecar, or a transient transport error): respond with the
+                // transfer id, then a transfer.error — no file is written.
+                if let Some((code, message, retryable, retry_after)) =
+                    st.download_failures.get_mut(&uid).and_then(VecDeque::pop_front)
+                {
+                    let mut failure = json!({
+                        "transferId": transfer_id, "code": code, "message": message, "retryable": retryable,
+                    });
+                    if let Some(secs) = retry_after {
+                        failure["retryAfter"] = json!(secs.as_secs_f64());
+                    }
+                    let err = json!({
+                        "jsonrpc": "2.0",
+                        "method": "transfer.error",
+                        "params": failure,
+                    })
+                    .to_string();
+                    return vec![ok(json!({"transferId": transfer_id})), err];
+                }
                 let content = st
                     .nodes
-                    .get(&pstr("nodeUid"))
+                    .get(&uid)
                     .and_then(|n| n.content.clone())
                     .unwrap_or_default();
                 let _ = std::fs::write(pstr("path"), &*content);

@@ -116,6 +116,49 @@ async function main(): Promise<void> {
     check("backoff delays retry", Date.now() - t0 >= 20, Date.now() - t0);
   }
 
+  // 3b. A stream drops AFTER delivering events: the last forwarded eventId is
+  //     the reconnect cursor, so the retry drains from there without
+  //     re-delivering the events we already applied.
+  {
+    const ac = new AbortController();
+    const errors: unknown[] = [];
+    const forwarded: string[] = [];
+    const calls: (string | undefined)[] = [];
+    const iterate = (cursor: string | undefined): AsyncIterable<DriveEvent> => {
+      calls.push(cursor);
+      const call = calls.length;
+      return (async function* () {
+        if (call === 1) {
+          yield nodeEvent("e1");
+          yield nodeEvent("e2");
+          throw new Error("stream dropped");
+        }
+        if (call === 2) {
+          // One event delivered after reconnect, then a clean (empty) drain:
+          // the SDK does not repeat events the cursor already covers.
+          yield nodeEvent("e3");
+        }
+      })();
+    };
+    const done = runEventLoop({
+      iterate,
+      forward: (e) => forwarded.push(e.eventId),
+      signal: ac.signal,
+      onError: (e) => errors.push(e),
+      pollIntervalMs: 10,
+      jitterMs: 0,
+      backoffMinMs: 10,
+      backoffMaxMs: 10,
+    });
+    await sleep(80);
+    ac.abort();
+    await done;
+    check("events forwarded before the drop", forwarded.slice(0, 2).join(",") === "e1,e2", forwarded);
+    check("reconnect resumes from the last applied event", calls.length >= 2 && calls[1] === "e2", calls);
+    check("no event is delivered twice across reconnect", forwarded.join(",") === "e1,e2,e3", forwarded);
+    check("drop reported once", errors.length === 1, errors.length);
+  }
+
   // 4. Abort during the poll sleep exits promptly.
   {
     const ac = new AbortController();

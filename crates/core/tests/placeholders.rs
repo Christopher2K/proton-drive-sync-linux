@@ -1157,6 +1157,158 @@ async fn executable_bit_survives_evict_and_rehydrate() {
     fx.shutdown().await;
 }
 
+// ---------------------------------------------------------------------------
+// Wave 3a — environment resilience in placeholder mode (TG-19)
+// ---------------------------------------------------------------------------
+
+async fn next_activity(
+    rx: &mut tokio::sync::broadcast::Receiver<pds_core::ActivityItem>,
+    pred: impl Fn(&pds_core::ActivityItem) -> bool,
+) -> pds_core::ActivityItem {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        match tokio::time::timeout(left, rx.recv()).await {
+            Ok(Ok(item)) if pred(&item) => return item,
+            Ok(Ok(_)) => continue,
+            Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => continue,
+            Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => {
+                panic!("activity feed closed")
+            }
+            Err(_) => panic!("matching activity entry not seen within 30 s"),
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn hydration_permission_denied_is_surfaced_and_retries() {
+    // TG-19: the backing cache is not writable. Opening the placeholder must
+    // fail visibly (activity + errored row), not wedge the reader, and a
+    // resume after fixing permissions must hydrate it.
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let fx = start_with_cap(None).await;
+    // Wait for the initial snapshot so the row exists.
+    wait_for(|| fx.store.snapshot().by_path.contains_key("hello.txt")).await;
+    let backing_dir = fx.root.join(pds_core::VFS_BACKING_DIR);
+    std::fs::create_dir_all(&backing_dir).unwrap();
+    std::fs::set_permissions(&backing_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+    let mut activity = fx.handle.subscribe_activity();
+    assert!(fx.store.begin_hydrate("hello.txt"));
+    let item = next_activity(&mut activity, |i| {
+        i.kind == pds_core::ActivityKind::DownloadErrored && i.path == "hello.txt"
+    })
+    .await;
+    assert!(
+        item.detail
+            .as_deref()
+            .is_some_and(|d| d.contains("Permission denied")),
+        "detail should name the cause: {item:?}"
+    );
+    assert!(fx.store.backing_path("hello.txt").is_none());
+    wait_for(|| {
+        fx.db
+            .node_by_path("hello.txt")
+            .ok()
+            .flatten()
+            .is_some_and(|r| {
+                r.sync_state == pds_core::SyncState::Downloading
+                    && fx.db.upload_error("hello.txt").ok().flatten().is_some()
+            })
+    })
+    .await;
+
+    std::fs::set_permissions(&backing_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+    fx.handle.resume().await.unwrap();
+    wait_for(|| {
+        fx.store
+            .backing_path("hello.txt")
+            .is_some_and(|p| p.is_file())
+            && fx
+                .store
+                .snapshot()
+                .by_path
+                .get("hello.txt")
+                .is_some_and(|n| n.content_ready)
+            && fx
+                .db
+                .node_by_path("hello.txt")
+                .ok()
+                .flatten()
+                .is_some_and(|r| r.sync_state == pds_core::SyncState::Synced)
+    })
+    .await;
+    assert_eq!(
+        std::fs::read(fx.store.backing_path("hello.txt").unwrap()).unwrap(),
+        b"hello drive"
+    );
+    fx.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn unreadable_backing_file_is_errored_without_hot_looping() {
+    // TG-19: a queued write-through whose backing file cannot be read must
+    // not upload empty bytes (which would overwrite the remote copy), must
+    // surface an error, and must drop the queue entry instead of spinning.
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let fx = start_with_cap(None).await;
+    assert!(fx.store.begin_hydrate("hello.txt"));
+    wait_for(|| {
+        fx.store
+            .backing_path("hello.txt")
+            .is_some_and(|p| p.is_file())
+    })
+    .await;
+    let backing = fx.store.backing_path("hello.txt").unwrap();
+    let remote_before = fx.mock.file_content("node-hello").unwrap();
+
+    std::fs::set_permissions(&backing, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let uploads_before = fx.mock.upload_attempts("hello.txt");
+    let mut activity = fx.handle.subscribe_activity();
+    // This is what the VFS queues after a write/close.
+    fx.store.record_write("hello.txt");
+
+    let item = next_activity(&mut activity, |i| {
+        i.kind == pds_core::ActivityKind::UploadErrored && i.path == "hello.txt"
+    })
+    .await;
+    assert!(
+        item.detail
+            .as_deref()
+            .is_some_and(|d| d.contains("Permission denied")),
+        "detail should name the cause: {item:?}"
+    );
+    assert_eq!(fx.mock.upload_attempts("hello.txt"), uploads_before);
+    assert_eq!(fx.mock.file_content("node-hello").unwrap(), remote_before);
+    // The failed write is dropped from the queue (no hot loop) but stays
+    // visible as errored until a fresh write arrives.
+    wait_for(|| fx.store.pending_writes() == 0).await;
+    assert!(fx.db.upload_error("hello.txt").unwrap().is_some());
+
+    std::fs::set_permissions(&backing, std::fs::Permissions::from_mode(0o644)).unwrap();
+    std::fs::write(&backing, b"hello v2").unwrap();
+    fx.store.record_write("hello.txt");
+    wait_for(|| {
+        fx.mock.file_content("node-hello").as_deref() == Some(b"hello v2")
+            && fx
+                .db
+                .node_by_path("hello.txt")
+                .ok()
+                .flatten()
+                .is_some_and(|r| {
+                    r.sync_state == pds_core::SyncState::Synced
+                        && fx.db.upload_error("hello.txt").ok().flatten().is_none()
+                })
+    })
+    .await;
+    fx.shutdown().await;
+}
+
 // Keep imports honest even if a test is skipped.
+
 #[allow(dead_code)]
 fn _t(_: HashMap<String, String>) {}
