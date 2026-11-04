@@ -1211,6 +1211,70 @@ async fn executable_bit_survives_evict_and_rehydrate() {
     .await;
     let backing = fx.store.backing_path("script.sh").unwrap();
     wait_for(|| mode_of(&backing) == Some(0o755)).await;
+}
+
+// ---------------------------------------------------------------------------
+// TG-13 (placeholder mode): the snapshot keys, node names, DB paths, and
+// backing-cache filenames all agree byte-for-byte with odd-but-legal remote
+// names (NFC/NFD are distinct, emoji, quotes, newline, trailing dot/space).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn unusual_names_are_identical_in_snapshot_db_and_backing_cache() {
+    const NAMES: &[&str] = &[
+        "caf\u{e9}.txt",
+        "cafe\u{301}.txt",
+        "rocket \u{1f680}.txt",
+        "with space.txt",
+        "it's \"quoted\".txt",
+        "line\nbreak.txt",
+        "trailing dot.",
+        "trailing space ",
+        "~leading.txt",
+    ];
+    let fx = start().await;
+    wait_for(|| fx.store.snapshot().by_path.contains_key("hello.txt")).await;
+    for name in NAMES {
+        fx.mock
+            .remote_create_file("root", name, format!("remote:{name}").as_bytes());
+    }
+    let db = pds_core::Db::open(&fx.root.join(STATE_DIR).join("state.db")).unwrap();
+    for name in NAMES {
+        // Snapshot and row are published separately; wait for both so the
+        // lookups below cannot observe the download mid-flight.
+        wait_for(|| {
+            fx.store.snapshot().by_path.contains_key(*name)
+                && db.node_by_path(name).ok().flatten().is_some()
+        })
+        .await;
+        let node = &fx.store.snapshot().by_path[*name];
+        assert_eq!(node.rel, *name);
+        assert_eq!(node.name, *name);
+        assert_eq!(node.parent, "");
+        assert!(!node.is_dir);
+    }
+    for name in NAMES {
+        let row = db
+            .node_by_path(name)
+            .unwrap()
+            .unwrap_or_else(|| panic!("missing DB row for {name:?}"));
+        assert_eq!(row.local_path, *name);
+        assert_eq!(row.name, *name);
+        // Hydration writes the backing file under the same exact name.
+        assert!(fx.store.begin_hydrate(name));
+    }
+    for name in NAMES {
+        wait_for(|| {
+            fx.store
+                .backing_path(name)
+                .map(|p| std::fs::read(p).ok().as_deref()
+                    == Some(format!("remote:{name}").as_bytes()))
+                .unwrap_or(false)
+        })
+        .await;
+        let backing = fx.store.backing_path(name).unwrap();
+        assert_eq!(backing.file_name().unwrap().to_string_lossy(), *name);
+    }
+    assert!(fx.mock.trashed_uids().is_empty());
     fx.shutdown().await;
 }
 
