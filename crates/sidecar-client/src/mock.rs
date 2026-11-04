@@ -51,6 +51,17 @@ struct State {
     /// Scripted `transfer.error`s for revision uploads, per node uid; popped
     /// one per `drive.upload` attempt (content is NOT applied on failure).
     upload_failures: HashMap<String, ScriptedFailures>,
+    /// Scripted `transfer.error`s for downloads, per node uid; popped one per
+    /// `drive.download` attempt (no file is written on failure).
+    download_failures: HashMap<String, ScriptedFailures>,
+    /// Simulated sidecar outage: every request fails with the client's own
+    /// "connection closed" RPC error (-32000) until cleared.
+    offline: bool,
+    /// The next `drive.upload` answers with a transfer id, then the server
+    /// exits WITHOUT sending `transfer.done` (mid-transfer process death).
+    crash_next_upload: bool,
+    /// Set by `crash_next_upload`; the serve loop exits after the response.
+    crashed: bool,
     /// Outbound notification queue (drained by the server task).
     outbox: mpsc::UnboundedSender<String>,
 }
@@ -462,6 +473,19 @@ impl MockHandle {
         );
     }
 
+    /// Script failures for the next `n` download attempts of `node_uid`
+    /// (`(code, message, retryable)`); no content is written on failure.
+    pub fn inject_download_failures(&self, node_uid: &str, failures: &[(i64, &str, bool)]) {
+        let mut st = self.state.lock().unwrap();
+        st.download_failures.insert(
+            node_uid.to_string(),
+            failures
+                .iter()
+                .map(|(code, message, retryable)| (*code, (*message).to_string(), *retryable, None))
+                .collect(),
+        );
+    }
+
     /// How many `drive.upload` calls (any outcome) were made for `name`.
     pub fn upload_attempts(&self, name: &str) -> usize {
         self.state
@@ -471,6 +495,27 @@ impl MockHandle {
             .iter()
             .filter(|(m, a)| m == "upload" && a.iter().any(|n| n == name))
             .count()
+    }
+
+    /// Whole call log `(method, args)` in arrival order — for asserting
+    /// drain order (tombstones before uploads).
+    pub fn call_log(&self) -> Vec<(String, Vec<String>)> {
+        self.state.lock().unwrap().calls.clone()
+    }
+
+    /// Simulate a sidecar outage that keeps the process (and its streams)
+    /// alive: every request answers with the client-side -32000
+    /// "connection closed" error until cleared. Lets a test model
+    /// "subsequent calls fail, then the sidecar comes back".
+    pub fn set_offline(&self, offline: bool) {
+        self.state.lock().unwrap().offline = offline;
+    }
+
+    /// Crash the transport during the NEXT upload: respond with the transfer
+    /// id, then close the stream (no `transfer.done`), like a sidecar process
+    /// dying mid-transfer. One-shot.
+    pub fn crash_on_next_upload(&self) {
+        self.state.lock().unwrap().crash_next_upload = true;
     }
 
     /// Emit a raw drive event (for custom scenarios).
@@ -573,6 +618,10 @@ impl MockSidecar {
                 calls: Vec::new(),
                 upload_mtimes: Vec::new(),
                 upload_failures: HashMap::new(),
+                download_failures: HashMap::new(),
+                offline: false,
+                crash_next_upload: false,
+                crashed: false,
                 outbox,
             })),
         }
@@ -582,6 +631,20 @@ impl MockSidecar {
         MockHandle {
             state: Arc::clone(&self.state),
         }
+    }
+
+    /// A mock whose node/transfer id counters start at `seq`. A fresh mock
+    /// used with a DB written by an earlier mock must not reissue ids that
+    /// are already persisted there (`node_uid` is UNIQUE); start the
+    /// counters above anything the previous session allocated.
+    pub fn new_with_seq(seq: u64) -> Self {
+        let mock = Self::new();
+        {
+            let mut st = mock.state.lock().unwrap();
+            st.next_node = seq;
+            st.next_transfer = seq;
+        }
+        mock
     }
 
     /// Connect a `SidecarClient` to this mock over an in-memory duplex stream
@@ -622,6 +685,9 @@ impl MockSidecar {
                                 }
                             }
                             let _ = writer.flush().await;
+                            if self.state.lock().unwrap().crashed {
+                                return; // simulated mid-transfer process death
+                            }
                         }
                         Ok(_) => return, // EOF
                         Err(_) => return,
@@ -648,6 +714,19 @@ impl MockSidecar {
         let id = msg.get("id").cloned().unwrap_or(Value::Null);
         let method = msg.get("method").and_then(Value::as_str).unwrap_or("");
         let params = msg.get("params").cloned().unwrap_or(Value::Null);
+
+        // Simulated outage: mirror the error `JsonRpcClient` synthesizes for
+        // in-flight requests when the child's stdout closes (-32000).
+        if self.state.lock().unwrap().offline {
+            return vec![
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "error": {"code": -32000, "message": "connection closed"},
+                })
+                .to_string(),
+            ];
+        }
 
         let ok = |result: Value| json!({"jsonrpc":"2.0","id":id,"result":result}).to_string();
         let err = |code: i64, message: &str| {
@@ -858,6 +937,15 @@ impl MockSidecar {
                 st.calls.push(("upload".into(), vec![name.clone()]));
                 st.upload_mtimes.push((name.clone(), mtime));
 
+                // Simulated process death mid-transfer: ack the request with
+                // a transfer id, then the serve loop closes the stream without
+                // ever sending `transfer.done`.
+                if st.crash_next_upload {
+                    st.crash_next_upload = false;
+                    st.crashed = true;
+                    return vec![ok(json!({"transferId": transfer_id}))];
+                }
+
                 // Scripted failure (e.g. the 409 stale-revision class):
                 // respond with the transfer id, then a transfer.error —
                 // content is NOT applied, like a server-side rejection.
@@ -923,11 +1011,31 @@ impl MockSidecar {
             "drive.download" => {
                 let mut st = self.state.lock().unwrap();
                 st.next_transfer += 1;
-                st.calls.push(("download".into(), vec![pstr("nodeUid")]));
+                let uid = pstr("nodeUid");
+                st.calls.push(("download".into(), vec![uid.clone()]));
                 let transfer_id = format!("transfer-{}", st.next_transfer);
+                if let Some((code, message, retryable, retry_after)) = st
+                    .download_failures
+                    .get_mut(&uid)
+                    .and_then(VecDeque::pop_front)
+                {
+                    let mut failure = json!({
+                        "transferId": transfer_id, "code": code, "message": message, "retryable": retryable,
+                    });
+                    if let Some(secs) = retry_after {
+                        failure["retryAfter"] = json!(secs.as_secs_f64());
+                    }
+                    let err = json!({
+                        "jsonrpc": "2.0",
+                        "method": "transfer.error",
+                        "params": failure,
+                    })
+                    .to_string();
+                    return vec![ok(json!({"transferId": transfer_id})), err];
+                }
                 let content = st
                     .nodes
-                    .get(&pstr("nodeUid"))
+                    .get(&uid)
                     .and_then(|n| n.content.clone())
                     .unwrap_or_default();
                 let _ = std::fs::write(pstr("path"), &*content);

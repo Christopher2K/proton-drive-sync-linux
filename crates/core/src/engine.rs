@@ -56,6 +56,10 @@ pub const RETRY_BACKOFF_MAX: Duration = Duration::from_secs(300);
 /// Consecutive retryable failures after which a node is marked errored and
 /// the engine moves on (no hot-looping).
 pub const MAX_UPLOAD_RETRIES: i64 = 10;
+/// While the sidecar is degraded, how long the engine waits before probing
+/// it again. Deliberately independent of `retry_base` (test knobs must not
+/// turn an outage into a hot loop).
+const SIDECAR_PROBE_DELAY: Duration = Duration::from_secs(1);
 
 /// Engine run-state (F4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -105,6 +109,14 @@ pub struct EngineStatus {
     /// UI/CLI can point users at the folder eating their disk. `None` in
     /// mirror mode.
     pub cache_path: Option<PathBuf>,
+    /// The sidecar reported `session_expired` / `auth_required` (1001/1002):
+    /// pending work is parked until the host re-authenticates (resume) or
+    /// restarts the engine. Local data is never discarded.
+    pub needs_sign_in: bool,
+    /// The sidecar transport failed or its process died. With the stream
+    /// still open the engine probes it again; with the stream closed it
+    /// stays visibly degraded (no automatic respawn yet).
+    pub sidecar_unavailable: bool,
 }
 
 /// Control commands (CLI socket / UI).
@@ -145,6 +157,11 @@ pub enum ActivityKind {
     GuardPaused,
     /// Upload failed terminally (non-retryable, or retries exhausted).
     UploadErrored,
+    /// The Drive session expired mid-sync; pending work is parked until the
+    /// user signs in again. Emitted once per expiry, not per file.
+    SignInRequired,
+    /// The sidecar stopped answering (transport error / process death).
+    SidecarUnavailable,
     /// A local item cannot be represented remotely (e.g. a non-UTF-8
     /// filename) and was deliberately left alone (never uploaded/deleted).
     Skipped,
@@ -367,6 +384,54 @@ fn is_revision_conflict(code: i64, message: &str) -> bool {
             .contains("no longer up to date")
 }
 
+/// True for the auth codes the sidecar maps 400/401 to (1002) and the
+/// "no session" code (1001): the host must re-run `auth.loginFork`.
+fn is_auth_error(code: i64) -> bool {
+    matches!(
+        code,
+        pds_sidecar_client::types::error_codes::AUTH_REQUIRED
+            | pds_sidecar_client::types::error_codes::SESSION_EXPIRED
+    )
+}
+
+/// True when a client error means the transport itself is gone (process
+/// exit, stdout EOF, broken pipe) rather than a request-level refusal.
+/// `JsonRpcClient` drains pending requests with `-32000 "connection closed"`
+/// when its read loop hits EOF, so that synthetic RPC error counts too.
+fn is_connection_lost(err: &pds_sidecar_client::Error) -> bool {
+    use pds_sidecar_client::Error as ClientError;
+    match err {
+        ClientError::Io(_) | ClientError::Closed | ClientError::Malformed(_) => true,
+        ClientError::Rpc(rpc) => {
+            rpc.code == -32000
+                && rpc
+                    .message
+                    .to_ascii_lowercase()
+                    .contains("connection closed")
+        }
+    }
+}
+
+fn is_connection_lost_anyhow(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        cause
+            .downcast_ref::<pds_sidecar_client::Error>()
+            .is_some_and(is_connection_lost)
+    })
+}
+
+/// The auth code/message carried by an `anyhow` chain, if any.
+fn auth_error_in_anyhow(err: &anyhow::Error) -> Option<(i64, String)> {
+    err.chain()
+        .find_map(|cause| cause.downcast_ref::<pds_sidecar_client::Error>())
+        .and_then(|err| match err {
+            pds_sidecar_client::Error::Rpc(rpc) if is_auth_error(rpc.code) => {
+                Some((rpc.code, rpc.message.clone()))
+            }
+            _ => None,
+        })
+}
+
 /// True for the "destination name already exists remotely" rename class:
 /// the SDK's `NodeWithSameNameExistsValidationError` maps to 1005
 /// (`CONFLICT`), while the raw-`ApiError` path surfaces the same text as
@@ -435,6 +500,19 @@ pub struct Engine<S: SidecarApi> {
     active_transfer: Option<String>,
     /// Pin commands queued from the control socket, awaiting async drain.
     pending_pins: VecDeque<PinRequest>,
+    /// Set once the sidecar reported an auth failure (1001/1002): all remote
+    /// work is parked until an explicit resume (the host re-authenticated)
+    /// or a restart. Never discards pending local work.
+    needs_sign_in: bool,
+    /// Set when the sidecar transport fails or the process dies. If the
+    /// notification stream is still open the main loop probes again after
+    /// [`SIDECAR_PROBE_DELAY`]; otherwise it stays degraded for this run.
+    sidecar_down: bool,
+    /// When the next probe is due while `sidecar_down`.
+    sidecar_probe_at: Option<Instant>,
+    /// The notification stream ended (sidecar process gone). There is no
+    /// reconnect path here; the host must restart the engine.
+    notifications_closed: bool,
     /// Set when Shutdown arrived mid-transfer; the main loop exits ASAP.
     shutting_down: bool,
     /// Set once `run()` has been entered.
@@ -533,6 +611,10 @@ impl<S: SidecarApi + 'static> Engine<S> {
             scope_id: None,
             active_transfer: None,
             pending_pins: VecDeque::new(),
+            needs_sign_in: false,
+            sidecar_down: false,
+            sidecar_probe_at: None,
+            notifications_closed: false,
             shutting_down: false,
             started: AtomicBool::new(false),
             watcher_ready: watcher_ready.clone(),
@@ -556,6 +638,51 @@ impl<S: SidecarApi + 'static> Engine<S> {
     /// > caller default); the DB stays the source for future runs.
     pub fn sync_mode(&self) -> SyncMode {
         self.mode
+    }
+
+    /// Park sync work after the sidecar reported an expired/missing session.
+    /// The row stays Dirty (local content is intact); a long retry delay and
+    /// the global gate keep the engine from hammering `/auth`. `resume()`
+    /// (the host just re-authenticated) or a restart unparks it.
+    fn note_auth_required(&mut self, rel: Option<&str>, code: i64, message: &str) {
+        if let Some(rel) = rel {
+            self.retry_at
+                .insert(rel.to_string(), Instant::now() + RETRY_BACKOFF_MAX);
+        }
+        if !self.needs_sign_in {
+            warn!(code, error = %message, "sidecar session expired; parking sync until re-authentication");
+            self.emit_activity(
+                ActivityKind::SignInRequired,
+                rel.unwrap_or(""),
+                Some(format!("sign in again to resume syncing: {message}")),
+            );
+            self.needs_sign_in = true;
+        }
+    }
+
+    /// Record that the sidecar transport is unavailable and schedule the
+    /// next probe. Degraded mode is visible in status/activity; pending local
+    /// work stays in the DB.
+    fn note_sidecar_failure(&mut self, message: &str) {
+        if !self.sidecar_down {
+            warn!(error = %message, "sidecar unavailable; pausing sync until it answers again");
+            self.emit_activity(
+                ActivityKind::SidecarUnavailable,
+                "",
+                Some(message.to_string()),
+            );
+        }
+        self.sidecar_down = true;
+        self.sidecar_probe_at = Some(Instant::now() + SIDECAR_PROBE_DELAY);
+    }
+
+    /// The last sidecar call succeeded: leave degraded mode.
+    fn note_sidecar_ok(&mut self) {
+        if self.sidecar_down {
+            info!("sidecar answering again; resuming sync");
+        }
+        self.sidecar_down = false;
+        self.sidecar_probe_at = None;
     }
 
     /// Run until shutdown. Consumes the engine.
@@ -871,8 +998,18 @@ impl<S: SidecarApi + 'static> Engine<S> {
                 }
             }
             // F4: when running, pump queued work (tombstones → uploads → events).
-            if self.state == EngineState::Running && self.pump_work().await? {
-                continue;
+            if self.state == EngineState::Running {
+                match self.pump_work().await {
+                    Ok(true) => continue,
+                    Ok(false) => {}
+                    Err(e) if self.needs_sign_in || is_connection_lost_anyhow(&e) => {
+                        if !self.needs_sign_in {
+                            self.note_sidecar_failure(&e.to_string());
+                        }
+                        warn!(error = %e, "sync work parked after a session/sidecar failure");
+                    }
+                    Err(e) => return Err(e),
+                }
             }
             // If dirty rows are only waiting out a retry backoff, wake up
             // when the earliest one matures (F2 — no busy loop, no stall).
@@ -884,15 +1021,31 @@ impl<S: SidecarApi + 'static> Engine<S> {
                         Some(c) => self.handle_command(c)?,
                     }
                 }
-                n = self.notifications.recv() => {
+                n = self.notifications.recv(), if !self.notifications_closed => {
                     match n {
                         Some(n) => self.handle_notification(n).await?,
-                        None => return Err(anyhow!("sidecar notification stream closed")),
+                        None => {
+                            // The child process exited / stdout closed: keep
+                            // the engine alive in a visible degraded state.
+                            // Pending work stays durable; recovery needs a
+                            // host restart (no automatic respawn yet).
+                            self.note_sidecar_failure("sidecar notification stream closed");
+                            self.notifications_closed = true;
+                        }
                     }
                 }
                 batch = fs_rx.recv() => {
-                    if let Some(events) = batch {
-                        self.handle_fs_batch(events).await?;
+                    if let Some(events) = batch
+                        && let Err(e) = self.handle_fs_batch(events).await
+                    {
+                        if self.needs_sign_in || is_connection_lost_anyhow(&e) {
+                            if !self.needs_sign_in {
+                                self.note_sidecar_failure(&e.to_string());
+                            }
+                            warn!(error = %e, "local batch parked after a session/sidecar failure");
+                        } else {
+                            return Err(e);
+                        }
                     }
                 }
                 _ = async {
@@ -1389,7 +1542,11 @@ impl<S: SidecarApi + 'static> Engine<S> {
     /// Earliest backoff expiry among scheduled retries, if any. Stale
     /// entries are harmless (the wake just finds nothing eligible).
     fn next_retry_wake(&self) -> Option<Instant> {
-        self.retry_at.values().copied().min()
+        self.retry_at
+            .values()
+            .copied()
+            .chain(self.sidecar_probe_at)
+            .min()
     }
 
     /// Create/write-close on a file: hash, then upload (new node or new
@@ -1484,8 +1641,8 @@ impl<S: SidecarApi + 'static> Engine<S> {
             self.retry_at.remove(rel);
         }
 
-        if self.state != EngineState::Running {
-            debug!(path = %rel, "paused: buffered dirty file");
+        if self.state != EngineState::Running || self.needs_sign_in || self.sidecar_down {
+            debug!(path = %rel, "paused/degraded: buffered dirty file");
             return Ok(());
         }
         self.upload_one(rel).await
@@ -1518,6 +1675,10 @@ impl<S: SidecarApi + 'static> Engine<S> {
         // superseding it.
         if !row.node_uid.starts_with("pending:") {
             self.check_remote_head(rel, &row).await?;
+            // Auth expiry / transport death parks the whole queue.
+            if self.needs_sign_in || self.sidecar_down {
+                return Ok(());
+            }
             // The check may have re-keyed the row (vanished node) or left it
             // untouched (fast path / conflict downloaded); re-read it.
             let Some(row) = self.db.node_by_path(rel)? else {
@@ -1555,6 +1716,17 @@ impl<S: SidecarApi + 'static> Engine<S> {
     async fn check_remote_head(&mut self, rel: &str, row: &NodeRow) -> Result<()> {
         let node = match self.sidecar.get_node(&row.node_uid).await {
             Ok(n) => n,
+            Err(e) if is_connection_lost(&e) => {
+                // Transport death must NOT be mistaken for "node vanished"
+                // (that would re-key the row and upload a duplicate later).
+                self.note_sidecar_failure(&e.to_string());
+                return Ok(());
+            }
+            Err(e) if e.code().is_some_and(is_auth_error) => {
+                let code = e.code().expect("checked above");
+                self.note_auth_required(Some(rel), code, &e.to_string());
+                return Ok(());
+            }
             Err(e) => {
                 // Node gone remotely (trashed by another client; the event
                 // hasn't reached us). Re-upload as a NEW file rather than
@@ -1693,6 +1865,7 @@ impl<S: SidecarApi + 'static> Engine<S> {
         self.db.upsert_node(&row)?;
         self.clear_upload_blocks(rel)?;
         self.retry_at.remove(rel);
+        self.note_sidecar_ok();
         info!(path = %rel, "uploaded");
         self.emit_activity(ActivityKind::Uploaded, rel, None);
         Ok(())
@@ -1717,11 +1890,23 @@ impl<S: SidecarApi + 'static> Engine<S> {
     ) -> Result<()> {
         let (code, message, retryable, retry_after) = match failure {
             TransferFailure::Aborted(e) => {
-                // Shutdown/transport teardown — leave dirty for next run.
+                // Leave the row Dirty for the next run/session.
                 if self.db.node_by_path(rel)?.is_some() {
                     self.db.set_sync_state(rel, SyncState::Dirty)?;
                 }
-                return Err(e);
+                if self.shutting_down {
+                    return Err(e); // normal teardown, not a failure to surface
+                }
+                if !is_connection_lost_anyhow(&e) {
+                    return Err(e); // e.g. a local DB failure, not a sidecar loss
+                }
+                // Transport death mid-transfer (sidecar process exit, EOF).
+                // Keep the engine alive in a visible degraded state and
+                // avoid an immediate retry spin; no respawn is attempted.
+                self.note_sidecar_failure(&e.to_string());
+                self.retry_at
+                    .insert(rel.to_string(), Instant::now() + RETRY_BACKOFF_MAX);
+                return Ok(());
             }
             TransferFailure::Remote {
                 code,
@@ -1734,6 +1919,13 @@ impl<S: SidecarApi + 'static> Engine<S> {
             return Ok(()); // vanished mid-transfer; delete path owns it
         }
         self.db.set_sync_state(rel, SyncState::Dirty)?;
+
+        // Auth expired mid-transfer: park, never loop (the sidecar would
+        // reject every attempt until the host signs in again).
+        if is_auth_error(code) {
+            self.note_auth_required(Some(rel), code, &message);
+            return Ok(());
+        }
 
         // The 409 class: the remote head moved under us (e.g. its event was
         // applied first and updated our synced head, so the getNode
@@ -2118,6 +2310,7 @@ impl<S: SidecarApi + 'static> Engine<S> {
             .trash(std::slice::from_ref(&t.node_uid))
             .await?;
         if results.iter().any(|r| r.uid == t.node_uid && r.ok) {
+            self.note_sidecar_ok();
             info!(path = %t.local_path, uid = %t.node_uid, "trashed remotely");
             self.remove_node_recursive(&t.local_path)?;
             self.db.remove_tombstone(&t.local_path)?;
@@ -2151,10 +2344,23 @@ impl<S: SidecarApi + 'static> Engine<S> {
     async fn handle_notification(&mut self, n: Notification) -> Result<()> {
         match n {
             Notification::DriveEvent(ev) => {
-                if self.state == EngineState::Running {
-                    self.apply_event(*ev).await?;
+                if self.state == EngineState::Running && !self.needs_sign_in && !self.sidecar_down {
+                    let event = (*ev).clone();
+                    match self.apply_event(event).await {
+                        Ok(()) => {}
+                        Err(e) if self.needs_sign_in || is_connection_lost_anyhow(&e) => {
+                            if !self.needs_sign_in && !self.sidecar_down {
+                                self.note_sidecar_failure(&e.to_string());
+                            }
+                            // apply_event persists the cursor last, so the
+                            // event is safe to replay after recovery.
+                            debug!(event = %ev.event_id, "parking event after a session/sidecar failure");
+                            self.buffered_events.push_back(*ev);
+                        }
+                        Err(e) => return Err(e),
+                    }
                 } else {
-                    debug!(event = %ev.event_id, "paused: buffering remote event");
+                    debug!(event = %ev.event_id, "paused/degraded: buffering remote event");
                     self.buffered_events.push_back(*ev);
                 }
             }
@@ -2184,6 +2390,12 @@ impl<S: SidecarApi + 'static> Engine<S> {
                     if ev.is_trashed == Some(true) {
                         self.apply_remote_delete(&uid)?;
                     } else if let Err(e) = self.apply_node_upsert(&uid).await {
+                        // Auth/transport failures mean the event was not
+                        // applied: propagate so the caller parks it for replay
+                        // instead of advancing the cursor past it.
+                        if self.needs_sign_in || is_connection_lost_anyhow(&e) {
+                            return Err(e);
+                        }
                         warn!(uid = %uid, error = %e, "failed to apply node event");
                     }
                 }
@@ -2264,7 +2476,16 @@ impl<S: SidecarApi + 'static> Engine<S> {
         let node = match self.sidecar.get_node(uid).await {
             Ok(n) => n,
             Err(e) => {
-                debug!(uid = %uid, error = %e, "node vanished before fetch; skipping");
+                let err = anyhow::Error::from(e);
+                if let Some((code, message)) = auth_error_in_anyhow(&err) {
+                    self.note_auth_required(None, code, &message);
+                    return Err(err);
+                }
+                if is_connection_lost_anyhow(&err) {
+                    self.note_sidecar_failure(&err.to_string());
+                    return Err(err);
+                }
+                debug!(uid = %uid, error = %err, "node vanished before fetch; skipping");
                 return Ok(());
             }
         };
@@ -2817,10 +3038,25 @@ impl<S: SidecarApi + 'static> Engine<S> {
         }
         let tmp = to_abs(&self.backing_dir, &format!("{rel}.pds-part"));
         let sidecar = Arc::clone(&self.sidecar);
-        let outcome = self
+        match self
             .run_transfer("download", Some(rel), sidecar.download(uid, &tmp))
-            .await?;
-        let _ = outcome;
+            .await
+        {
+            Ok(_) => {}
+            Err(TransferFailure::Remote { code, message, .. }) if is_auth_error(code) => {
+                self.note_auth_required(Some(rel), code, &message);
+                return Err(anyhow!(
+                    "sign-in required while downloading `{rel}`: {message}"
+                ));
+            }
+            Err(TransferFailure::Aborted(e)) => {
+                if !self.shutting_down && is_connection_lost_anyhow(&e) {
+                    self.note_sidecar_failure(&e.to_string());
+                }
+                return Err(e);
+            }
+            Err(e) => return Err(e.into()),
+        }
         std::fs::rename(&tmp, &abs)?;
         apply_file_metadata(&abs, mtime, mode);
         Ok(())
@@ -3035,10 +3271,28 @@ impl<S: SidecarApi + 'static> Engine<S> {
         let tmp_rel = format!("{rel}.pds-part");
         let tmp = self.content_path(&tmp_rel);
         let sidecar = Arc::clone(&self.sidecar);
-        let outcome = self
+        match self
             .run_transfer("download", Some(rel), sidecar.download(uid, &tmp))
-            .await?;
-        let _ = outcome;
+            .await
+        {
+            Ok(_) => {}
+            Err(TransferFailure::Remote { code, message, .. }) if is_auth_error(code) => {
+                // Park the event (the caller re-buffers it) and surface the
+                // sign-in requirement instead of dying or advancing the
+                // cursor past a file we never materialized.
+                self.note_auth_required(Some(rel), code, &message);
+                return Err(anyhow!(
+                    "sign-in required while downloading `{rel}`: {message}"
+                ));
+            }
+            Err(TransferFailure::Aborted(e)) => {
+                if !self.shutting_down && is_connection_lost_anyhow(&e) {
+                    self.note_sidecar_failure(&e.to_string());
+                }
+                return Err(e);
+            }
+            Err(e) => return Err(e.into()),
+        }
         std::fs::rename(&tmp, &abs)?;
         apply_file_metadata(&abs, remote_mtime, existing_mode);
         self.db.upsert_node(&NodeRow {
@@ -3056,6 +3310,7 @@ impl<S: SidecarApi + 'static> Engine<S> {
             synced_sha1: node.as_ref().and_then(|n| n.sha1.clone()),
         })?;
         self.clear_upload_blocks(rel)?;
+        self.note_sidecar_ok();
         info!(path = %rel, "downloaded");
         self.emit_activity(ActivityKind::Downloaded, rel, None);
         Ok(())
@@ -3069,9 +3324,26 @@ impl<S: SidecarApi + 'static> Engine<S> {
         local_path: Option<&str>,
         start: impl std::future::Future<Output = Result<String, pds_sidecar_client::Error>>,
     ) -> Result<TransferOutcome, TransferFailure> {
-        let transfer_id = start
-            .await
-            .map_err(|e| TransferFailure::Aborted(e.into()))?;
+        let transfer_id = start.await.map_err(|e| {
+            // Preserve a request-level code (session expired, rate limit,
+            // conflict) instead of collapsing every failure into an abort;
+            // transport death stays Aborted so it is retried/degraded.
+            if is_connection_lost(&e) {
+                TransferFailure::Aborted(e.into())
+            } else {
+                match &e {
+                    pds_sidecar_client::Error::Rpc(rpc) => TransferFailure::Remote {
+                        code: rpc.code,
+                        message: rpc.message.clone(),
+                        retryable: rpc.code == pds_sidecar_client::types::error_codes::RATE_LIMITED,
+                        retry_after: rpc
+                            .retry_after()
+                            .map(|secs| Duration::from_secs_f64(secs.max(0.0))),
+                    },
+                    _ => TransferFailure::Aborted(e.into()),
+                }
+            }
+        })?;
         self.active_transfer = Some(transfer_id.clone());
         self.db
             .upsert_transfer(
@@ -3127,7 +3399,9 @@ impl<S: SidecarApi + 'static> Engine<S> {
                             });
                         }
                         Some(other) => self.backlog.push_back(other),
-                        None => break Err(TransferFailure::Aborted(anyhow!("sidecar closed during transfer"))),
+                        None => break Err(TransferFailure::Aborted(
+                            pds_sidecar_client::Error::Closed.into(),
+                        )),
                     }
                 }
             }
@@ -3193,6 +3467,19 @@ impl<S: SidecarApi + 'static> Engine<S> {
                 }
                 // Explicit resume = "try now": drop pending retry backoffs.
                 self.retry_at.clear();
+                // Resume is also the host's "sign-in finished" signal (the
+                // desktop app restarts the engine after login; embedding
+                // callers may just resume). Re-probe a transiently failed
+                // sidecar, but a closed notification stream cannot recover
+                // without a restart.
+                if self.needs_sign_in {
+                    info!("session restored: resuming parked sync work");
+                    self.needs_sign_in = false;
+                }
+                if self.sidecar_down && !self.notifications_closed {
+                    self.sidecar_down = false;
+                    self.sidecar_probe_at = None;
+                }
                 if let Some(tid) = self.active_transfer.clone() {
                     let sidecar = Arc::clone(&self.sidecar);
                     tokio::spawn(async move {
@@ -3227,6 +3514,8 @@ impl<S: SidecarApi + 'static> Engine<S> {
                     cache_cap: self.eviction_cap,
                     cache_used,
                     cache_path,
+                    needs_sign_in: self.needs_sign_in,
+                    sidecar_unavailable: self.sidecar_down || self.notifications_closed,
                 });
             }
             Command::Shutdown => {}
@@ -3316,9 +3605,40 @@ impl<S: SidecarApi + 'static> Engine<S> {
     /// drain order "uploads then events", accepted for F7 safety.)
     /// Returns true if any work was done.
     async fn pump_work(&mut self) -> Result<bool> {
+        // The sidecar process is gone: no retry can succeed without a host
+        // restart (no automatic respawn). Stay alive for status/commands.
+        if self.notifications_closed {
+            return Ok(false);
+        }
+        if self.sidecar_down {
+            let due = self.sidecar_probe_at.is_none_or(|at| at <= Instant::now());
+            if !due {
+                return Ok(false);
+            }
+            // Probe once; the handlers re-enter degraded mode on failure.
+            self.sidecar_down = false;
+            self.sidecar_probe_at = None;
+        }
+        // No session: every remote call would fail. Keep the queues intact
+        // until an explicit resume (host re-authenticated) or restart.
+        if self.needs_sign_in {
+            return Ok(false);
+        }
         if !self.db.tombstones()?.is_empty() {
             // Guard may auto-pause; false means "stop pumping".
-            self.drain_one_tombstone().await?;
+            match self.drain_one_tombstone().await {
+                Ok(_) => {}
+                Err(e) if is_connection_lost_anyhow(&e) => {
+                    self.note_sidecar_failure(&e.to_string());
+                    return Ok(false);
+                }
+                Err(e) if auth_error_in_anyhow(&e).is_some() => {
+                    let (code, message) = auth_error_in_anyhow(&e).expect("checked above");
+                    self.note_auth_required(None, code, &message);
+                    return Ok(false);
+                }
+                Err(e) => return Err(e),
+            }
             // Write-through: the VFS tree must drop the path right away.
             if let Some(store) = &self.store
                 && let Err(e) = self.publish_vfs_snapshot(store)
@@ -3328,7 +3648,21 @@ impl<S: SidecarApi + 'static> Engine<S> {
             return Ok(true);
         }
         if let Some(ev) = self.buffered_events.pop_front() {
-            self.apply_event(ev).await?;
+            match self.apply_event(ev.clone()).await {
+                Ok(()) => {}
+                Err(_) if self.needs_sign_in => {
+                    // Retry after sign-in: the event was not committed
+                    // (apply_event saves the cursor last).
+                    self.buffered_events.push_front(ev);
+                    return Ok(false);
+                }
+                Err(e) if is_connection_lost_anyhow(&e) => {
+                    self.note_sidecar_failure(&e.to_string());
+                    self.buffered_events.push_front(ev);
+                    return Ok(false);
+                }
+                Err(e) => return Err(e),
+            }
             return Ok(true);
         }
         // Uploads: skip terminally errored / remote-conflicted nodes and
@@ -3346,7 +3680,16 @@ impl<S: SidecarApi + 'static> Engine<S> {
                     && self.retry_at.get(&r.local_path).is_none_or(|t| *t <= now)
             })
         {
-            self.upload_one(&row.local_path).await?;
+            match self.upload_one(&row.local_path).await {
+                Ok(()) => {}
+                Err(e) if self.needs_sign_in || is_connection_lost_anyhow(&e) => {
+                    if !self.needs_sign_in {
+                        self.note_sidecar_failure(&e.to_string());
+                    }
+                    return Ok(false);
+                }
+                Err(e) => return Err(e),
+            }
             return Ok(true);
         }
         Ok(false)

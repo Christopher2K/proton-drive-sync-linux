@@ -94,7 +94,11 @@ impl ActivityFilter {
             ActivityFilter::Problems => {
                 matches!(
                     kind,
-                    ActivityKind::UploadErrored | ActivityKind::GuardPaused | ActivityKind::Skipped
+                    ActivityKind::UploadErrored
+                        | ActivityKind::GuardPaused
+                        | ActivityKind::Skipped
+                        | ActivityKind::SignInRequired
+                        | ActivityKind::SidecarUnavailable
                 )
             }
         }
@@ -211,6 +215,18 @@ impl AppState {
     /// Engine run-state, if a status snapshot has arrived.
     pub fn engine_state(&self) -> Option<EngineState> {
         self.status.as_ref().map(|s| s.state)
+    }
+
+    /// The sidecar rejected the Drive session mid-sync; the user must sign in
+    /// again before parked work can drain. Local files and the queue are
+    /// untouched (Wave 3b / TG-20).
+    pub fn sign_in_required(&self) -> bool {
+        self.phase == Phase::Running && self.status.as_ref().is_some_and(|s| s.needs_sign_in)
+    }
+
+    /// The sidecar transport is unavailable (crashed / stopped answering).
+    pub fn sidecar_unavailable(&self) -> bool {
+        self.phase == Phase::Running && self.status.as_ref().is_some_and(|s| s.sidecar_unavailable)
     }
 
     /// True when the engine is not actively syncing: no status yet, user
@@ -419,11 +435,19 @@ pub fn badge(state: &AppState) -> &'static str {
         Phase::Starting => "Starting",
         Phase::NeedsLogin => "Sign-in required",
         Phase::Failed => "Stopped",
-        Phase::Running => match state.engine_state() {
-            Some(EngineState::Running) | None => "Syncing",
-            Some(EngineState::Paused) => "Paused",
-            Some(EngineState::GuardPaused) => "Delete guard",
-        },
+        Phase::Running => {
+            if state.sign_in_required() {
+                "Sign-in required"
+            } else if state.sidecar_unavailable() {
+                "Sidecar lost"
+            } else {
+                match state.engine_state() {
+                    Some(EngineState::Running) | None => "Syncing",
+                    Some(EngineState::Paused) => "Paused",
+                    Some(EngineState::GuardPaused) => "Delete guard",
+                }
+            }
+        }
     }
 }
 
@@ -436,6 +460,8 @@ pub fn kind_label(kind: ActivityKind) -> &'static str {
         ActivityKind::Conflict => "Conflict",
         ActivityKind::GuardPaused => "Guard paused",
         ActivityKind::UploadErrored => "Upload error",
+        ActivityKind::SignInRequired => "Sign-in required",
+        ActivityKind::SidecarUnavailable => "Sidecar unavailable",
         ActivityKind::Skipped => "Skipped",
     }
 }
@@ -467,6 +493,8 @@ mod tests {
             cache_cap: Some(10 * 1024 * 1024 * 1024),
             cache_used: 0,
             cache_path: None,
+            needs_sign_in: false,
+            sidecar_unavailable: false,
         }
     }
 
@@ -589,6 +617,37 @@ mod tests {
         apply(&mut s, &AppUpdate::EngineStarted);
         apply(&mut s, &AppUpdate::Status(status(EngineState::GuardPaused)));
         assert_eq!(badge(&s), "Delete guard");
+    }
+
+    #[test]
+    fn session_expiry_mid_sync_shows_sign_in_required() {
+        let mut s = AppState::new(PathBuf::from("/tmp/root"));
+        apply(&mut s, &AppUpdate::EngineStarted);
+        apply(&mut s, &AppUpdate::Status(status(EngineState::Running)));
+        assert_eq!(badge(&s), "Syncing");
+        assert!(!s.sign_in_required());
+
+        let mut expired = status(EngineState::Running);
+        expired.needs_sign_in = true;
+        apply(&mut s, &AppUpdate::Status(expired));
+        assert!(s.sign_in_required());
+        assert_eq!(badge(&s), "Sign-in required");
+
+        // A successful re-authentication (status flag cleared) heals the UI.
+        apply(&mut s, &AppUpdate::Status(status(EngineState::Running)));
+        assert!(!s.sign_in_required());
+        assert_eq!(badge(&s), "Syncing");
+    }
+
+    #[test]
+    fn sidecar_loss_shows_visible_degraded_badge() {
+        let mut s = AppState::new(PathBuf::from("/tmp/root"));
+        apply(&mut s, &AppUpdate::EngineStarted);
+        let mut lost = status(EngineState::Running);
+        lost.sidecar_unavailable = true;
+        apply(&mut s, &AppUpdate::Status(lost));
+        assert!(s.sidecar_unavailable());
+        assert_eq!(badge(&s), "Sidecar lost");
     }
 
     #[test]
