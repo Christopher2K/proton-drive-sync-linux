@@ -732,6 +732,66 @@ async fn evicted_placeholder_rehydrates_on_request() {
     fx.shutdown().await;
 }
 
+/// TG-27: an open FUSE/store handle protects a file from eviction even when
+/// the cap shrinks below current usage; once released, the next pass evicts
+/// it to a placeholder and rehydration returns the same bytes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn open_handle_survives_eviction_and_evicts_after_release() {
+    let fx = start_with_cap(None).await;
+    wait_for(|| fx.store.snapshot().by_path.contains_key("hello.txt")).await;
+
+    // Simulate the FUSE open path: track the handle BEFORE hydration so the
+    // first eviction pass already sees it as open.
+    fx.store.add_open_handle("hello.txt");
+    assert!(fx.store.begin_hydrate("hello.txt"));
+    wait_for(|| {
+        fx.store
+            .backing_path("hello.txt")
+            .is_some_and(|p| std::fs::read(p).ok().as_deref() == Some(b"hello drive".as_slice()))
+    })
+    .await;
+
+    fx.handle.set_cache_cap(Some(1)).await.unwrap();
+    // The cap is exceeded but the only candidate is open: the pass skips it
+    // and returns (no hot loop). Give a spin a chance to show up, then
+    // assert the engine still answers and the content is intact.
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    let st = fx.handle.status().await.unwrap();
+    assert_eq!(st.state, EngineState::Running);
+    assert_eq!(st.cache_cap, Some(1));
+    assert!(st.cache_used > 1);
+    assert!(
+        fx.store
+            .backing_path("hello.txt")
+            .is_some_and(|p| p.is_file()),
+        "open file must stay hydrated even over the cap"
+    );
+
+    fx.store.remove_open_handle("hello.txt");
+    // Same-cap command re-runs the eviction pass immediately.
+    fx.handle.set_cache_cap(Some(1)).await.unwrap();
+    wait_for(|| fx.store.backing_path("hello.txt").is_none()).await;
+    wait_for(|| {
+        fx.store
+            .snapshot()
+            .by_path
+            .get("hello.txt")
+            .is_some_and(|n| !n.content_ready)
+    })
+    .await;
+    assert!(fx.mock.trashed_uids().is_empty(), "eviction must not trash");
+
+    fx.store.begin_hydrate("hello.txt");
+    wait_for(|| {
+        fx.store
+            .backing_path("hello.txt")
+            .is_some_and(|p| std::fs::read(p).ok().as_deref() == Some(b"hello drive".as_slice()))
+    })
+    .await;
+    fx.shutdown().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
 async fn remote_folder_rename_moves_hydrated_backing_subtree() {
@@ -941,6 +1001,77 @@ async fn placeholder_folder_delete_trashes_once_and_leaves_snapshot() {
             trashed.iter().filter(|u| *u == uid).count(),
             1,
             "uid {uid} must be trashed exactly once: {trashed:?}"
+        );
+    }
+    fx.shutdown().await;
+}
+
+// TG-24 (placeholder mode): deletes recorded through the mount/store go
+// through the same mass-delete guard as watcher deletes, and one explicit
+// resume approves the pending batch.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn placeholder_mass_delete_guard_trips_and_one_resume_drains() {
+    let fx = start().await;
+    for i in 0..40 {
+        fx.mock
+            .remote_create_file("root", &format!("f{i:02}.txt"), b"filler");
+    }
+    wait_for(|| fx.store.snapshot().by_path.contains_key("f39.txt")).await;
+    let synced = fx.db.count_synced().unwrap();
+    assert!(synced >= 42, "expected 40 fillers + defaults, got {synced}");
+
+    // Record all deletes while paused so the guard sees the whole wave.
+    fx.handle.pause().await.unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while fx.handle.status().await.unwrap().state != EngineState::Paused {
+        assert!(Instant::now() < deadline, "engine did not pause");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    for i in 0..15 {
+        fx.store.record_delete(&format!("f{i:02}.txt"));
+    }
+    wait_for(|| fx.db.tombstones().map(|t| t.len() == 15).unwrap_or(false)).await;
+    fx.handle.resume().await.unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if fx.handle.status().await.unwrap().state == EngineState::GuardPaused {
+            break;
+        }
+        assert!(Instant::now() < deadline, "guard never tripped");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let trashed_at_trip = fx.mock.trashed_uids().len();
+    assert!(
+        trashed_at_trip < 15,
+        "guard must stop the placeholder delete wave: {trashed_at_trip} already trashed"
+    );
+    let pending = fx.db.tombstones().unwrap().len();
+    assert!(pending > 0);
+    assert_eq!(trashed_at_trip + pending, 15);
+
+    // Explicit resume approves exactly the pending batch; nothing lost.
+    fx.handle.resume().await.unwrap();
+    wait_for(|| fx.mock.trashed_uids().len() == 15).await;
+    wait_for(|| fx.db.tombstones().map(|t| t.is_empty()).unwrap_or(false)).await;
+    assert_eq!(
+        fx.handle.status().await.unwrap().state,
+        EngineState::Running
+    );
+    let snapshot = fx.store.snapshot();
+    for i in 0..15 {
+        let path = format!("f{i:02}.txt");
+        assert!(
+            !snapshot.by_path.contains_key(&path),
+            "{path} must be gone after resume"
+        );
+    }
+    for i in 15..40 {
+        let path = format!("f{i:02}.txt");
+        assert!(
+            snapshot.by_path.contains_key(&path),
+            "{path} was not deleted and must remain"
         );
     }
     fx.shutdown().await;
