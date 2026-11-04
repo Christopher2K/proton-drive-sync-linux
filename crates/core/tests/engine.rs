@@ -1960,8 +1960,16 @@ async fn recreate_after_delete_drained_uploads_new_node() {
     wait_for(|| fx.db.node_by_path("churn.txt").unwrap().is_none()).await;
 
     // Re-create while paused so its upload cannot start yet: this is the
-    // "delete drained, upload not completed" window.
+    // "delete drained, upload not completed" window. `pause()` only enqueues
+    // the command, so wait until the engine loop has applied it — otherwise
+    // the re-create can race the pause and upload immediately.
     fx.handle.pause().await.unwrap();
+    wait_for(|| {
+        futures::executor::block_on(fx.handle.status())
+            .map(|s| s.state == EngineState::Paused)
+            .unwrap_or(false)
+    })
+    .await;
     std::fs::write(fx.root.join("churn.txt"), b"v2 replacement").unwrap();
     wait_for(|| {
         fx.db
@@ -2223,8 +2231,16 @@ async fn remote_trash_then_restore_round_trips_mirror() {
 
     fx.mock.remote_trash("node-hello");
     wait_for(|| {
+        // The cursor is persisted after the event is applied, so require it
+        // here too: the file/row can be gone a moment before the cursor write.
         !fx.root.join("hello.txt").exists()
             && fx.db.node_by_path("hello.txt").unwrap().is_none()
+            && fx
+                .db
+                .event_cursor("scope-1")
+                .unwrap()
+                .as_deref()
+                != cursor_before.as_deref()
     })
     .await;
     let cursor_trashed = fx.db.event_cursor("scope-1").unwrap();
@@ -2235,6 +2251,8 @@ async fn remote_trash_then_restore_round_trips_mirror() {
 
     fx.mock.remote_restore("node-hello");
     wait_for(|| {
+        // Same ordering as the trash event: wait for the cursor, not just the
+        // materialized file, before asserting that it advanced.
         std::fs::read(fx.root.join("hello.txt")).ok().as_deref() == Some(b"hello drive".as_slice())
             && fx
                 .db
@@ -2242,6 +2260,12 @@ async fn remote_trash_then_restore_round_trips_mirror() {
                 .ok()
                 .flatten()
                 .is_some_and(|r| r.node_uid == "node-hello")
+            && fx
+                .db
+                .event_cursor("scope-1")
+                .unwrap()
+                .as_deref()
+                != cursor_trashed.as_deref()
     })
     .await;
     let cursor_restored = fx.db.event_cursor("scope-1").unwrap();
@@ -3041,7 +3065,520 @@ async fn overlong_path_fails_cleanly_and_sync_continues() {
     fx.shutdown().await;
 }
 
+// ---------------------------------------------------------------------------
+// Wave 3a — environment / transport resilience (TG-19, TG-22)
+// ---------------------------------------------------------------------------
+
+/// TG-23: startup refuses a corrupt state DB with an actionable message
+/// instead of panicking or silently starting from an empty index.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn engine_startup_refuses_corrupt_state_db_with_actionable_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("sync");
+    let db_path = root.join(STATE_DIR).join("state.db");
+    std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+    std::fs::write(&db_path, b"not a database, just bytes\n").unwrap();
+
+    let (mut client, _mock) = MockSidecar::new().connect();
+    let notifications = client.take_notifications();
+    let result = Engine::new(
+        Arc::new(client),
+        notifications,
+        EngineConfig {
+            root,
+            db_path,
+            ..Default::default()
+        },
+    );
+    let err = match result {
+        Ok(_) => panic!("corrupt DB must refuse startup"),
+        Err(e) => format!("{e:#}"),
+    };
+    assert!(err.contains("state DB"), "error should name the DB: {err}");
+    assert!(
+        err.contains("not a database") || err.contains("malformed"),
+        "error should name the cause: {err}"
+    );
+}
+
+/// Lock a directory against writes by the current (non-root) user and make
+/// sure the test restores it so the tempdir can be cleaned up.
+fn lock_dir(path: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o555)).unwrap();
+}
+
+fn unlock_dir(path: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+/// Wait for (and return) the next activity item matching `pred`. Bounded, so
+/// a wrong signal fails the test instead of hanging it.
+async fn next_activity(
+    rx: &mut tokio::sync::broadcast::Receiver<pds_core::ActivityItem>,
+    pred: impl Fn(&pds_core::ActivityItem) -> bool,
+) -> pds_core::ActivityItem {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        match tokio::time::timeout(left, rx.recv()).await {
+            Ok(Ok(item)) if pred(&item) => return item,
+            Ok(Ok(_)) => continue,
+            Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => continue,
+            Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => {
+                panic!("activity feed closed")
+            }
+            Err(_) => panic!("matching activity entry not seen within 30 s"),
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn initial_sync_download_permission_denied_is_surfaced_and_recovers() {
+    // TG-19: a single un-writable download target must not kill the run loop
+    // or block the rest of the tree. The row stays visible as errored and an
+    // explicit resume after restoring permissions retries it.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("sync");
+    std::fs::create_dir_all(root.join("Documents")).unwrap();
+    lock_dir(&root.join("Documents"));
+
+    let (client, mock) = MockSidecar::new().connect();
+    // Seed a remote file under the locked folder (event predates the stream;
+    // initial enumeration is what discovers it).
+    mock.remote_create_file("node-docs", "locked.txt", b"locked v1");
+    let fx = start_with_client(
+        dir,
+        root.clone(),
+        client,
+        mock,
+        Duration::from_secs(30),
+    )
+    .await;
+
+    // Other files keep syncing even though one target is denied.
+    assert_eq!(
+        std::fs::read(fx.root.join("hello.txt")).unwrap(),
+        b"hello drive"
+    );
+    wait_for(|| {
+        fx.db
+            .node_by_path("Documents/locked.txt")
+            .ok()
+            .flatten()
+            .is_some_and(|r| {
+                r.sync_state == pds_core::SyncState::Downloading
+                    && fx
+                        .db
+                        .upload_error("Documents/locked.txt")
+                        .ok()
+                        .flatten()
+                        .is_some_and(|e| e.contains("Permission denied"))
+            })
+    })
+    .await;
+    assert!(!fx.engine.is_finished(), "engine must survive a bad target");
+    assert_eq!(
+        fx.handle.status().await.unwrap().state,
+        EngineState::Running
+    );
+
+    unlock_dir(&fx.root.join("Documents"));
+    fx.handle.resume().await.unwrap();
+    wait_for(|| {
+        std::fs::read(fx.root.join("Documents/locked.txt")).ok().as_deref() == Some(b"locked v1")
+            && fx
+                .db
+                .node_by_path("Documents/locked.txt")
+                .ok()
+                .flatten()
+                .is_some_and(|r| {
+                    r.sync_state == pds_core::SyncState::Synced
+                        && fx.db.upload_error("Documents/locked.txt").ok().flatten().is_none()
+                })
+    })
+    .await;
+    assert_eq!(fx.handle.status().await.unwrap().errored_nodes, 0);
+    fx.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn non_writable_sync_root_does_not_stop_the_engine() {
+    // TG-19: mirror mode with a read-only root. The engine must come up,
+    // report the failed download, and recover once the root is writable.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("sync");
+    std::fs::create_dir_all(root.join("Documents")).unwrap();
+
+    let (mut client, mock) = MockSidecar::new().connect();
+    let notifications = client.take_notifications();
+    let db_path = root.join(STATE_DIR).join("state.db");
+    let (engine, handle) = Engine::new(
+        Arc::new(client),
+        notifications,
+        EngineConfig {
+            root: root.clone(),
+            db_path: db_path.clone(),
+            retry_base: Duration::from_secs(30),
+            placeholders: false,
+            eviction_cap: None,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let db = Db::open(&db_path).unwrap();
+    lock_dir(&root);
+    let join = tokio::spawn(engine.run());
+
+    wait_for(|| {
+        db.node_by_path("hello.txt").ok().flatten().is_some_and(|r| {
+            r.sync_state == pds_core::SyncState::Downloading
+                && db.upload_error("hello.txt").ok().flatten().is_some()
+        })
+    })
+    .await;
+    assert!(!join.is_finished(), "engine exited on a read-only root");
+    assert_eq!(handle.status().await.unwrap().state, EngineState::Running);
+    assert!(!root.join("hello.txt").exists());
+
+    unlock_dir(&root);
+    handle.resume().await.unwrap();
+    wait_for(|| {
+        std::fs::read(root.join("hello.txt")).ok().as_deref() == Some(b"hello drive")
+            && db.node_by_path("hello.txt").ok().flatten().is_some_and(|r| {
+                r.sync_state == pds_core::SyncState::Synced
+            })
+    })
+    .await;
+
+    handle.shutdown().await.unwrap();
+    let result = join.await.unwrap();
+    assert!(result.is_ok(), "engine run returned {result:?}");
+    let _ = mock;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn failed_download_keeps_local_content_and_reports_activity() {
+    // TG-19: an in-place remote update whose download target is denied must
+    // keep the existing local bytes, emit an activity entry, respect backoff,
+    // and recover on resume after permissions are restored.
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let fx = start_with_retry_base(Duration::from_secs(30)).await;
+    let uid = fx
+        .mock
+        .remote_create_file("node-docs", "keep.txt", b"v1");
+    wait_for(|| {
+        std::fs::read(fx.root.join("Documents/keep.txt")).ok().as_deref() == Some(b"v1")
+    })
+    .await;
+    wait_for_synced(&fx.db, "Documents/keep.txt").await;
+
+    let downloads_before = fx.mock.downloaded_uids().len();
+    lock_dir(&fx.root.join("Documents"));
+    let mut activity = fx.handle.subscribe_activity();
+    fx.mock.remote_update_file(&uid, b"v2");
+
+    let item = next_activity(&mut activity, |i| {
+        i.kind == ActivityKind::DownloadErrored && i.path == "Documents/keep.txt"
+    })
+    .await;
+    assert!(
+        item.detail
+            .as_deref()
+            .is_some_and(|d| d.contains("Permission denied")),
+        "detail should name the cause: {item:?}"
+    );
+    // The failed rename never touches the previous file.
+    assert_eq!(
+        std::fs::read(fx.root.join("Documents/keep.txt")).unwrap(),
+        b"v1",
+        "failed download must never truncate existing content"
+    );
+    // 30 s retry base: no retry-storm while the target stays unwritable. The
+    // unwritable target is rejected before the transfer starts.
+    assert_eq!(fx.mock.downloaded_uids().len(), downloads_before);
+    assert_eq!(
+        fx.db.node_by_path("Documents/keep.txt").unwrap().unwrap().sync_state,
+        pds_core::SyncState::Downloading
+    );
+
+    std::fs::set_permissions(
+        fx.root.join("Documents"),
+        std::fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+    fx.handle.resume().await.unwrap();
+    wait_for(|| {
+        std::fs::read(fx.root.join("Documents/keep.txt")).ok().as_deref() == Some(b"v2")
+            && fx
+                .db
+                .node_by_path("Documents/keep.txt")
+                .unwrap()
+                .is_some_and(|r| r.sync_state == pds_core::SyncState::Synced)
+    })
+    .await;
+    assert!(fx.db.upload_error("Documents/keep.txt").unwrap().is_none());
+    fx.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn download_no_space_error_is_surfaced_and_recovers() {
+    // TG-19: local ENOSPC reported through the sidecar's transfer.error path.
+    // Retryable=false on purpose: for a local target error the engine still
+    // backs off and retries once the condition is cleared (resume), instead
+    // of dropping the file or clobbering the old copy.
+    let fx = start_with_retry_base(Duration::from_secs(30)).await;
+    let uid = fx
+        .mock
+        .remote_create_file("node-docs", "disk.txt", b"old bytes");
+    wait_for(|| {
+        std::fs::read(fx.root.join("Documents/disk.txt")).ok().as_deref() == Some(b"old bytes")
+    })
+    .await;
+    wait_for_synced(&fx.db, "Documents/disk.txt").await;
+
+    let downloads_before = fx.mock.downloaded_uids().len();
+    fx.mock.inject_download_failures(
+        &uid,
+        &[(pds_sidecar_client::types::error_codes::INTERNAL, "No space left on device", false)],
+    );
+    let mut activity = fx.handle.subscribe_activity();
+    fx.mock.remote_update_file(&uid, b"new bytes");
+
+    let item = next_activity(&mut activity, |i| {
+        i.kind == ActivityKind::DownloadErrored && i.path == "Documents/disk.txt"
+    })
+    .await;
+    assert!(
+        item.detail
+            .as_deref()
+            .is_some_and(|d| d.contains("No space left on device")),
+        "detail should carry the sidecar error: {item:?}"
+    );
+    assert_eq!(
+        std::fs::read(fx.root.join("Documents/disk.txt")).unwrap(),
+        b"old bytes"
+    );
+    assert_eq!(fx.mock.downloaded_uids().len(), downloads_before + 1);
+
+    fx.handle.resume().await.unwrap();
+    wait_for(|| {
+        std::fs::read(fx.root.join("Documents/disk.txt")).ok().as_deref() == Some(b"new bytes")
+            && fx
+                .db
+                .node_by_path("Documents/disk.txt")
+                .unwrap()
+                .is_some_and(|r| r.sync_state == pds_core::SyncState::Synced)
+    })
+    .await;
+    fx.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn unreadable_local_file_is_errored_without_uploading_empty_content() {
+    // TG-19: a queued local edit whose source becomes unreadable must not
+    // upload an empty/partial revision (which would destroy the remote copy),
+    // must surface an error, and must heal on a fresh edit after chmod.
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let fx = start().await;
+    let path = fx.root.join("secret.txt");
+    std::fs::write(&path, b"remote v1").unwrap();
+    wait_for(|| fx.mock.uploaded_names().iter().any(|n| n == "secret.txt")).await;
+    wait_for_synced(&fx.db, "secret.txt").await;
+    let uid = fx.mock.find_uid("root", "secret.txt").unwrap();
+    let before_sha = fx.db.node_by_path("secret.txt").unwrap().unwrap().sha1;
+
+    fx.handle.pause().await.unwrap();
+    wait_for(|| {
+        futures::executor::block_on(fx.handle.status())
+            .map(|s| s.state == EngineState::Paused)
+            .unwrap_or(false)
+    })
+    .await;
+    std::fs::write(&path, b"local v2").unwrap();
+    wait_for(|| {
+        fx.db.node_by_path("secret.txt").ok().flatten().is_some_and(|r| {
+            r.sync_state == pds_core::SyncState::Dirty && r.sha1 != before_sha
+        })
+    })
+    .await;
+
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let uploads_before = fx.mock.upload_attempts("secret.txt");
+    let mut activity = fx.handle.subscribe_activity();
+    fx.handle.resume().await.unwrap();
+
+    let item = next_activity(&mut activity, |i| {
+        i.kind == ActivityKind::UploadErrored && i.path == "secret.txt"
+    })
+    .await;
+    assert!(
+        item.detail
+            .as_deref()
+            .is_some_and(|d| d.contains("Permission denied")),
+        "detail should name the cause: {item:?}"
+    );
+    assert_eq!(
+        fx.mock.upload_attempts("secret.txt"),
+        uploads_before,
+        "unreadable source must not reach the uploader"
+    );
+    assert_eq!(fx.mock.file_content(&uid).unwrap(), b"remote v1");
+    assert!(fx.db.upload_error("secret.txt").unwrap().is_some());
+
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+    std::fs::write(&path, b"local v3").unwrap();
+    wait_for(|| {
+        fx.mock.file_content(&uid).as_deref() == Some(b"local v3")
+            && fx
+                .db
+                .node_by_path("secret.txt")
+                .unwrap()
+                .is_some_and(|r| r.sync_state == pds_core::SyncState::Synced)
+    })
+    .await;
+    assert!(fx.db.upload_error("secret.txt").unwrap().is_none());
+    fx.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn offline_start_reports_and_retries_until_sidecar_is_reachable() {
+    // TG-22: the sidecar rejects getRoot/enumeration at startup. The engine
+    // must stay alive, report the condition, back off, and converge once the
+    // mock starts succeeding (no exit/panic).
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("sync");
+    std::fs::create_dir_all(&root).unwrap();
+    let (mut client, mock) = MockSidecar::new().connect();
+    mock.fail_get_root(2);
+    mock.fail_list_children(1);
+    let notifications = client.take_notifications();
+    let db_path = root.join(STATE_DIR).join("state.db");
+    let (engine, handle) = Engine::new(
+        Arc::new(client),
+        notifications,
+        EngineConfig {
+            root: root.clone(),
+            db_path,
+            retry_base: Duration::from_millis(10),
+            placeholders: false,
+            eviction_cap: None,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let mut activity = handle.subscribe_activity();
+    let join = tokio::spawn(engine.run());
+
+    let item = next_activity(&mut activity, |i| i.kind == ActivityKind::ConnectionError).await;
+    assert!(
+        item.detail
+            .as_deref()
+            .is_some_and(|d| d.contains("getRoot") || d.contains("listChildren")),
+        "startup failure should be reported: {item:?}"
+    );
+    assert!(!join.is_finished(), "offline start must not exit the run loop");
+
+    wait_for(|| root.join("hello.txt").is_file()).await;
+    assert_eq!(
+        std::fs::read(root.join("hello.txt")).unwrap(),
+        b"hello drive"
+    );
+    assert_eq!(handle.status().await.unwrap().state, EngineState::Running);
+
+    handle.shutdown().await.unwrap();
+    let result = join.await.unwrap();
+    assert!(result.is_ok(), "engine run returned {result:?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn replayed_event_after_reconnect_does_not_duplicate_downloads() {
+    // TG-22: after a stream reconnect the mock replays the last delivered
+    // event (the host cursor did not advance past it). Applying it twice must
+    // not re-download or duplicate the row, and the cursor must keep moving
+    // only over genuinely applied events.
+    let fx = start().await;
+    let downloads_before = fx.mock.downloaded_uids().len();
+    let uid = fx
+        .mock
+        .remote_create_file("root", "reconnect.txt", b"v1");
+    wait_for(|| {
+        std::fs::read(fx.root.join("reconnect.txt")).ok().as_deref() == Some(b"v1")
+    })
+    .await;
+    wait_for_synced(&fx.db, "reconnect.txt").await;
+    let cursor = fx.db.event_cursor("scope-1").unwrap().unwrap();
+    let downloads_after_create = fx.mock.downloaded_uids().len();
+    assert_eq!(downloads_after_create, downloads_before + 1);
+
+    // Replay the exact event the stream ended on, then drive a marker event
+    // through the same FIFO notification channel. Waiting for the marker's
+    // cursor guarantees the replay was fully processed before we touch the
+    // remote again (the mock's getNode would otherwise already show v2).
+    fx.mock.emit_event(&DriveEvent {
+        scope_id: "scope-1".into(),
+        event_id: cursor.clone(),
+        kind: EventKind::NodeCreated,
+        node_uid: Some(uid.clone()),
+        parent_node_uid: Some("root".into()),
+        is_trashed: None,
+    });
+    fx.mock.emit_event(&DriveEvent {
+        scope_id: "scope-1".into(),
+        event_id: "evt-marker".into(),
+        kind: EventKind::FastForward,
+        node_uid: None,
+        parent_node_uid: None,
+        is_trashed: None,
+    });
+    wait_for(|| {
+        fx.db.event_cursor("scope-1").ok().flatten().as_deref() == Some("evt-marker")
+    })
+    .await;
+    assert_eq!(
+        fx.mock.downloaded_uids().len(),
+        downloads_after_create,
+        "a replayed event must not download again"
+    );
+
+    fx.mock.remote_update_file(&uid, b"v2");
+    wait_for(|| {
+        std::fs::read(fx.root.join("reconnect.txt")).ok().as_deref() == Some(b"v2")
+    })
+    .await;
+    wait_for_synced(&fx.db, "reconnect.txt").await;
+
+    assert_eq!(
+        fx.mock.downloaded_uids().len(),
+        downloads_after_create + 1,
+        "the later update downloads exactly once"
+    );
+    let rows: Vec<_> = fx
+        .db
+        .all_nodes()
+        .unwrap()
+        .into_iter()
+        .filter(|r| r.local_path == "reconnect.txt")
+        .collect();
+    assert_eq!(rows.len(), 1, "replay must not duplicate the row");
+    assert_eq!(rows[0].node_uid, uid);
+    assert_ne!(fx.db.event_cursor("scope-1").unwrap().unwrap(), cursor);
+    fx.shutdown().await;
+}
+
 // Helper so tests can use `futures::executor::block_on` without an extra dep.
+
 mod futures {
     pub mod executor {
         pub fn block_on<F: std::future::Future>(f: F) -> F::Output {
