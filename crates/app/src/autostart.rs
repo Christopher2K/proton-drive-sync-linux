@@ -41,17 +41,12 @@ pub fn is_enabled() -> bool {
 
 /// Turn start-at-login on or off, persisting the decision and updating the
 /// XDG entry.
+///
+/// A login start is always `--minimized`: an autostart entry must never open
+/// a dashboard window on its own, whether or not the panel (and therefore the
+/// tray icon) is already up when the session launches us.
 pub fn set_enabled(enabled: bool) -> Result<()> {
-    // Only start without a window at login when the desktop can show the
-    // tray icon; otherwise the user would have no way back to the window.
-    let background = crate::tray::host_available();
-    set_enabled_in(
-        &app_config_dir(),
-        &autostart_dir(),
-        &launch_path()?,
-        enabled,
-        background,
-    )
+    set_enabled_in(&app_config_dir(), &autostart_dir(), &launch_path()?, enabled)
 }
 
 /// First-run setup: install the autostart entry unless the user already
@@ -62,7 +57,6 @@ pub fn set_enabled(enabled: bool) -> Result<()> {
 ///
 /// Called once at startup. Headless/smoke runs skip it.
 pub fn init_on_launch() {
-    let background = crate::tray::host_available();
     let exe = match launch_path() {
         Ok(exe) => exe,
         Err(e) => {
@@ -74,13 +68,12 @@ pub fn init_on_launch() {
     let dir = autostart_dir();
     match read_choice_in(&config) {
         Some(true) => {
-            // Self-heal the entry if a package upgrade removed it. The stored
-            // choice is the source of truth; turning it off in Settings
-            // changes the choice too.
-            if !dir.join(DESKTOP_FILE).is_file()
-                && let Err(e) = install_in(&dir, &exe, background)
-            {
-                warn!("autostart: could not reinstall the login entry: {e:#}");
+            // The entry is app-managed: rewrite it on every launch so an
+            // existing entry picks up `--minimized` (older builds omitted it
+            // when the panel was not visible yet) and the current executable
+            // path.
+            if let Err(e) = install_in(&dir, &exe) {
+                warn!("autostart: could not write the login entry: {e:#}");
             }
         }
         Some(false) => {
@@ -91,17 +84,12 @@ pub fn init_on_launch() {
         }
         None => {
             let default_enabled = !is_dev_build(&exe);
-            if let Err(e) =
-                set_enabled_in(&config, &dir, &exe, default_enabled, background)
-            {
+            if let Err(e) = set_enabled_in(&config, &dir, &exe, default_enabled) {
                 warn!("autostart: first-run setup failed: {e:#}");
                 return;
             }
             if default_enabled {
-                info!(
-                    background,
-                    "autostart: enabled for the next login"
-                );
+                info!("autostart: enabled for the next login");
             }
         }
     }
@@ -159,24 +147,18 @@ fn write_choice_in(config_dir: &Path, enabled: bool) -> Result<()> {
     write_atomic(&path, body.as_bytes())
 }
 
-fn set_enabled_in(
-    config_dir: &Path,
-    dir: &Path,
-    exe: &Path,
-    enabled: bool,
-    background: bool,
-) -> Result<()> {
+fn set_enabled_in(config_dir: &Path, dir: &Path, exe: &Path, enabled: bool) -> Result<()> {
     if enabled {
-        install_in(dir, exe, background)?;
+        install_in(dir, exe)?;
     } else {
         remove_in(dir)?;
     }
     write_choice_in(config_dir, enabled)
 }
 
-fn install_in(dir: &Path, exe: &Path, background: bool) -> Result<()> {
+fn install_in(dir: &Path, exe: &Path) -> Result<()> {
     std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
-    let body = desktop_entry(exe, background);
+    let body = desktop_entry(exe);
     write_atomic(&dir.join(DESKTOP_FILE), body.as_bytes())
 }
 
@@ -200,8 +182,9 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     std::fs::rename(&tmp, path).with_context(|| format!("replace {}", path.display()))
 }
 
-/// The `.desktop` entry launched by the session at login.
-fn desktop_entry(exe: &Path, background: bool) -> String {
+/// The `.desktop` entry launched by the session at login. It always starts
+/// minimized: the login entry must never open a window on its own.
+fn desktop_entry(exe: &Path) -> String {
     format!(
         "[Desktop Entry]\n\
          Type=Application\n\
@@ -209,15 +192,14 @@ fn desktop_entry(exe: &Path, background: bool) -> String {
          Name=Proton Drive Sync\n\
          GenericName=File Synchronizer\n\
          Comment=Background sync with Proton Drive (unofficial)\n\
-         Exec={}{}\n\
+         Exec={} --minimized\n\
          Icon=proton-drive-sync\n\
          Terminal=false\n\
          NoDisplay=true\n\
          X-GNOME-Autostart-enabled=true\n\
          X-GNOME-Autostart-Delay=3\n\
          X-KDE-autostart-after=panel\n",
-        exec_quote(exe),
-        if background { " --minimized" } else { "" }
+        exec_quote(exe)
     )
 }
 
@@ -246,19 +228,32 @@ mod tests {
     }
 
     #[test]
-    fn desktop_entry_launches_in_background_with_quoted_path() {
-        let entry = desktop_entry(Path::new("/home/me/My Apps/proton-drive-sync"), true);
+    fn desktop_entry_launches_minimized_with_quoted_path() {
+        let entry = desktop_entry(Path::new("/home/me/My Apps/proton-drive-sync"));
         assert!(entry.contains(
             "Exec=\"/home/me/My Apps/proton-drive-sync\" --minimized"
         ));
         assert!(entry.contains("Type=Application"));
         assert!(entry.contains("NoDisplay=true"));
         assert!(entry.ends_with('\n'));
+    }
 
-        // Without a tray host the dashboard opens instead of hiding.
-        let visible = desktop_entry(Path::new("/opt/pds/proton-drive-sync"), false);
-        assert!(visible.contains("Exec=\"/opt/pds/proton-drive-sync\"\n"));
-        assert!(!visible.contains("--minimized"));
+    #[test]
+    fn existing_entry_is_upgraded_to_minimized() {
+        let root = temp();
+        let autostart = root.path().join("autostart");
+        std::fs::create_dir_all(&autostart).unwrap();
+        // An entry written by an older build that probed the tray too early:
+        // no --minimized, so it opened the dashboard at login.
+        std::fs::write(
+            autostart.join(DESKTOP_FILE),
+            "[Desktop Entry]\nExec=\"/opt/pds/proton-drive-sync\"\n",
+        )
+        .unwrap();
+
+        install_in(&autostart, Path::new("/opt/pds/proton-drive-sync")).unwrap();
+        let text = std::fs::read_to_string(autostart.join(DESKTOP_FILE)).unwrap();
+        assert!(text.contains("--minimized"));
     }
 
     #[test]
@@ -274,13 +269,13 @@ mod tests {
         let autostart = root.path().join("autostart");
         let exe = Path::new("/opt/pds/proton-drive-sync");
 
-        set_enabled_in(&config, &autostart, exe, true, true).unwrap();
+        set_enabled_in(&config, &autostart, exe, true).unwrap();
         assert!(autostart.join(DESKTOP_FILE).is_file());
         assert_eq!(read_choice_in(&config), Some(true));
         let text = std::fs::read_to_string(autostart.join(DESKTOP_FILE)).unwrap();
         assert!(text.contains("--minimized"));
 
-        set_enabled_in(&config, &autostart, exe, false, true).unwrap();
+        set_enabled_in(&config, &autostart, exe, false).unwrap();
         assert!(!autostart.join(DESKTOP_FILE).is_file());
         assert_eq!(read_choice_in(&config), Some(false));
     }
@@ -291,8 +286,8 @@ mod tests {
         let config = root.path().join("config");
         let autostart = root.path().join("autostart");
         let exe = Path::new("/opt/pds/proton-drive-sync");
-        set_enabled_in(&config, &autostart, exe, false, true).unwrap();
-        set_enabled_in(&config, &autostart, exe, false, true).unwrap();
+        set_enabled_in(&config, &autostart, exe, false).unwrap();
+        set_enabled_in(&config, &autostart, exe, false).unwrap();
         assert_eq!(read_choice_in(&config), Some(false));
     }
 

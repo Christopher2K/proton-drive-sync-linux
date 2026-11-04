@@ -53,14 +53,12 @@ impl AppView {
             let cx = cx.clone();
             async move {
                 while let Some(update) = updates_rx.recv().await {
-                    let quit = cx
-                        .update(|cx| {
-                            this.update(cx, |view, cx| view.apply_update(update, cx))
-                                .unwrap_or(false)
-                        })
-                        .unwrap_or(false);
+                    let quit = cx.update(|cx| {
+                        this.update(cx, |view, cx| view.apply_update(update, cx))
+                            .unwrap_or(false)
+                    });
                     if quit {
-                        let _ = cx.update(|cx| cx.quit());
+                        cx.update(|cx| cx.quit());
                         break;
                     }
                 }
@@ -255,10 +253,10 @@ impl AppView {
 
     /// Close the window. Bound to the titlebar's close button and ctrl-w.
     ///
-    /// Mirrors the window manager's close request: hide to the tray where
-    /// that works (X11 minimize, niri workspace parking — see
-    /// `hide_dashboard`), quit everywhere else. Quitting is only right when
-    /// there is no way back to the window.
+    /// Mirrors the window manager's close request: hide to the tray when a
+    /// tray host can bring the window back (see `hide_dashboard`), quit
+    /// otherwise. Quitting is only right when there is no way back to the
+    /// window.
     pub(crate) fn close_window(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.state.quitting {
             return;
@@ -280,7 +278,7 @@ impl AppView {
             self.send(UiCommand::Shutdown);
             cx.spawn(async move |_this, cx| {
                 cx.background_executor().timer(Duration::from_secs(5)).await;
-                let _ = cx.update(|cx| cx.quit());
+                cx.update(|cx| cx.quit());
             })
             .detach();
         } else {
@@ -1005,29 +1003,24 @@ impl AppView {
 /// Returns whether hiding worked; the caller must quit when it did not,
 /// because there would be no way back to the window.
 ///
-/// X11 window managers own iconification, so minimize is reliable there.
-/// Wayland has no such thing: `xdg_toplevel.set_minimized` is silently
-/// ignored by tiling compositors (niri, sway) and gpui wrongly reports
-/// minimize as supported when the compositor sends no capability list. niri
-/// instead gets the window parked on its trailing workspace through niri's
-/// own IPC socket ([`crate::niri`]), which leaves the process (and syncing)
-/// untouched.
+/// `set_visible(false)` unmaps the toplevel on both Wayland and X11 but
+/// leaves it alive, so the event loop and the sync engine keep running.
+/// This works on tiling compositors without a minimize state (niri, sway)
+/// as well as on desktops that do implement minimize.
+///
+/// Two things must both hold: a tray object was built (otherwise there is no
+/// icon to click even if a host appears later) and a StatusNotifier host is
+/// registered. The startup probe can race the panel, so a "no" from startup
+/// is re-probed here instead of stranding the window.
 pub(crate) fn hide_dashboard(window: &mut Window, cx: &App) -> bool {
-    if !tray_available(cx) {
-        // Without a tray icon there is no way to bring the window back.
+    if cx.try_global::<crate::tray::TrayHolder>().is_none() {
         return false;
     }
-    if cx.compositor_name() == "X11" {
-        window.minimize_window();
-        return true;
+    if !tray_available(cx) && !crate::tray::host_available() {
+        return false;
     }
-    match crate::niri::park() {
-        Ok(()) => true,
-        Err(error) => {
-            warn!("could not park the dashboard off screen: {error:#}");
-            false
-        }
-    }
+    window.set_visible(false);
+    true
 }
 
 /// Whether a StatusNotifier host is registered, i.e. whether the tray icon
