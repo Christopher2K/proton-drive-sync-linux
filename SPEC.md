@@ -41,6 +41,8 @@ Three components:
 
 Login (browser session-fork, 2FA supported) → sync root (default `~/ProtonDrive`) → remote tree materializes → event cursor stored. **First-run rule: an empty local folder is never interpreted as "delete everything."**
 
+**Reserved names:** `.pds` (engine state: SQLite DB, control socket) and `.pds-vfs-backing` (placeholder backing cache) at the sync root are engine-internal. The sync pipeline never uploads, trashes, or adopts them. If a user item uses either name it is left untouched and surfaced **once** as *Skipped* in Activity ("reserved engine-internal name"), never silently invisible.
+
 ### F2 — Upload on new/changed file
 
 Filesystem watcher reports create/close-write → hash → upload via sidecar (SDK handles block splitting/encryption) → SQLite mapping updated. Debounce rapid writes; retry with exponential backoff; resumable block uploads for large files. **M4 ✅:** exponential schedule verified (`base·2ⁿ` capped at 5 min, unit-tested); a server `Retry-After` hint (rate-limit 1003 → `transfer.error.retryAfter`) is honored in place of the computed schedule; explicit resume drops pending backoffs ("try now"); a terminally errored node heals on a fresh local edit.
@@ -51,7 +53,7 @@ Filesystem watcher reports create/close-write → hash → upload via sidecar (S
 
 1. Only propagate deletes for nodes **previously confirmed synced** (present in SQLite). Unknown/never-synced items deleted locally are simply removed locally.
 2. Remote action is always **Trash** (recoverable in Proton Drive), never permanent delete.
-3. **Mass-deletion guard:** >20 deletes or >25% of synced nodes within a short window → auto-pause + user confirmation dialog.
+3. **Mass-deletion guard:** >20 deletes or >25% of synced nodes within a short window → auto-pause + user confirmation dialog. The ratio limb is strict: one delete trips on a 2-node tree (1 > 0.5) but is allowed on a 4-node tree (1 > 1.0). The pause is **durable** (`meta.guard_paused`): a restart comes back guard-paused and requires the same explicit resume before any queued tombstone drains, so a fresh in-memory window can never quietly finish a blocked deletion wave.
 4. Offline deletes are recorded as tombstones and applied on resume/reconnect — same guard applies.
 
 ### F4 — Pause / resume
@@ -78,7 +80,7 @@ Sidecar consumes the SDK event stream; host applies create/update/trash events t
 
 ### F7 — Conflicts
 
-Keep-both: the losing version is renamed `name (conflict YYYY-MM-DD HHmm).ext`; no silent overwrites in either direction.
+Keep-both: the losing version is renamed `name (conflict YYYY-MM-DD HHmm).ext`; no silent overwrites in either direction. If that name (or `… (2)`, `… (3)`, …) is already taken by a user file or another conflict copy, the next free sibling is used — the search advances monotonically and never reuses or overwrites an existing path, including when the conflicting item's own name already looks like a conflict copy.
 
 ### F8 — Background service, start at login, tray (M5 ✅ 2026-10-31)
 
@@ -147,4 +149,5 @@ A tray icon mirrors the engine state and offers Open Dashboard / Pause-Resume / 
 
 - ~~FUSE mountpoint UX: M3.1 ships the **parallel mount** (`pds mount <folder> <mountpoint>`); whether to also bind-mount into the real root is deferred until desktop-app UX decides where users look for files.~~ **Resolved (M3.4):** the desktop app mounts the placeholder view **at the sync root** and keeps all engine state (SQLite, backing cache) in `$XDG_DATA_HOME/proton-drive-sync/roots/<hash>/` outside it; the parallel `pds mount` remains for CLI use.
 - ~~FUSE write-through (M3.2): direct vs through-the-watcher~~ **Resolved (M3.2):** neither — the VFS queues writes in the engine↔VFS `Store` (`record_write`/`record_mkdir`/`record_delete`) and the engine's main loop drains them through the same upload/delete machinery the watcher uses (F7 precondition, retries, pause buffering). No watcher noise from the backing dir; no duplicate dedup logic in the FUSE layer.
+- ~~Local name/path fidelity: how to treat case-only renames and names the filesystem cannot hold~~ **Resolved (TG-12/TG-14):** a case-only local rename reuses the node identity (filesystem inode pairing), so it mirrors as a rename instead of trash + re-upload. Folder depth is not artificially capped; the OS `PATH_MAX`/`NAME_MAX` are the boundary, and a remote path beyond them is surfaced once as a `Skipped` activity and left out of the mirror — no partial directory chain and no retry loop, while the rest of the sync continues.
 - Exact mass-deletion guard thresholds after real-world usage data.

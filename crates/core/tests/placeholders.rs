@@ -268,6 +268,63 @@ async fn hydrate_request_downloads_to_backing() {
     fx.shutdown().await;
 }
 
+// TG-09: a remote 0-byte file is a valid placeholder. Hydration must finish
+// immediately (content_ready + finish_hydrate), not be mistaken for "not
+// hydrated" and hang, and a second hydrate after eviction must work again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn empty_remote_file_placeholder_hydrates_and_rehydrates() {
+    let fx = start().await;
+    let uid = fx.mock.remote_create_file("root", "empty.txt", b"");
+    wait_for(|| fx.store.snapshot().by_path.contains_key("empty.txt")).await;
+
+    {
+        let snap = fx.store.snapshot();
+        let node = &snap.by_path["empty.txt"];
+        assert!(!node.is_dir);
+        assert_eq!(node.size, 0, "snapshot reports the remote size (zero)");
+        assert!(!node.content_ready, "not hydrated yet");
+    }
+
+    // First open: hydration must complete, not wait forever on a 0-byte file.
+    assert!(fx.store.begin_hydrate("empty.txt"));
+    wait_for(|| fx.store.snapshot().by_path["empty.txt"].content_ready).await;
+    wait_for(|| fx.store.hydrating_count() == 0).await;
+    let backing = fx
+        .store
+        .backing_path("empty.txt")
+        .expect("backing file registered");
+    assert_eq!(std::fs::metadata(&backing).unwrap().len(), 0);
+    assert_eq!(std::fs::read(&backing).unwrap(), Vec::<u8>::new());
+
+    // Force an eviction: hydrate the non-empty neighbour so bytes are over
+    // the cap, then shrink the cap to zero. The empty placeholder must drop
+    // out of the ready state like any other file.
+    assert!(fx.store.begin_hydrate("hello.txt"));
+    wait_for(|| fx.store.snapshot().by_path["hello.txt"].content_ready).await;
+    fx.handle.set_cache_cap(Some(0)).await.unwrap();
+    wait_for(|| !fx.store.snapshot().by_path["empty.txt"].content_ready).await;
+    assert!(!backing.exists(), "backing content evicted");
+
+    // Second open after eviction: rehydrate to the same empty content.
+    fx.handle.set_cache_cap(None).await.unwrap();
+    assert!(fx.store.begin_hydrate("empty.txt"));
+    wait_for(|| fx.store.snapshot().by_path["empty.txt"].content_ready).await;
+    wait_for(|| fx.store.hydrating_count() == 0).await;
+    let backing = fx.store.backing_path("empty.txt").unwrap();
+    assert_eq!(std::fs::read(&backing).unwrap(), Vec::<u8>::new());
+    assert_eq!(
+        fx.mock
+            .downloaded_uids()
+            .iter()
+            .filter(|u| *u == &uid)
+            .count(),
+        2,
+        "one download per hydration"
+    );
+    fx.shutdown().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
 async fn bare_mkdir_from_vfs_creates_remote_folder_and_rmdir_trashes_it() {
@@ -732,6 +789,66 @@ async fn evicted_placeholder_rehydrates_on_request() {
     fx.shutdown().await;
 }
 
+/// TG-27: an open FUSE/store handle protects a file from eviction even when
+/// the cap shrinks below current usage; once released, the next pass evicts
+/// it to a placeholder and rehydration returns the same bytes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn open_handle_survives_eviction_and_evicts_after_release() {
+    let fx = start_with_cap(None).await;
+    wait_for(|| fx.store.snapshot().by_path.contains_key("hello.txt")).await;
+
+    // Simulate the FUSE open path: track the handle BEFORE hydration so the
+    // first eviction pass already sees it as open.
+    fx.store.add_open_handle("hello.txt");
+    assert!(fx.store.begin_hydrate("hello.txt"));
+    wait_for(|| {
+        fx.store
+            .backing_path("hello.txt")
+            .is_some_and(|p| std::fs::read(p).ok().as_deref() == Some(b"hello drive".as_slice()))
+    })
+    .await;
+
+    fx.handle.set_cache_cap(Some(1)).await.unwrap();
+    // The cap is exceeded but the only candidate is open: the pass skips it
+    // and returns (no hot loop). Give a spin a chance to show up, then
+    // assert the engine still answers and the content is intact.
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    let st = fx.handle.status().await.unwrap();
+    assert_eq!(st.state, EngineState::Running);
+    assert_eq!(st.cache_cap, Some(1));
+    assert!(st.cache_used > 1);
+    assert!(
+        fx.store
+            .backing_path("hello.txt")
+            .is_some_and(|p| p.is_file()),
+        "open file must stay hydrated even over the cap"
+    );
+
+    fx.store.remove_open_handle("hello.txt");
+    // Same-cap command re-runs the eviction pass immediately.
+    fx.handle.set_cache_cap(Some(1)).await.unwrap();
+    wait_for(|| fx.store.backing_path("hello.txt").is_none()).await;
+    wait_for(|| {
+        fx.store
+            .snapshot()
+            .by_path
+            .get("hello.txt")
+            .is_some_and(|n| !n.content_ready)
+    })
+    .await;
+    assert!(fx.mock.trashed_uids().is_empty(), "eviction must not trash");
+
+    fx.store.begin_hydrate("hello.txt");
+    wait_for(|| {
+        fx.store
+            .backing_path("hello.txt")
+            .is_some_and(|p| std::fs::read(p).ok().as_deref() == Some(b"hello drive".as_slice()))
+    })
+    .await;
+    fx.shutdown().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
 async fn remote_folder_rename_moves_hydrated_backing_subtree() {
@@ -946,6 +1063,77 @@ async fn placeholder_folder_delete_trashes_once_and_leaves_snapshot() {
     fx.shutdown().await;
 }
 
+// TG-24 (placeholder mode): deletes recorded through the mount/store go
+// through the same mass-delete guard as watcher deletes, and one explicit
+// resume approves the pending batch.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn placeholder_mass_delete_guard_trips_and_one_resume_drains() {
+    let fx = start().await;
+    for i in 0..40 {
+        fx.mock
+            .remote_create_file("root", &format!("f{i:02}.txt"), b"filler");
+    }
+    wait_for(|| fx.store.snapshot().by_path.contains_key("f39.txt")).await;
+    let synced = fx.db.count_synced().unwrap();
+    assert!(synced >= 42, "expected 40 fillers + defaults, got {synced}");
+
+    // Record all deletes while paused so the guard sees the whole wave.
+    fx.handle.pause().await.unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while fx.handle.status().await.unwrap().state != EngineState::Paused {
+        assert!(Instant::now() < deadline, "engine did not pause");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    for i in 0..15 {
+        fx.store.record_delete(&format!("f{i:02}.txt"));
+    }
+    wait_for(|| fx.db.tombstones().map(|t| t.len() == 15).unwrap_or(false)).await;
+    fx.handle.resume().await.unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if fx.handle.status().await.unwrap().state == EngineState::GuardPaused {
+            break;
+        }
+        assert!(Instant::now() < deadline, "guard never tripped");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let trashed_at_trip = fx.mock.trashed_uids().len();
+    assert!(
+        trashed_at_trip < 15,
+        "guard must stop the placeholder delete wave: {trashed_at_trip} already trashed"
+    );
+    let pending = fx.db.tombstones().unwrap().len();
+    assert!(pending > 0);
+    assert_eq!(trashed_at_trip + pending, 15);
+
+    // Explicit resume approves exactly the pending batch; nothing lost.
+    fx.handle.resume().await.unwrap();
+    wait_for(|| fx.mock.trashed_uids().len() == 15).await;
+    wait_for(|| fx.db.tombstones().map(|t| t.is_empty()).unwrap_or(false)).await;
+    assert_eq!(
+        fx.handle.status().await.unwrap().state,
+        EngineState::Running
+    );
+    let snapshot = fx.store.snapshot();
+    for i in 0..15 {
+        let path = format!("f{i:02}.txt");
+        assert!(
+            !snapshot.by_path.contains_key(&path),
+            "{path} must be gone after resume"
+        );
+    }
+    for i in 15..40 {
+        let path = format!("f{i:02}.txt");
+        assert!(
+            snapshot.by_path.contains_key(&path),
+            "{path} was not deleted and must remain"
+        );
+    }
+    fx.shutdown().await;
+}
+
 // TG-08 (placeholder mode): the trashed row leaves the snapshot; restore
 // recreates the row and a hydratable placeholder at the original path.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1154,6 +1342,70 @@ async fn executable_bit_survives_evict_and_rehydrate() {
     .await;
     let backing = fx.store.backing_path("script.sh").unwrap();
     wait_for(|| mode_of(&backing) == Some(0o755)).await;
+}
+
+// ---------------------------------------------------------------------------
+// TG-13 (placeholder mode): the snapshot keys, node names, DB paths, and
+// backing-cache filenames all agree byte-for-byte with odd-but-legal remote
+// names (NFC/NFD are distinct, emoji, quotes, newline, trailing dot/space).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn unusual_names_are_identical_in_snapshot_db_and_backing_cache() {
+    const NAMES: &[&str] = &[
+        "caf\u{e9}.txt",
+        "cafe\u{301}.txt",
+        "rocket \u{1f680}.txt",
+        "with space.txt",
+        "it's \"quoted\".txt",
+        "line\nbreak.txt",
+        "trailing dot.",
+        "trailing space ",
+        "~leading.txt",
+    ];
+    let fx = start().await;
+    wait_for(|| fx.store.snapshot().by_path.contains_key("hello.txt")).await;
+    for name in NAMES {
+        fx.mock
+            .remote_create_file("root", name, format!("remote:{name}").as_bytes());
+    }
+    let db = pds_core::Db::open(&fx.root.join(STATE_DIR).join("state.db")).unwrap();
+    for name in NAMES {
+        // Snapshot and row are published separately; wait for both so the
+        // lookups below cannot observe the download mid-flight.
+        wait_for(|| {
+            fx.store.snapshot().by_path.contains_key(*name)
+                && db.node_by_path(name).ok().flatten().is_some()
+        })
+        .await;
+        let node = &fx.store.snapshot().by_path[*name];
+        assert_eq!(node.rel, *name);
+        assert_eq!(node.name, *name);
+        assert_eq!(node.parent, "");
+        assert!(!node.is_dir);
+    }
+    for name in NAMES {
+        let row = db
+            .node_by_path(name)
+            .unwrap()
+            .unwrap_or_else(|| panic!("missing DB row for {name:?}"));
+        assert_eq!(row.local_path, *name);
+        assert_eq!(row.name, *name);
+        // Hydration writes the backing file under the same exact name.
+        assert!(fx.store.begin_hydrate(name));
+    }
+    for name in NAMES {
+        wait_for(|| {
+            fx.store
+                .backing_path(name)
+                .map(|p| std::fs::read(p).ok().as_deref()
+                    == Some(format!("remote:{name}").as_bytes()))
+                .unwrap_or(false)
+        })
+        .await;
+        let backing = fx.store.backing_path(name).unwrap();
+        assert_eq!(backing.file_name().unwrap().to_string_lossy(), *name);
+    }
+    assert!(fx.mock.trashed_uids().is_empty());
     fx.shutdown().await;
 }
 

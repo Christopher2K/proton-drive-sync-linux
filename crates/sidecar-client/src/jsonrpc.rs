@@ -6,8 +6,8 @@
 use std::collections::HashMap;
 use std::io;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
@@ -61,6 +61,9 @@ impl Error {
 struct Shared {
     pending: Mutex<HashMap<u64, oneshot::Sender<Result<Value, RpcError>>>>,
     next_id: AtomicU64,
+    /// Set by the read loop once the stream is gone. Checked under the
+    /// `pending` lock so a request cannot slip in after the drain.
+    closed: AtomicBool,
 }
 
 /// An async JSON-RPC 2.0 client. Cheap to clone; calls may be made
@@ -83,6 +86,7 @@ impl JsonRpcClient {
         let shared = Arc::new(Shared {
             pending: Mutex::new(HashMap::new()),
             next_id: AtomicU64::new(1),
+            closed: AtomicBool::new(false),
         });
         let (write_tx, write_rx) = mpsc::channel::<String>(256);
         let (notif_tx, notif_rx) = mpsc::channel::<Notification>(256);
@@ -97,7 +101,15 @@ impl JsonRpcClient {
     pub async fn call(&self, method: &str, params: Value) -> Result<Value, Error> {
         let id = self.shared.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
-        self.shared.pending.lock().await.insert(id, tx);
+        {
+            let mut pending = self.shared.pending.lock().await;
+            // The read loop is gone: nobody will ever answer this request.
+            // Registering it after the EOF drain would hang forever.
+            if self.shared.closed.load(Ordering::SeqCst) {
+                return Err(Error::Closed);
+            }
+            pending.insert(id, tx);
+        }
 
         let line = serde_json::json!({
             "jsonrpc": "2.0",
@@ -157,7 +169,10 @@ async fn read_loop<R: AsyncRead + Unpin>(
             }
         }
     }
-    // Fail every pending request so callers don't hang.
+    // Fail every pending request so callers don't hang. Set `closed` first:
+    // a `call` either registered before this (and is drained below) or sees
+    // the flag under the same lock and fails immediately.
+    shared.closed.store(true, Ordering::SeqCst);
     let mut pending = shared.pending.lock().await;
     for (_, tx) in pending.drain() {
         let _ = tx.send(Err(RpcError {
