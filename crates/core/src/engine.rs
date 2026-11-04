@@ -604,7 +604,7 @@ impl<S: SidecarApi + 'static> Engine<S> {
         // 3. Crash recovery (M4): transfers interrupted by a previous run
         // leave rows stuck in `Uploading` (never drained: upload_one
         // requires Dirty) and `.pds-part` temps in the backing dir.
-        if let Err(e) = self.recover_interrupted_transfers() {
+        if let Err(e) = self.recover_interrupted_transfers().await {
             warn!(error = %e, "interrupted-transfer recovery failed");
         }
 
@@ -656,14 +656,18 @@ impl<S: SidecarApi + 'static> Engine<S> {
     ///   retries, pause buffering). A crash AFTER the transfer landed
     ///   remotely but before bookkeeping re-runs `check_remote_head`,
     ///   which keeps BOTH versions instead of silently superseding.
+    /// - Rows stuck in `Downloading` are re-fetched and downloaded again
+    ///   from the current remote head (TG-17). The final path was never
+    ///   renamed into place, so no partial bytes are trusted.
     /// - Stale `*.pds-part` transfer temps (upload scratch in the visible
     ///   root, hydration scratch in the backing dir) are deleted; a
     ///   half-written temp has no consistent content to resume from.
     ///
     /// In placeholder mode recovered rows upload from the backing dir via
     /// `content_root`, same as any other dirty file.
-    fn recover_interrupted_transfers(&mut self) -> Result<()> {
+    async fn recover_interrupted_transfers(&mut self) -> Result<()> {
         let stuck = self.db.nodes_with_state(SyncState::Uploading)?;
+        let interrupted_downloads = self.db.nodes_with_state(SyncState::Downloading)?;
         for row in stuck {
             // The file must still exist locally; if the user (or a crash
             // during a VFS unlink) removed it, the delete path owns the
@@ -710,6 +714,19 @@ impl<S: SidecarApi + 'static> Engine<S> {
                         debug!(path = %path.display(), "swept stale transfer temp");
                     }
                 }
+            }
+        }
+        // Re-download AFTER the sweep so a stale temp can never be mistaken
+        // for the recovered content. `download_file` re-reads the node, so
+        // the freshest remote bytes win over the interrupted attempt.
+        for row in interrupted_downloads {
+            warn!(path = %row.local_path, "recovering download interrupted by a previous run");
+            if let Err(e) = self.download_file(&row.node_uid, &row.local_path).await {
+                warn!(
+                    path = %row.local_path,
+                    error = %e,
+                    "interrupted download recovery failed; a later event will retry"
+                );
             }
         }
         Ok(())
@@ -2962,10 +2979,60 @@ impl<S: SidecarApi + 'static> Engine<S> {
         let node = self.sidecar.get_node(uid).await.ok();
         let tmp_rel = format!("{rel}.pds-part");
         let tmp = self.content_path(&tmp_rel);
+
+        // Persist the download intent BEFORE the transfer (TG-17): an
+        // interrupted transfer must leave a recoverable row, never a row that
+        // claims to be Synced with a hash whose bytes never landed. A path
+        // with no row yet (remote create event) gets one so a crash is just
+        // as recoverable.
+        let mut prior_state = None;
+        let mut created_row = false;
+        match self.db.node_by_path(rel)? {
+            Some(row) if row.node_uid == uid => {
+                prior_state = Some(row.sync_state);
+                self.db.set_sync_state(rel, SyncState::Downloading)?;
+            }
+            Some(_) => {} // another node owns this path; collision handling ran first
+            None => {
+                if let Some(node) = &node {
+                    self.db.upsert_node(&NodeRow {
+                        local_path: rel.to_string(),
+                        node_uid: uid.to_string(),
+                        parent_uid: node.parent_uid.clone(),
+                        name: rel.rsplit('/').next().unwrap_or(rel).to_string(),
+                        kind: NodeKind::File,
+                        size: node.size,
+                        sha1: node.sha1.clone(),
+                        mtime: node.mtime,
+                        sync_state: SyncState::Downloading,
+                        pinned: false,
+                        synced_sha1: node.sha1.clone(),
+                    })?;
+                    created_row = true;
+                }
+            }
+        }
+
         let sidecar = Arc::clone(&self.sidecar);
-        let outcome = self
+        let outcome = match self
             .run_transfer("download", Some(rel), sidecar.download(uid, &tmp))
-            .await?;
+            .await
+        {
+            Ok(outcome) => outcome,
+            Err(e) => {
+                // A live failure restores the previous state so reconciliation
+                // can retry later; a shutdown leaves `Downloading` for startup
+                // recovery to finish.
+                if !self.shutting_down {
+                    if let Some(state) = prior_state {
+                        self.db.set_sync_state(rel, state)?;
+                    } else if created_row {
+                        self.db.remove_node(rel)?;
+                    }
+                }
+                return Err(e.into());
+            }
+        };
         let _ = outcome;
         std::fs::rename(&tmp, &abs)?;
         self.db.upsert_node(&NodeRow {

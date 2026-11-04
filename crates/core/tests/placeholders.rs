@@ -253,6 +253,63 @@ async fn hydrate_request_downloads_to_backing() {
     fx.shutdown().await;
 }
 
+// TG-09: a remote 0-byte file is a valid placeholder. Hydration must finish
+// immediately (content_ready + finish_hydrate), not be mistaken for "not
+// hydrated" and hang, and a second hydrate after eviction must work again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn empty_remote_file_placeholder_hydrates_and_rehydrates() {
+    let fx = start().await;
+    let uid = fx.mock.remote_create_file("root", "empty.txt", b"");
+    wait_for(|| fx.store.snapshot().by_path.contains_key("empty.txt")).await;
+
+    {
+        let snap = fx.store.snapshot();
+        let node = &snap.by_path["empty.txt"];
+        assert!(!node.is_dir);
+        assert_eq!(node.size, 0, "snapshot reports the remote size (zero)");
+        assert!(!node.content_ready, "not hydrated yet");
+    }
+
+    // First open: hydration must complete, not wait forever on a 0-byte file.
+    assert!(fx.store.begin_hydrate("empty.txt"));
+    wait_for(|| fx.store.snapshot().by_path["empty.txt"].content_ready).await;
+    wait_for(|| fx.store.hydrating_count() == 0).await;
+    let backing = fx
+        .store
+        .backing_path("empty.txt")
+        .expect("backing file registered");
+    assert_eq!(std::fs::metadata(&backing).unwrap().len(), 0);
+    assert_eq!(std::fs::read(&backing).unwrap(), Vec::<u8>::new());
+
+    // Force an eviction: hydrate the non-empty neighbour so bytes are over
+    // the cap, then shrink the cap to zero. The empty placeholder must drop
+    // out of the ready state like any other file.
+    assert!(fx.store.begin_hydrate("hello.txt"));
+    wait_for(|| fx.store.snapshot().by_path["hello.txt"].content_ready).await;
+    fx.handle.set_cache_cap(Some(0)).await.unwrap();
+    wait_for(|| !fx.store.snapshot().by_path["empty.txt"].content_ready).await;
+    assert!(!backing.exists(), "backing content evicted");
+
+    // Second open after eviction: rehydrate to the same empty content.
+    fx.handle.set_cache_cap(None).await.unwrap();
+    assert!(fx.store.begin_hydrate("empty.txt"));
+    wait_for(|| fx.store.snapshot().by_path["empty.txt"].content_ready).await;
+    wait_for(|| fx.store.hydrating_count() == 0).await;
+    let backing = fx.store.backing_path("empty.txt").unwrap();
+    assert_eq!(std::fs::read(&backing).unwrap(), Vec::<u8>::new());
+    assert_eq!(
+        fx.mock
+            .downloaded_uids()
+            .iter()
+            .filter(|u| *u == &uid)
+            .count(),
+        2,
+        "one download per hydration"
+    );
+    fx.shutdown().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
 async fn bare_mkdir_from_vfs_creates_remote_folder_and_rmdir_trashes_it() {
