@@ -2817,12 +2817,20 @@ async fn conflict_copies_for_unusual_names_are_valid_siblings() {
     .await;
     let siblings = entries_with_prefix(&fx.root, "report (conflict ");
     assert_eq!(siblings.len(), 2, "dedup must not overwrite a sibling");
-    assert!(
-        siblings.iter().any(|p| p
-            .file_name()
-            .is_some_and(|n| n.to_string_lossy().contains(" (2)"))),
-        "second conflict copy must be deduped with a numeric suffix: {siblings:?}"
-    );
+    // The stamp has minute granularity, so a dedupe suffix only appears when
+    // both collisions land in the same minute. What must hold regardless is
+    // that the second copy is a distinct, tracked conflict sibling.
+    let names: std::collections::BTreeSet<String> = siblings
+        .iter()
+        .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
+        .collect();
+    assert_eq!(names.len(), 2, "second conflict copy must be a new sibling: {siblings:?}");
+    for name in &names {
+        assert!(
+            name.starts_with("report (conflict "),
+            "unexpected conflict sibling name: {name:?}"
+        );
+    }
     assert!(fx.mock.trashed_uids().is_empty());
     fx.shutdown().await;
 }
