@@ -44,6 +44,9 @@ const TTL: Duration = Duration::from_secs(1);
 /// Write-overlay inodes start here (snapshot inos grow from 3; a session
 /// would need millions of nodes to collide).
 const OVERLAY_INO_BASE: u64 = 1 << 40;
+/// Chunk size for `copy_file_range`: bounds one buffer while a large
+/// server-side copy streams; typical CAD files fit in a single chunk.
+const COPY_CHUNK: u64 = 1 << 20;
 
 pub struct PdsFs {
     tree: Tree,
@@ -576,6 +579,7 @@ impl fuser::Filesystem for PdsFs {
             // the fd points at nothing yet — wait here (bounded) so writes
             // land on real content.
             let Some(file) = self.open_backing_rw(&rel) else {
+                warn!(path = %rel, "open: backing file unavailable for writable handle");
                 return reply.error(Errno::EIO);
             };
             let fh = self
@@ -623,6 +627,7 @@ impl fuser::Filesystem for PdsFs {
         reply: ReplyData,
     ) {
         let Some(rel) = self.rel_of_any(ino) else {
+            warn!(ino = ino.0, "read: unknown inode");
             return reply.error(Errno::ENOENT);
         };
         // LRU touch on every read pass (cheap; open() covers the cold case).
@@ -630,24 +635,30 @@ impl fuser::Filesystem for PdsFs {
             self.store.record_access(&rel);
         }
         let Some((is_dir, node_size, _mtime, _ready)) = self.node_meta(&rel) else {
+            warn!(ino = ino.0, path = %rel, "read: path vanished from the served tree");
             return reply.error(Errno::ENOENT);
         };
         if is_dir {
             return reply.error(Errno::EISDIR);
         }
         let Some(mut file) = self.wait_for_backing(&rel) else {
+            warn!(path = %rel, offset, "read: backing unavailable (hydration failed)");
             return reply.error(Errno::EIO);
         };
         if offset >= node_size {
             return reply.data(&[]);
         }
         if file.seek(SeekFrom::Start(offset)).is_err() {
+            warn!(path = %rel, offset, "read: backing seek failed");
             return reply.error(Errno::EIO);
         }
         let mut buf = vec![0u8; size as usize];
         match file.read(&mut buf) {
             Ok(n) => reply.data(&buf[..n]),
-            Err(_) => reply.error(Errno::EIO),
+            Err(e) => {
+                warn!(error = %e, path = %rel, offset, "read: backing read failed");
+                reply.error(Errno::EIO)
+            }
         }
     }
 
@@ -665,12 +676,14 @@ impl fuser::Filesystem for PdsFs {
     ) {
         let handles = self.handles.lock().expect("handles mutex");
         let Some(handle) = handles.get(&fh.0) else {
+            warn!(fh = fh.0, "write: unknown file handle");
             return reply.error(Errno::EIO);
         };
         let handle_rel = handle.rel.clone();
         let mut file = handle.file.try_clone().expect("file clone");
         drop(handles);
         if file.seek(SeekFrom::Start(offset)).is_err() {
+            warn!(path = %handle_rel, offset, "write: backing seek failed");
             return reply.error(Errno::EIO);
         }
         match file.write_all(data) {
@@ -698,6 +711,127 @@ impl fuser::Filesystem for PdsFs {
                 reply.error(Errno::EIO)
             }
         }
+    }
+
+    /// Server-side copy for same-mount ranges (`fs.copyFile`, `cp` with
+    /// `copy_file_range(2)`). fuser's default replies ENOSYS, which makes
+    /// the kernel fall back to a splice copy that reads from and writes to
+    /// this daemon — workable, but it routes the copy through the kernel's
+    /// page cache and inode-size bookkeeping, which paired badly with the
+    /// 1 s attribute TTL (observed in production: intermittent EIO and a
+    /// silently truncated 0-byte copy from an app that saves via
+    /// `copyFile`). Handling it here copies backing file → backing file
+    /// with an exact byte count.
+    fn copy_file_range(
+        &self,
+        _req: &Request,
+        ino_in: INodeNo,
+        _fh_in: FileHandle,
+        offset_in: u64,
+        _ino_out: INodeNo,
+        fh_out: FileHandle,
+        offset_out: u64,
+        len: u64,
+        _flags: fuser::CopyFileRangeFlags,
+        reply: fuser::ReplyWrite,
+    ) {
+        let Some(rel_in) = self.rel_of_any(ino_in) else {
+            return reply.error(Errno::ENOENT);
+        };
+        // The destination handle is authoritative for the path — its inode
+        // may already have been recycled by a rename, same rationale as
+        // `release`. A writable open always allocates a handle (fh ≥ 1);
+        // fh 0 is the read-open marker and cannot be a copy destination.
+        let (rel_out, mut dst) = {
+            let handles = self.handles.lock().expect("handles mutex");
+            let Some(handle) = handles.get(&fh_out.0) else {
+                warn!(
+                    fh = fh_out.0,
+                    "copy_file_range: no write handle for destination"
+                );
+                return reply.error(Errno::EIO);
+            };
+            match handle.file.try_clone() {
+                Ok(f) => (handle.rel.clone(), f),
+                Err(e) => {
+                    warn!(error = %e, path = %handle.rel, "copy_file_range: destination clone failed");
+                    return reply.error(Errno::EIO);
+                }
+            }
+        };
+        let Some((src_is_dir, src_size, _mtime, _ready)) = self.node_meta(&rel_in) else {
+            return reply.error(Errno::ENOENT);
+        };
+        if src_is_dir {
+            return reply.error(Errno::EISDIR);
+        }
+        let Some(mut src) = self.wait_for_backing(&rel_in) else {
+            warn!(path = %rel_in, "copy_file_range: source backing unavailable");
+            return reply.error(Errno::EIO);
+        };
+        if src.seek(SeekFrom::Start(offset_in)).is_err() {
+            warn!(path = %rel_in, offset = offset_in, "copy_file_range: source seek failed");
+            return reply.error(Errno::EIO);
+        }
+        // Copy at most what the source advertises. A backing file shorter
+        // than its snapshot size ends the copy early — a short result is
+        // valid for copy_file_range, not an error (the kernel truncates
+        // the destination to `written`).
+        let mut remaining = len.min(src_size.saturating_sub(offset_in));
+        let mut written = 0u64;
+        let mut buf = vec![0u8; COPY_CHUNK.min(remaining.max(1)) as usize];
+        while remaining > 0 {
+            let want = remaining.min(COPY_CHUNK) as usize;
+            let n = match src.read(&mut buf[..want]) {
+                Ok(0) => break,
+                Ok(n) => n,
+                Err(e) => {
+                    warn!(error = %e, path = %rel_in, "copy_file_range: source read failed");
+                    return reply.error(Errno::EIO);
+                }
+            };
+            if dst.seek(SeekFrom::Start(offset_out + written)).is_err() {
+                warn!(
+                    path = %rel_out,
+                    offset = offset_out + written,
+                    "copy_file_range: destination seek failed"
+                );
+                return reply.error(Errno::EIO);
+            }
+            if let Err(e) = dst.write_all(&buf[..n]) {
+                warn!(error = %e, path = %rel_out, "copy_file_range: destination write failed");
+                return reply.error(Errno::EIO);
+            }
+            if let Some(h) = self
+                .handles
+                .lock()
+                .expect("handles mutex")
+                .get_mut(&fh_out.0)
+            {
+                h.dirty = true;
+            }
+            written += n as u64;
+            remaining -= n as u64;
+        }
+        // Keep an overlay destination's size current while open, exactly
+        // like `write` does (revision handles keep the snapshot size).
+        if let Ok(meta) = dst.metadata()
+            && let Some(entry) = self
+                .overlay
+                .lock()
+                .expect("overlay mutex")
+                .by_rel
+                .get_mut(&rel_out)
+        {
+            entry.size = entry.size.max(meta.len());
+        }
+        debug!(
+            from = %rel_in,
+            to = %rel_out,
+            bytes = written,
+            "copy_file_range: server-side copy"
+        );
+        reply.written(written as u32);
     }
 
     fn flush(
@@ -1183,6 +1317,7 @@ impl fuser::Filesystem for PdsFs {
                 // Placeholder content: hydrate first (bounded wait) so the
                 // truncate lands on real content, not a missing file.
                 if self.wait_for_backing(&rel).is_none() {
+                    warn!(path = %rel, "truncate: backing hydration failed");
                     return reply.error(Errno::EIO);
                 }
                 self.store.record_access(&rel);

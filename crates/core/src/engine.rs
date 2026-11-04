@@ -26,7 +26,7 @@ use pds_sidecar_client::{
     DriveEvent, EventKind, Node, NodeKind, Notification, SidecarApi, UploadParams,
 };
 use tokio::sync::{broadcast, mpsc, oneshot};
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::conflict::conflict_name;
 use crate::db::{Db, NodeRow, SyncState, Tombstone};
@@ -362,6 +362,26 @@ fn is_revision_conflict(code: i64, message: &str) -> bool {
         || message
             .to_ascii_lowercase()
             .contains("no longer up to date")
+}
+
+/// True for the "destination name already exists remotely" rename class:
+/// the SDK's `NodeWithSameNameExistsValidationError` maps to 1005
+/// (`CONFLICT`), while the raw-`ApiError` path surfaces the same text as
+/// 1099 (`INTERNAL`; `toRpcError` keeps the message). Retrying cannot
+/// heal this alone — the remote name has to free up first — so the store
+/// counts these toward its retry cap instead of re-queueing forever.
+fn is_rename_name_conflict(e: &anyhow::Error) -> bool {
+    use pds_sidecar_client::jsonrpc::Error as Rpc;
+    e.chain()
+        .find_map(|c| c.downcast_ref::<Rpc>())
+        .is_some_and(|rpc| match rpc {
+            Rpc::Rpc(r) => {
+                r.code == pds_sidecar_client::types::error_codes::CONFLICT
+                    || (r.code == pds_sidecar_client::types::error_codes::INTERNAL
+                        && r.message.to_ascii_lowercase().contains("already exists"))
+            }
+            _ => false,
+        })
 }
 
 pub struct Engine<S: SidecarApi> {
@@ -769,11 +789,27 @@ impl<S: SidecarApi + 'static> Engine<S> {
                         continue;
                     }
                     Some(WorkRequest::Rename(old, new)) => {
-                        if let Err(e) = self.apply_local_rename(&store, &old, &new).await {
-                            warn!(from = %old, to = %new, error = %e, "write-through rename failed");
-                            store.finish_rename(&old, &new, false);
-                        } else {
-                            store.finish_rename(&old, &new, true);
+                        match self.apply_local_rename(&store, &old, &new).await {
+                            Ok(()) => {
+                                store.finish_rename(&old, &new, true, false);
+                            }
+                            Err(e) => {
+                                warn!(from = %old, to = %new, error = %e, "write-through rename failed");
+                                // A name conflict re-queues a few times and is
+                                // then dropped: renames drain before pump_work,
+                                // so retrying one forever would starve the very
+                                // tombstone drain (dest trash) that frees the
+                                // remote name.
+                                let permanent = is_rename_name_conflict(&e);
+                                if !store.finish_rename(&old, &new, false, permanent) {
+                                    error!(
+                                        from = %old,
+                                        to = %new,
+                                        attempts = crate::store::RENAME_MAX_CONFLICT_RETRIES,
+                                        "write-through rename dropped after repeated name conflicts; the remote keeps the source name"
+                                    );
+                                }
+                            }
                         }
                         if let Err(e) = self.publish_vfs_snapshot(&store) {
                             warn!(error = %e, "post-rename VFS snapshot failed");
@@ -1518,25 +1554,50 @@ impl<S: SidecarApi + 'static> Engine<S> {
             return Ok(());
         };
 
-        // Overwrite-rename (tmp → existing destination) whose source never
-        // reached the remote: a racing write-upload created a `pending:`
-        // row for the tmp just before the rename drained. The generic
-        // re-key below would move that row onto the destination path,
-        // clobbering the destination's synced row — the content would
-        // upload as a BRAND-NEW node while the overwrite delete's
-        // tombstone trashes the destination's real node. The file's
-        // identity (node uid, share links, revisions) dies, and a tombstone
-        // draining after the upload loses the file entirely. Instead the
-        // destination's row wins: drop the never-synced source row, mark
-        // the destination dirty, and let its queued write deliver the
-        // content as a revision of the EXISTING node. The destination's
-        // overwrite-delete tombstone (deletes drain first) is cancelled
-        // once that revision upload lands (cancel_stale_tombstone).
+        // Overwrite-rename (tmp → existing destination): keep the
+        // destination's node. The generic re-key below would move the
+        // source's row onto the destination path, clobbering the
+        // destination's synced row — the content would upload as a
+        // BRAND-NEW node while the overwrite delete's tombstone trashes
+        // the destination's real node. The file's identity (node uid,
+        // share links, revisions) dies, and a tombstone draining after
+        // the upload loses the file entirely. The destination's row wins
+        // instead: drop the source row, mark the destination dirty, and
+        // let its queued write deliver the content as a revision of the
+        // EXISTING node (its overwrite-delete tombstone is cancelled when
+        // that revision upload lands — cancel_stale_tombstone).
+        //
+        // Two source shapes, same outcome:
+        // - `pending:` row (PR #22): never synced, no remote node.
+        // - synced row: the tmp's upload drained before the rename, so
+        //   its remote node exists. Trash it — leaving it behind shows a
+        //   `*.tmp` orphan. And a plain renameNode here would 409 while
+        //   the destination's overwrite-delete tombstone is still
+        //   pending: tombstones drain in pump_work, which the engine only
+        //   reaches when the rename queue is empty — the failed rename
+        //   re-queues itself instantly and starves it (observed in
+        //   production: 66 failed API calls in 36 s).
         if row.is_file()
-            && row.node_uid.starts_with("pending:")
             && let Some(dest) = self.db.node_by_path(new_rel)?
             && dest.is_file()
         {
+            let source_is_remote = !row.node_uid.starts_with("pending:");
+            if source_is_remote {
+                let results = self
+                    .sidecar
+                    .trash(std::slice::from_ref(&row.node_uid))
+                    .await?;
+                if !results.iter().any(|r| r.uid == row.node_uid && r.ok) {
+                    // Transport errors retry above, but a per-node refusal
+                    // (e.g. already trashed by an earlier attempt) must not
+                    // block the save: the orphan is cosmetic, the content
+                    // is not.
+                    warn!(
+                        uid = %row.node_uid,
+                        "overwritten source node trash rejected; continuing"
+                    );
+                }
+            }
             self.db.remove_node(old_rel)?;
             let uid = dest.node_uid.clone();
             self.db.upsert_node(&NodeRow {
@@ -1664,13 +1725,20 @@ impl<S: SidecarApi + 'static> Engine<S> {
             return Ok(());
         };
         if row.sync_state != SyncState::Synced {
-            // Never confirmed synced → local removal only (F3.1).
-            self.db.remove_node(rel)?;
-            if let Some(store) = &self.store
-                && !rename_inbound
-            {
-                store.forget(rel);
-                std::fs::remove_file(to_abs(&self.backing_dir, rel)).ok();
+            // Never confirmed synced → local removal only (F3.1). An
+            // inbound overwrite-rename owns this path: its merge keeps
+            // the row (the destination's identity wins) and re-queues the
+            // content. Dropping the row here would leave the merge with
+            // no destination node — the next rename would upload as a
+            // brand-new node and orphan the real one (the back-to-back
+            // save case: the previous save's revision upload is still
+            // pending, so the destination row is Dirty).
+            if !rename_inbound {
+                self.db.remove_node(rel)?;
+                if let Some(store) = &self.store {
+                    store.forget(rel);
+                    std::fs::remove_file(to_abs(&self.backing_dir, rel)).ok();
+                }
             }
             return Ok(());
         }
@@ -3006,6 +3074,23 @@ mod tests {
         }
     }
 
+    /// A file row backed by a known remote uid (engine merge tests).
+    fn row_at(rel: &str, uid: &str, state: SyncState) -> NodeRow {
+        NodeRow {
+            local_path: rel.to_string(),
+            node_uid: uid.to_string(),
+            parent_uid: Some("root".into()),
+            name: rel.rsplit('/').next().unwrap_or(rel).to_string(),
+            kind: NodeKind::File,
+            size: None,
+            sha1: None,
+            mtime: None,
+            sync_state: state,
+            pinned: false,
+            synced_sha1: None,
+        }
+    }
+
     #[test]
     fn retry_backoff_doubles_and_caps() {
         let base = Duration::from_secs(1);
@@ -3249,5 +3334,170 @@ mod tests {
         )
         .unwrap();
         assert_eq!(engine2.sync_mode(), SyncMode::Mirror);
+    }
+
+    /// The production case: the save's tmp file finished uploading before
+    /// the rename drained, so the source node is real. The merge must trash
+    /// that node and keep the destination's (revision history), never call
+    /// renameNode onto an occupied name — which 409s while the
+    /// destination's overwrite-delete tombstone is still pending, and the
+    /// requeue starves the tombstone drain (the 66-call hot loop).
+    #[tokio::test]
+    async fn overwrite_rename_merges_synced_source_into_destination() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("state.db");
+        let (client, mock) = pds_sidecar_client::MockSidecar::new().connect();
+        let dest_uid = mock.remote_create_file("root", "base.plasticity", b"old");
+        let src_uid = mock.remote_create_file("root", "tmp.plasticity", b"new");
+        let (_tx, rx) = tokio::sync::mpsc::channel(1);
+        let (mut engine, _handle) = Engine::new(
+            Arc::new(client),
+            rx,
+            EngineConfig {
+                root: dir.path().join("root"),
+                db_path,
+                placeholders: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let store = engine.store.clone().expect("placeholder store");
+        engine
+            .db
+            .upsert_node(&row_at("base.plasticity", &dest_uid, SyncState::Synced))
+            .unwrap();
+        engine
+            .db
+            .upsert_node(&row_at("tmp.plasticity", &src_uid, SyncState::Synced))
+            .unwrap();
+
+        // What the VFS queues for `rename(tmp → base)` over an existing base.
+        store.record_overwrite("base.plasticity", "tmp.plasticity", "base.plasticity");
+        let Some(WorkRequest::Delete(rel)) = store.next_work_request() else {
+            panic!("overwrite delete must drain first");
+        };
+        engine.handle_local_delete(&rel).await.unwrap();
+        let Some(WorkRequest::Rename(old, new)) = store.next_work_request() else {
+            panic!("rename must follow the delete");
+        };
+        engine.apply_local_rename(&store, &old, &new).await.unwrap();
+
+        // The tmp's node is dropped; the destination's node survives; no
+        // remote rename was attempted (its name was never free).
+        assert!(mock.trashed_uids().contains(&src_uid));
+        assert!(!mock.trashed_uids().contains(&dest_uid));
+        assert!(mock.renames().is_empty());
+        assert!(engine.db.node_by_path("tmp.plasticity").unwrap().is_none());
+        let dest = engine
+            .db
+            .node_by_path("base.plasticity")
+            .unwrap()
+            .expect("destination row");
+        assert_eq!(dest.node_uid, dest_uid);
+        assert_eq!(dest.sync_state, SyncState::Dirty);
+        // The content is queued as a revision of that node.
+        assert!(matches!(
+            store.next_work_request(),
+            Some(WorkRequest::Write(rel)) if rel == "base.plasticity"
+        ));
+    }
+
+    /// Back-to-back saves: the previous save's revision upload has not
+    /// drained, so the destination row is Dirty. The overwrite delete must
+    /// keep it (the inbound rename's merge needs it) and the second merge
+    /// must land on the same incumbent node.
+    #[tokio::test]
+    async fn back_to_back_overwrite_rename_keeps_incumbent_destination() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("state.db");
+        let (client, mock) = pds_sidecar_client::MockSidecar::new().connect();
+        let dest_uid = mock.remote_create_file("root", "base.plasticity", b"old");
+        let src_uid = mock.remote_create_file("root", "tmp2.plasticity", b"newer");
+        let (_tx, rx) = tokio::sync::mpsc::channel(1);
+        let (mut engine, _handle) = Engine::new(
+            Arc::new(client),
+            rx,
+            EngineConfig {
+                root: dir.path().join("root"),
+                db_path,
+                placeholders: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let store = engine.store.clone().expect("placeholder store");
+        engine
+            .db
+            .upsert_node(&row_at("base.plasticity", &dest_uid, SyncState::Dirty))
+            .unwrap();
+        engine
+            .db
+            .upsert_node(&row_at("tmp2.plasticity", &src_uid, SyncState::Synced))
+            .unwrap();
+
+        store.record_overwrite("base.plasticity", "tmp2.plasticity", "base.plasticity");
+        let Some(WorkRequest::Delete(rel)) = store.next_work_request() else {
+            panic!("overwrite delete must drain first");
+        };
+        engine.handle_local_delete(&rel).await.unwrap();
+        assert!(
+            engine.db.node_by_path("base.plasticity").unwrap().is_some(),
+            "an inbound rename keeps the dirty destination row"
+        );
+        let Some(WorkRequest::Rename(old, new)) = store.next_work_request() else {
+            panic!("rename must follow the delete");
+        };
+        engine.apply_local_rename(&store, &old, &new).await.unwrap();
+
+        assert!(mock.trashed_uids().contains(&src_uid));
+        let dest = engine.db.node_by_path("base.plasticity").unwrap().unwrap();
+        assert_eq!(dest.node_uid, dest_uid);
+        assert_eq!(dest.sync_state, SyncState::Dirty);
+    }
+
+    /// A plain rename (no local destination row) still moves the source's
+    /// node under its new name — the merge must not hijack it.
+    #[tokio::test]
+    async fn rename_without_destination_row_rekeys_the_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("state.db");
+        let (client, mock) = pds_sidecar_client::MockSidecar::new().connect();
+        let src_uid = mock.remote_create_file("root", "tmp.plasticity", b"new");
+        let (_tx, rx) = tokio::sync::mpsc::channel(1);
+        let (mut engine, _handle) = Engine::new(
+            Arc::new(client),
+            rx,
+            EngineConfig {
+                root: dir.path().join("root"),
+                db_path,
+                placeholders: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let store = engine.store.clone().expect("placeholder store");
+        engine
+            .db
+            .upsert_node(&row_at("tmp.plasticity", &src_uid, SyncState::Synced))
+            .unwrap();
+
+        store.record_rename("tmp.plasticity", "final.plasticity");
+        let Some(WorkRequest::Rename(old, new)) = store.next_work_request() else {
+            panic!("rename queued");
+        };
+        engine.apply_local_rename(&store, &old, &new).await.unwrap();
+
+        assert_eq!(
+            mock.renames(),
+            vec![(src_uid.clone(), "final.plasticity".to_string())]
+        );
+        assert!(mock.trashed_uids().is_empty());
+        assert!(engine.db.node_by_path("tmp.plasticity").unwrap().is_none());
+        let row = engine
+            .db
+            .node_by_path("final.plasticity")
+            .unwrap()
+            .expect("re-keyed row");
+        assert_eq!(row.node_uid, src_uid);
     }
 }

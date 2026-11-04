@@ -16,6 +16,7 @@
 
 use std::collections::HashMap;
 use std::io::Write as _;
+use std::os::unix::io::AsRawFd as _;
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::sync::Arc;
@@ -56,6 +57,38 @@ impl Drop for Watchdog {
     }
 }
 
+/// Shared sink for the tracing subscriber. The e2e test asserts on it to
+/// prove the daemon's `copy_file_range` handler answered a copy: the kernel
+/// silently substitutes a splice copy when the filesystem replies
+/// `EOPNOTSUPP`, so a correct destination file alone does not prove which
+/// path ran.
+#[derive(Clone, Default)]
+struct LogBuf(Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl LogBuf {
+    fn contains(&self, needle: &str) -> bool {
+        let buf = self.0.lock().unwrap();
+        String::from_utf8_lossy(&buf).contains(needle)
+    }
+}
+
+impl std::io::Write for LogBuf {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogBuf {
+    type Writer = LogBuf;
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+
 /// Real-kernel FUSE needs /dev/fuse and a setuid fusermount3. Returns why
 /// this host cannot run the test, or None if it can.
 fn fuse_unavailable_reason() -> Option<String> {
@@ -92,11 +125,13 @@ async fn fuse_mount_serves_placeholders_and_hydrates() {
         return;
     }
 
+    let logs = LogBuf::default();
     let _ = tracing_subscriber::fmt()
+        .with_writer(logs.clone())
+        .with_ansi(false)
         .with_env_filter(std::env::var("RUST_LOG").unwrap_or_else(|_| {
-            "pds_core=debug,pds_sidecar_client=debug".to_string()
+            "pds_core=debug,pds_sidecar_client=debug,pds_vfs_linux=debug".to_string()
         }))
-        .with_test_writer()
         .try_init();
 
     let dir = tempfile::tempdir().unwrap();
@@ -340,6 +375,72 @@ async fn fuse_mount_serves_placeholders_and_hydrates() {
         assert!(
             Instant::now() < deadline,
             "overlay replace never landed remotely: children {:?}, uploads {:?}",
+            mock.child_names("root"),
+            mock.uploaded_names(),
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // 6e. Server-side copy (`copy_file_range(2)`): same-mount copies are
+    // routed to the daemon instead of being read back through userspace.
+    // fuser's default answer was ENOSYS, so the kernel used its splice
+    // fallback — the path apps like Plasticity hit as intermittent EIO /
+    // 0-byte saves. A full-length return alone does not prove which path
+    // ran (the kernel silently substitutes splice on EOPNOTSUPP), so the
+    // handler's log line is asserted below as well.
+    let src = std::fs::File::open(mnt.join("big.bin")).expect("copy source open");
+    let dst = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(mnt.join("big-copy.bin"))
+        .expect("copy destination create");
+    let mut off_in: libc::loff_t = 0;
+    let mut off_out: libc::loff_t = 0;
+    let copied = unsafe {
+        libc::copy_file_range(
+            src.as_raw_fd(),
+            &mut off_in,
+            dst.as_raw_fd(),
+            &mut off_out,
+            big.len(),
+            0,
+        )
+    };
+    assert_eq!(
+        copied,
+        big.len() as isize,
+        "copy_file_range must copy every byte (errno {:?})",
+        std::io::Error::last_os_error()
+    );
+    assert_eq!(off_out, big.len() as i64);
+    assert!(
+        logs.contains("copy_file_range: server-side copy"),
+        "the daemon must answer copy_file_range itself; the kernel's splice \
+         fallback (EOPNOTSUPP) produces the same bytes but reintroduces the \
+         page-cache path this handler exists to bypass"
+    );
+    drop(dst);
+    drop(src);
+    let expect_copy = std::fs::read(mnt.join("big.bin")).unwrap();
+    assert_eq!(expect_copy.len(), big.len());
+    assert_eq!(
+        std::fs::read(mnt.join("big-copy.bin")).unwrap(),
+        expect_copy,
+        "copied file must match the source byte for byte"
+    );
+    // …and the copy uploads remotely as a new node with the same bytes.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let remote = mock
+            .find_uid("root", "big-copy.bin")
+            .and_then(|uid| mock.file_content(&uid));
+        if remote.as_deref() == Some(expect_copy.as_slice()) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "copy never landed remotely intact: children {:?}, uploads {:?}",
             mock.child_names("root"),
             mock.uploaded_names(),
         );

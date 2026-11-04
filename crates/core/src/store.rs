@@ -62,6 +62,12 @@ struct Inner {
     /// The engine turns each into a remote `renameNode` (never a
     /// trash+re-upload), re-keying the DB rows beneath the paths.
     pending_renames: VecDeque<(String, String)>,
+    /// Consecutive name-conflict failures per rename pair. A doomed pair
+    /// (the remote destination name never frees up) is dropped at
+    /// [`RENAME_MAX_CONFLICT_RETRIES`] instead of re-queueing forever:
+    /// renames drain before `pump_work`, so a perpetual retry starves
+    /// the tombstone drain that could unblock it.
+    rename_conflicts: HashMap<(String, String), u32>,
     /// Paths deleted through the mount that the served snapshot may still
     /// list until the engine drains their tombstones and republishes.
     /// Outlives `pending_deletes` (which the engine pops immediately);
@@ -80,6 +86,12 @@ struct Inner {
     /// Monotonic generation for `publish_snapshot`.
     next_generation: u64,
 }
+
+/// How many consecutive name-conflict failures a rename pair survives
+/// before it is dropped. Each failure is a round trip to the API; more
+/// than a handful of collisions on one move means the remote name is not
+/// freeing up (see `Store::finish_rename`).
+pub const RENAME_MAX_CONFLICT_RETRIES: u32 = 5;
 
 /// One unit of local work for the engine's main loop, popped atomically
 /// from the store's queues with delete → rename → write priority
@@ -540,19 +552,41 @@ impl Store {
         }
     }
 
-    /// Engine finished one rename attempt. On failure the pair re-queues.
-    pub fn finish_rename(&self, old_rel: &str, new_rel: &str, ok: bool) {
+    /// Finish a drained rename. `ok=false` re-queues it (transient
+    /// failures retry immediately; the engine's main loop only reaches
+    /// `pump_work` when this queue is empty, so an instant retry keeps
+    /// the API path alive). `permanent=true` marks a name conflict — a
+    /// failure that cannot heal by retrying alone — and counts toward
+    /// [`RENAME_MAX_CONFLICT_RETRIES`]; the pair is dropped (returns
+    /// false) once the cap is reached, so a doomed move cannot starve
+    /// the tombstone drain that would free the name. Dropping clears the
+    /// count: a rename the user makes again later gets a fresh budget.
+    pub fn finish_rename(&self, old_rel: &str, new_rel: &str, ok: bool, permanent: bool) -> bool {
         let mut inner = self.lock();
-        if !ok
-            && !inner
-                .pending_renames
-                .iter()
-                .any(|(o, n)| o == old_rel && n == new_rel)
-        {
-            inner
-                .pending_renames
-                .push_back((old_rel.to_string(), new_rel.to_string()));
+        let key = (old_rel.to_string(), new_rel.to_string());
+        if ok {
+            inner.rename_conflicts.remove(&key);
+            return true;
         }
+        if permanent {
+            let attempts = {
+                let count = inner.rename_conflicts.entry(key.clone()).or_insert(0);
+                *count += 1;
+                *count
+            };
+            if attempts >= RENAME_MAX_CONFLICT_RETRIES {
+                inner.rename_conflicts.remove(&key);
+                return false;
+            }
+        }
+        if !inner
+            .pending_renames
+            .iter()
+            .any(|(o, n)| o == old_rel && n == new_rel)
+        {
+            inner.pending_renames.push_back(key);
+        }
+        true
     }
 
     /// True while a queued or in-flight rename targets `rel` (an
@@ -580,6 +614,9 @@ impl Store {
         inner
             .pending_renames
             .retain(|(o, n)| o != rel && n != rel);
+        inner
+            .rename_conflicts
+            .retain(|(o, n), _| o != rel && n != rel);
     }
 
     /// Drop `rel` and every path under it (recursive delete through the
@@ -782,7 +819,7 @@ mod tests {
             store.next_rename_request(),
             Some(("a.txt".into(), "b.txt".into()))
         );
-        store.finish_rename("a.txt", "b.txt", true);
+        store.finish_rename("a.txt", "b.txt", true, false);
         assert_eq!(store.next_rename_request(), None);
 
         // Failure re-queues; rename-back cancels on drain.
@@ -791,12 +828,12 @@ mod tests {
             store.next_rename_request(),
             Some(("a.txt".into(), "b.txt".into()))
         );
-        store.finish_rename("a.txt", "b.txt", false);
+        store.finish_rename("a.txt", "b.txt", false, false);
         assert_eq!(
             store.next_rename_request(),
             Some(("a.txt".into(), "b.txt".into()))
         );
-        store.finish_rename("a.txt", "b.txt", true);
+        store.finish_rename("a.txt", "b.txt", true, false);
 
         store.record_rename("a.txt", "b.txt");
         store.record_rename("b.txt", "a.txt"); // chained → a→a, cancels
@@ -809,12 +846,79 @@ mod tests {
             store.next_rename_request(),
             Some(("a.txt".into(), "c.txt".into()))
         );
-        store.finish_rename("a.txt", "c.txt", true);
+        store.finish_rename("a.txt", "c.txt", true, false);
 
         // forget drops renames touching the path.
         store.record_rename("x.txt", "y.txt");
         store.forget("x.txt");
         assert_eq!(store.next_rename_request(), None);
+    }
+
+    #[test]
+    fn rename_conflicts_are_capped_but_transient_failures_are_not() {
+        let store = Store::new();
+        // Transient failures re-queue without limit.
+        store.record_rename("a.txt", "b.txt");
+        for _ in 0..(RENAME_MAX_CONFLICT_RETRIES * 2) {
+            assert_eq!(
+                store.next_rename_request(),
+                Some(("a.txt".into(), "b.txt".into()))
+            );
+            assert!(store.finish_rename("a.txt", "b.txt", false, false));
+        }
+
+        // Name conflicts stop after the cap: the pair is dropped, so the
+        // main loop can reach pump_work and free the remote name.
+        for _ in 1..RENAME_MAX_CONFLICT_RETRIES {
+            assert_eq!(
+                store.next_rename_request(),
+                Some(("a.txt".into(), "b.txt".into()))
+            );
+            assert!(store.finish_rename("a.txt", "b.txt", false, true));
+        }
+        assert_eq!(
+            store.next_rename_request(),
+            Some(("a.txt".into(), "b.txt".into()))
+        );
+        assert!(!store.finish_rename("a.txt", "b.txt", false, true));
+        assert_eq!(store.next_rename_request(), None);
+
+        // Dropping cleared the count: the same pair queued again gets a
+        // full budget instead of dying on its first conflict.
+        store.record_rename("a.txt", "b.txt");
+        for _ in 1..RENAME_MAX_CONFLICT_RETRIES {
+            assert_eq!(
+                store.next_rename_request(),
+                Some(("a.txt".into(), "b.txt".into()))
+            );
+            assert!(store.finish_rename("a.txt", "b.txt", false, true));
+        }
+        assert_eq!(
+            store.next_rename_request(),
+            Some(("a.txt".into(), "b.txt".into()))
+        );
+        assert!(!store.finish_rename("a.txt", "b.txt", false, true));
+        assert_eq!(store.next_rename_request(), None);
+
+        // Success clears the count too.
+        store.record_rename("a.txt", "b.txt");
+        assert_eq!(
+            store.next_rename_request(),
+            Some(("a.txt".into(), "b.txt".into()))
+        );
+        assert!(store.finish_rename("a.txt", "b.txt", true, false));
+        store.record_rename("a.txt", "b.txt");
+        for _ in 1..RENAME_MAX_CONFLICT_RETRIES {
+            assert_eq!(
+                store.next_rename_request(),
+                Some(("a.txt".into(), "b.txt".into()))
+            );
+            assert!(store.finish_rename("a.txt", "b.txt", false, true));
+        }
+        assert_eq!(
+            store.next_rename_request(),
+            Some(("a.txt".into(), "b.txt".into()))
+        );
     }
 
     #[test]
