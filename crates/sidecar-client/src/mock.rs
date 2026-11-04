@@ -51,6 +51,17 @@ struct SparseContent {
 /// retry_after)` tuples, popped one per `drive.upload` attempt.
 type ScriptedFailures = VecDeque<(i64, String, bool, Option<Duration>)>;
 
+/// A download parked mid-stream by [`MockHandle::hold_next_download`]: the
+/// sidecar wrote only part of the content and waits for `transfer.resume`
+/// before finishing and emitting `transfer.done` (F4 pause semantics).
+#[derive(Debug)]
+struct HeldDownload {
+    path: String,
+    content: Arc<Vec<u8>>,
+    written: usize,
+    done: Value,
+}
+
 #[derive(Debug)]
 struct State {
     nodes: HashMap<String, MockNode>,
@@ -85,6 +96,19 @@ struct State {
     get_root_failures: usize,
     /// Remaining `drive.listChildren` calls to reject with a transport error.
     list_children_failures: usize,
+    /// Simulated sidecar outage: every request fails with the client's own
+    /// "connection closed" RPC error (-32000) until cleared.
+    offline: bool,
+    /// The next `drive.upload` answers with a transfer id, then the server
+    /// exits WITHOUT sending `transfer.done` (mid-transfer process death).
+    crash_next_upload: bool,
+    /// Set by `crash_next_upload`; the serve loop exits after the response.
+    crashed: bool,
+    /// Node uids whose next download stops after this many bytes until the
+    /// matching `transfer.resume` arrives (or `transfer.cancel` drops it).
+    download_holds: HashMap<String, usize>,
+    /// Parked downloads by transfer id (see [`HeldDownload`]).
+    held_downloads: HashMap<String, HeldDownload>,
     /// Outbound notification queue (drained by the server task).
     outbox: mpsc::UnboundedSender<String>,
 }
@@ -525,6 +549,46 @@ impl MockHandle {
             .collect()
     }
 
+    /// Freeze the next download of `node_uid` after `bytes` bytes until the
+    /// engine sends `transfer.resume` (or `transfer.cancel`). Lets a test
+    /// hold a transfer in flight without sleeps — the mock is the transfer
+    /// authority, exactly like the real sidecar's pause controller.
+    pub fn hold_next_download(&self, node_uid: &str, bytes: usize) {
+        self.state
+            .lock()
+            .unwrap()
+            .download_holds
+            .insert(node_uid.to_string(), bytes);
+    }
+
+    /// Number of downloads currently parked waiting for `transfer.resume`.
+    pub fn held_downloads(&self) -> usize {
+        self.state.lock().unwrap().held_downloads.len()
+    }
+
+    /// Transfer-control methods the engine sent, in call order
+    /// (`pause` / `resume` / `cancel`).
+    pub fn transfer_controls(&self) -> Vec<String> {
+        self.state
+            .lock()
+            .unwrap()
+            .calls
+            .iter()
+            .filter(|(m, _)| matches!(m.as_str(), "pause" | "resume" | "cancel"))
+            .map(|(m, _)| m.clone())
+            .collect()
+    }
+
+    /// Remote file size in bytes, if the uid is a file.
+    pub fn file_size(&self, uid: &str) -> Option<i64> {
+        self.state.lock().unwrap().nodes.get(uid).and_then(|n| n.size)
+    }
+
+    /// Hex SHA-1 of a remote file's current content.
+    pub fn file_sha1(&self, uid: &str) -> Option<String> {
+        self.state.lock().unwrap().nodes.get(uid).and_then(|n| n.sha1.clone())
+    }
+
     /// Emit a `node_deleted` event for a uid and remove it remotely.
     pub fn remote_delete(&self, uid: &str) {
         let mut st = self.state.lock().unwrap();
@@ -661,6 +725,27 @@ impl MockHandle {
             .count()
     }
 
+    /// Whole call log `(method, args)` in arrival order — for asserting
+    /// drain order (tombstones before uploads).
+    pub fn call_log(&self) -> Vec<(String, Vec<String>)> {
+        self.state.lock().unwrap().calls.clone()
+    }
+
+    /// Simulate a sidecar outage that keeps the process (and its streams)
+    /// alive: every request answers with the client-side -32000
+    /// "connection closed" error until cleared. Lets a test model
+    /// "subsequent calls fail, then the sidecar comes back".
+    pub fn set_offline(&self, offline: bool) {
+        self.state.lock().unwrap().offline = offline;
+    }
+
+    /// Crash the transport during the NEXT upload: respond with the transfer
+    /// id, then close the stream (no `transfer.done`), like a sidecar process
+    /// dying mid-transfer. One-shot.
+    pub fn crash_on_next_upload(&self) {
+        self.state.lock().unwrap().crash_next_upload = true;
+    }
+
     /// Emit a raw drive event (for custom scenarios).
     pub fn emit_event(&self, event: &DriveEvent) {
         let st = self.state.lock().unwrap();
@@ -677,9 +762,11 @@ impl State {
         self.next_event += 1;
         format!("evt-{}", self.next_event)
     }
+    fn enqueue(&self, msg: Value) {
+        let _ = self.outbox.send(msg.to_string());
+    }
     fn emit(&self, params: Value) {
-        let msg = json!({"jsonrpc": "2.0", "method": "drive.event", "params": params}).to_string();
-        let _ = self.outbox.send(msg);
+        self.enqueue(json!({"jsonrpc": "2.0", "method": "drive.event", "params": params}));
     }
 }
 
@@ -810,6 +897,11 @@ impl MockSidecar {
                 download_failures: HashMap::new(),
                 get_root_failures: 0,
                 list_children_failures: 0,
+                offline: false,
+                crash_next_upload: false,
+                crashed: false,
+                download_holds: HashMap::new(),
+                held_downloads: HashMap::new(),
                 outbox,
             })),
         }
@@ -819,6 +911,20 @@ impl MockSidecar {
         MockHandle {
             state: Arc::clone(&self.state),
         }
+    }
+
+    /// A mock whose node/transfer id counters start at `seq`. A fresh mock
+    /// used with a DB written by an earlier mock must not reissue ids that
+    /// are already persisted there (`node_uid` is UNIQUE); start the
+    /// counters above anything the previous session allocated.
+    pub fn new_with_seq(seq: u64) -> Self {
+        let mock = Self::new();
+        {
+            let mut st = mock.state.lock().unwrap();
+            st.next_node = seq;
+            st.next_transfer = seq;
+        }
+        mock
     }
 
     /// Connect a `SidecarClient` to this mock over an in-memory duplex stream
@@ -859,6 +965,9 @@ impl MockSidecar {
                                 }
                             }
                             let _ = writer.flush().await;
+                            if self.state.lock().unwrap().crashed {
+                                return; // simulated mid-transfer process death
+                            }
                         }
                         Ok(_) => return, // EOF
                         Err(_) => return,
@@ -885,6 +994,19 @@ impl MockSidecar {
         let id = msg.get("id").cloned().unwrap_or(Value::Null);
         let method = msg.get("method").and_then(Value::as_str).unwrap_or("");
         let params = msg.get("params").cloned().unwrap_or(Value::Null);
+
+        // Simulated outage: mirror the error `JsonRpcClient` synthesizes for
+        // in-flight requests when the child's stdout closes (-32000).
+        if self.state.lock().unwrap().offline {
+            return vec![
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "error": {"code": -32000, "message": "connection closed"},
+                })
+                .to_string(),
+            ];
+        }
 
         let ok = |result: Value| json!({"jsonrpc":"2.0","id":id,"result":result}).to_string();
         let err = |code: i64, message: &str| {
@@ -1104,6 +1226,15 @@ impl MockSidecar {
                 st.calls.push(("upload".into(), vec![name.clone()]));
                 st.upload_mtimes.push((name.clone(), mtime));
 
+                // Simulated process death mid-transfer: ack the request with
+                // a transfer id, then the serve loop closes the stream without
+                // ever sending `transfer.done`.
+                if st.crash_next_upload {
+                    st.crash_next_upload = false;
+                    st.crashed = true;
+                    return vec![ok(json!({"transferId": transfer_id}))];
+                }
+
                 // Scripted failure (e.g. the 409 stale-revision class):
                 // respond with the transfer id, then a transfer.error —
                 // content is NOT applied, like a server-side rejection.
@@ -1191,8 +1322,10 @@ impl MockSidecar {
             "drive.download" => {
                 let mut st = self.state.lock().unwrap();
                 st.next_transfer += 1;
-                let uid = pstr("nodeUid");
-                st.calls.push(("download".into(), vec![uid.clone()]));
+                let node_uid = pstr("nodeUid");
+                let uid = node_uid.clone();
+                let path = pstr("path");
+                st.calls.push(("download".into(), vec![node_uid.clone()]));
                 let delay = st.download_delay;
                 // Deliberately block this test-only server while the
                 // download is "in flight"; the state lock is released so
@@ -1223,8 +1356,13 @@ impl MockSidecar {
                     .to_string();
                     return vec![ok(json!({"transferId": transfer_id})), err];
                 }
-                let path = pstr("path");
                 let sparse = st.nodes.get(&uid).and_then(|n| n.sparse.clone());
+                let is_sparse = sparse.is_some();
+                let content = st
+                    .nodes
+                    .get(&node_uid)
+                    .and_then(|n| n.content.clone())
+                    .unwrap_or_default();
                 if let Some(sparse) = sparse {
                     // Materialize only the markers; the holes stay sparse on
                     // disk so a 5 GiB download costs a few blocks.
@@ -1242,21 +1380,33 @@ impl MockSidecar {
                         .to_string();
                         return vec![ok(json!({"transferId": transfer_id})), err];
                     }
-                } else {
-                    let content = st
-                        .nodes
-                        .get(&uid)
-                        .and_then(|n| n.content.clone())
-                        .unwrap_or_default();
-                    let _ = std::fs::write(&path, &*content);
                 }
                 let done = json!({
                     "jsonrpc": "2.0",
                     "method": "transfer.done",
                     "params": {"transferId": transfer_id},
-                })
-                .to_string();
-                vec![ok(json!({"transferId": transfer_id})), done]
+                });
+                if let Some(hold_after) = st.download_holds.remove(&node_uid) {
+                    // Park mid-stream: write the prefix, keep the completion
+                    // for `transfer.resume`, like a paused real transfer.
+                    let written = hold_after.min(content.len());
+                    let _ = std::fs::write(&path, &content[..written]);
+                    st.held_downloads.insert(
+                        transfer_id.clone(),
+                        HeldDownload {
+                            path,
+                            content,
+                            written,
+                            done,
+                        },
+                    );
+                    return vec![ok(json!({"transferId": transfer_id}))];
+                }
+                if !is_sparse {
+                    let _ = std::fs::write(&path, &*content);
+                }
+                st.enqueue(done);
+                vec![ok(json!({"transferId": transfer_id}))]
             }
             "drive.events.start" => {
                 let mut st = self.state.lock().unwrap();
@@ -1271,7 +1421,37 @@ impl MockSidecar {
                 vec![ok(json!({})), ff]
             }
             "drive.events.stop" => vec![ok(json!({}))],
-            "transfer.pause" | "transfer.resume" | "transfer.cancel" => vec![ok(json!({}))],
+            "transfer.pause" => {
+                let tid = pstr("transferId");
+                self.state
+                    .lock()
+                    .unwrap()
+                    .calls
+                    .push(("pause".into(), vec![tid]));
+                vec![ok(json!({}))]
+            }
+            "transfer.resume" => {
+                let tid = pstr("transferId");
+                let mut st = self.state.lock().unwrap();
+                st.calls.push(("resume".into(), vec![tid.clone()]));
+                if let Some(held) = st.held_downloads.remove(&tid) {
+                    // Finish the parked transfer: write the remaining bytes,
+                    // then emit completion (after the response, per protocol).
+                    let mut content = Vec::with_capacity(held.content.len());
+                    content.extend_from_slice(&held.content[..held.written]);
+                    content.extend_from_slice(&held.content[held.written..]);
+                    let _ = std::fs::write(&held.path, &content);
+                    st.enqueue(held.done);
+                }
+                vec![ok(json!({}))]
+            }
+            "transfer.cancel" => {
+                let tid = pstr("transferId");
+                let mut st = self.state.lock().unwrap();
+                st.calls.push(("cancel".into(), vec![tid.clone()]));
+                st.held_downloads.remove(&tid);
+                vec![ok(json!({}))]
+            }
             _ => vec![err(-32601, "method not found")],
         }
     }

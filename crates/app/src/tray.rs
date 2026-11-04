@@ -73,11 +73,19 @@ impl StatusKind {
             Phase::Starting => StatusKind::Starting,
             Phase::NeedsLogin => StatusKind::NeedsLogin,
             Phase::Failed => StatusKind::Failed,
-            Phase::Running => match state.engine_state() {
-                Some(EngineState::Paused) => StatusKind::Paused,
-                Some(EngineState::GuardPaused) => StatusKind::GuardPaused,
-                Some(EngineState::Running) | None => StatusKind::Running,
-            },
+            Phase::Running => {
+                if state.sign_in_required() {
+                    StatusKind::NeedsLogin
+                } else if state.sidecar_unavailable() {
+                    StatusKind::Failed
+                } else {
+                    match state.engine_state() {
+                        Some(EngineState::Paused) => StatusKind::Paused,
+                        Some(EngineState::GuardPaused) => StatusKind::GuardPaused,
+                        Some(EngineState::Running) | None => StatusKind::Running,
+                    }
+                }
+            }
         }
     }
 
@@ -448,6 +456,8 @@ mod tests {
             cache_cap: None,
             cache_used: 0,
             cache_path: None,
+            needs_sign_in: false,
+            sidecar_unavailable: false,
         });
         state
     }
@@ -467,6 +477,17 @@ mod tests {
         assert_eq!(StatusKind::from_state(&state), StatusKind::NeedsLogin);
 
         state.phase = Phase::Failed;
+        assert_eq!(StatusKind::from_state(&state), StatusKind::Failed);
+    }
+
+    #[test]
+    fn tray_reflects_session_expiry_and_sidecar_loss() {
+        let mut state = running();
+        state.status.as_mut().unwrap().needs_sign_in = true;
+        assert_eq!(StatusKind::from_state(&state), StatusKind::NeedsLogin);
+
+        let mut state = running();
+        state.status.as_mut().unwrap().sidecar_unavailable = true;
         assert_eq!(StatusKind::from_state(&state), StatusKind::Failed);
     }
 
