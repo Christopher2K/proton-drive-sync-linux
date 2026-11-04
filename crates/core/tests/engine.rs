@@ -1486,11 +1486,14 @@ async fn remote_folder_rename_rekeys_subtree_and_preserves_nested_content() {
     fx.mock.remote_rename("node-docs", "Docs");
 
     wait_for(|| {
+        // Parent rows are inserted after their children, so require both
+        // ends of the re-key before reading them.
         fx.db
             .node_by_path("Docs/nested.txt")
             .ok()
             .flatten()
             .is_some_and(|r| r.node_uid == nested_uid)
+            && fx.db.node_by_path("Docs").ok().flatten().is_some()
             && fx.db.node_by_path("Documents/nested.txt").ok().flatten().is_none()
     })
     .await;
@@ -1537,6 +1540,11 @@ async fn remote_folder_move_rekeys_subtree_and_back_to_root() {
                 .ok()
                 .flatten()
                 .is_some()
+            && fx.db
+                .node_by_path("Archive/Documents")
+                .ok()
+                .flatten()
+                .is_some()
     })
     .await;
     assert!(fx.db.node_by_path("Documents").unwrap().is_none());
@@ -1563,6 +1571,7 @@ async fn remote_folder_move_rekeys_subtree_and_back_to_root() {
                 .ok()
                 .flatten()
                 .is_some()
+            && fx.db.node_by_path("Documents").ok().flatten().is_some()
     })
     .await;
     assert!(fx.db.node_by_path("Archive/Documents").unwrap().is_none());
@@ -2042,6 +2051,9 @@ async fn local_folder_rename_and_move_preserves_uids() {
     // 2. Move under Archive.
     std::fs::rename(fx.root.join("Renamed"), fx.root.join("Archive/Renamed")).unwrap();
     wait_for(|| {
+        // Re-keying deletes the old rows and inserts children before their
+        // parent, so wait for the parent row too — the child can be visible
+        // at the new path while the folder row is still missing.
         fx.db.node_by_path("Archive/Renamed/sub/c.txt").ok().flatten().is_some()
             && fx.db.node_by_path("Archive/Renamed").ok().flatten().is_some()
             && fx.db.node_by_path("Renamed").ok().flatten().is_none()
