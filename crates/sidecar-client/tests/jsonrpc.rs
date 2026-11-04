@@ -165,6 +165,54 @@ async fn out_of_order_responses_are_correlated() {
     assert_eq!(r2.unwrap()["echo"], "second");
 }
 
+/// TG-21: a request already in flight when the child's stdout closes must
+/// fail with a typed error, never hang forever waiting for a reply.
+#[tokio::test]
+async fn pending_request_fails_when_server_exits() {
+    let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+    let (cr, cw) = tokio::io::split(client_io);
+    let (sr, sw) = tokio::io::split(server_io);
+
+    // Read the request, then exit without answering (sidecar crash).
+    tokio::spawn(async move {
+        let mut lines = BufReader::new(sr).lines();
+        let _ = lines.next_line().await;
+        drop(sw);
+    });
+
+    let (rpc, _notifs) = JsonRpcClient::new(cr, cw);
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        rpc.call("drive.getRoot", json!({})),
+    )
+    .await
+    .expect("pending request hung after the sidecar exited");
+
+    match result {
+        Err(pds_sidecar_client::Error::Rpc(err)) => {
+            assert_eq!(err.code, -32000, "expected the connection-closed sentinel");
+        }
+        Err(pds_sidecar_client::Error::Closed) => {}
+        other => panic!("expected a typed transport error, got {other:?}"),
+    }
+
+    // A request issued AFTER the read loop drained its pending map must also
+    // fail fast: registering it post-drain used to await an answer forever.
+    let late = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        rpc.call("drive.getRoot", json!({})),
+    )
+    .await
+    .expect("post-EOF request hung");
+    assert!(
+        matches!(
+            late,
+            Err(pds_sidecar_client::Error::Closed) | Err(pds_sidecar_client::Error::Rpc(_))
+        ),
+        "expected a typed transport error, got {late:?}"
+    );
+}
+
 /// Server closing the connection must fail pending and future calls.
 #[tokio::test]
 async fn closed_connection_fails_calls() {

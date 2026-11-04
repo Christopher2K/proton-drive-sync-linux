@@ -61,6 +61,10 @@ pub const RETRY_BACKOFF_MAX: Duration = Duration::from_secs(300);
 /// Consecutive retryable failures after which a node is marked errored and
 /// the engine moves on (no hot-looping).
 pub const MAX_UPLOAD_RETRIES: i64 = 10;
+/// While the sidecar is degraded, how long the engine waits before probing
+/// it again. Deliberately independent of `retry_base` (test knobs must not
+/// turn an outage into a hot loop).
+const SIDECAR_PROBE_DELAY: Duration = Duration::from_secs(1);
 
 /// Engine run-state (F4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -110,6 +114,14 @@ pub struct EngineStatus {
     /// UI/CLI can point users at the folder eating their disk. `None` in
     /// mirror mode.
     pub cache_path: Option<PathBuf>,
+    /// The sidecar reported `session_expired` / `auth_required` (1001/1002):
+    /// pending work is parked until the host re-authenticates (resume) or
+    /// restarts the engine. Local data is never discarded.
+    pub needs_sign_in: bool,
+    /// The sidecar transport failed or its process died. With the stream
+    /// still open the engine probes it again; with the stream closed it
+    /// stays visibly degraded (no automatic respawn yet).
+    pub sidecar_unavailable: bool,
 }
 
 /// Control commands (CLI socket / UI).
@@ -153,9 +165,14 @@ pub enum ActivityKind {
     /// Download/hydration failed (permissions, no space, transport) and is
     /// waiting for a retry. Existing content is never touched.
     DownloadErrored,
+    /// The Drive session expired mid-sync; pending work is parked until the
+    /// user signs in again. Emitted once per expiry, not per file.
+    SignInRequired,
     /// The sidecar could not be reached during startup/initial sync; the
     /// engine stays alive and retries with backoff.
     ConnectionError,
+    /// The sidecar stopped answering (transport error / process death).
+    SidecarUnavailable,
     /// A local item cannot be represented remotely (e.g. a non-UTF-8
     /// filename) and was deliberately left alone (never uploaded/deleted).
     Skipped,
@@ -378,6 +395,54 @@ fn is_revision_conflict(code: i64, message: &str) -> bool {
             .contains("no longer up to date")
 }
 
+/// True for the auth codes the sidecar maps 400/401 to (1002) and the
+/// "no session" code (1001): the host must re-run `auth.loginFork`.
+fn is_auth_error(code: i64) -> bool {
+    matches!(
+        code,
+        pds_sidecar_client::types::error_codes::AUTH_REQUIRED
+            | pds_sidecar_client::types::error_codes::SESSION_EXPIRED
+    )
+}
+
+/// True when a client error means the transport itself is gone (process
+/// exit, stdout EOF, broken pipe) rather than a request-level refusal.
+/// `JsonRpcClient` drains pending requests with `-32000 "connection closed"`
+/// when its read loop hits EOF, so that synthetic RPC error counts too.
+fn is_connection_lost(err: &pds_sidecar_client::Error) -> bool {
+    use pds_sidecar_client::Error as ClientError;
+    match err {
+        ClientError::Io(_) | ClientError::Closed | ClientError::Malformed(_) => true,
+        ClientError::Rpc(rpc) => {
+            rpc.code == -32000
+                && rpc
+                    .message
+                    .to_ascii_lowercase()
+                    .contains("connection closed")
+        }
+    }
+}
+
+fn is_connection_lost_anyhow(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        cause
+            .downcast_ref::<pds_sidecar_client::Error>()
+            .is_some_and(is_connection_lost)
+    })
+}
+
+/// The auth code/message carried by an `anyhow` chain, if any.
+fn auth_error_in_anyhow(err: &anyhow::Error) -> Option<(i64, String)> {
+    err.chain()
+        .find_map(|cause| cause.downcast_ref::<pds_sidecar_client::Error>())
+        .and_then(|err| match err {
+            pds_sidecar_client::Error::Rpc(rpc) if is_auth_error(rpc.code) => {
+                Some((rpc.code, rpc.message.clone()))
+            }
+            _ => None,
+        })
+}
+
 /// True for the "destination name already exists remotely" rename class:
 /// the SDK's `NodeWithSameNameExistsValidationError` maps to 1005
 /// (`CONFLICT`), while the raw-`ApiError` path surfaces the same text as
@@ -455,6 +520,19 @@ pub struct Engine<S: SidecarApi> {
     active_transfer: Option<String>,
     /// Pin commands queued from the control socket, awaiting async drain.
     pending_pins: VecDeque<PinRequest>,
+    /// Set once the sidecar reported an auth failure (1001/1002): all remote
+    /// work is parked until an explicit resume (the host re-authenticated)
+    /// or a restart. Never discards pending local work.
+    needs_sign_in: bool,
+    /// Set when the sidecar transport fails or the process dies. If the
+    /// notification stream is still open the main loop probes again after
+    /// [`SIDECAR_PROBE_DELAY`]; otherwise it stays degraded for this run.
+    sidecar_down: bool,
+    /// When the next probe is due while `sidecar_down`.
+    sidecar_probe_at: Option<Instant>,
+    /// The notification stream ended (sidecar process gone). There is no
+    /// reconnect path here; the host must restart the engine.
+    notifications_closed: bool,
     /// Set when Shutdown arrived mid-transfer; the main loop exits ASAP.
     shutting_down: bool,
     /// Set once `run()` has been entered.
@@ -480,6 +558,11 @@ pub struct Engine<S: SidecarApi> {
     /// stable across the rename and lets [`Engine::detect_dir_renames`] pair
     /// the two without guessing from names/content.
     dir_ids: HashMap<String, (u64, u64)>,
+    /// The same identity map for tracked files. A case-only file rename on a
+    /// case-sensitive filesystem also arrives as delete + create; the stable
+    /// inode lets [`Engine::detect_case_only_file_renames`] preserve the node
+    /// instead of trashing it and re-uploading as a new one (TG-12).
+    file_ids: HashMap<String, (u64, u64)>,
 }
 
 impl<S: SidecarApi + 'static> Engine<S> {
@@ -568,6 +651,10 @@ impl<S: SidecarApi + 'static> Engine<S> {
             scope_id: None,
             active_transfer: None,
             pending_pins: VecDeque::new(),
+            needs_sign_in: false,
+            sidecar_down: false,
+            sidecar_probe_at: None,
+            notifications_closed: false,
             shutting_down: false,
             started: AtomicBool::new(false),
             watcher_ready: watcher_ready.clone(),
@@ -575,6 +662,7 @@ impl<S: SidecarApi + 'static> Engine<S> {
             non_utf8_reported: HashSet::new(),
             reserved_reported: HashSet::new(),
             dir_ids: HashMap::new(),
+            file_ids: HashMap::new(),
         };
         Ok((
             engine,
@@ -592,6 +680,51 @@ impl<S: SidecarApi + 'static> Engine<S> {
     /// > caller default); the DB stays the source for future runs.
     pub fn sync_mode(&self) -> SyncMode {
         self.mode
+    }
+
+    /// Park sync work after the sidecar reported an expired/missing session.
+    /// The row stays Dirty (local content is intact); a long retry delay and
+    /// the global gate keep the engine from hammering `/auth`. `resume()`
+    /// (the host just re-authenticated) or a restart unparks it.
+    fn note_auth_required(&mut self, rel: Option<&str>, code: i64, message: &str) {
+        if let Some(rel) = rel {
+            self.retry_at
+                .insert(rel.to_string(), Instant::now() + RETRY_BACKOFF_MAX);
+        }
+        if !self.needs_sign_in {
+            warn!(code, error = %message, "sidecar session expired; parking sync until re-authentication");
+            self.emit_activity(
+                ActivityKind::SignInRequired,
+                rel.unwrap_or(""),
+                Some(format!("sign in again to resume syncing: {message}")),
+            );
+            self.needs_sign_in = true;
+        }
+    }
+
+    /// Record that the sidecar transport is unavailable and schedule the
+    /// next probe. Degraded mode is visible in status/activity; pending local
+    /// work stays in the DB.
+    fn note_sidecar_failure(&mut self, message: &str) {
+        if !self.sidecar_down {
+            warn!(error = %message, "sidecar unavailable; pausing sync until it answers again");
+            self.emit_activity(
+                ActivityKind::SidecarUnavailable,
+                "",
+                Some(message.to_string()),
+            );
+        }
+        self.sidecar_down = true;
+        self.sidecar_probe_at = Some(Instant::now() + SIDECAR_PROBE_DELAY);
+    }
+
+    /// The last sidecar call succeeded: leave degraded mode.
+    fn note_sidecar_ok(&mut self) {
+        if self.sidecar_down {
+            info!("sidecar answering again; resuming sync");
+        }
+        self.sidecar_down = false;
+        self.sidecar_probe_at = None;
     }
 
     /// Run until shutdown. Consumes the engine.
@@ -628,7 +761,7 @@ impl<S: SidecarApi + 'static> Engine<S> {
         // 3. Crash recovery (M4): transfers interrupted by a previous run
         // leave rows stuck in `Uploading` (never drained: upload_one
         // requires Dirty) and `.pds-part` temps in the backing dir.
-        if let Err(e) = self.recover_interrupted_transfers() {
+        if let Err(e) = self.recover_interrupted_transfers().await {
             warn!(error = %e, "interrupted-transfer recovery failed");
         }
 
@@ -737,7 +870,7 @@ impl<S: SidecarApi + 'static> Engine<S> {
         // (reported by the watcher as "old gone + new appeared") can be
         // paired without guessing from names or content (TG-06).
         if !self.placeholders {
-            self.index_dir_inodes();
+            self.index_local_inodes();
         }
         Ok(root_node)
     }
@@ -806,14 +939,18 @@ impl<S: SidecarApi + 'static> Engine<S> {
     ///   retries, pause buffering). A crash AFTER the transfer landed
     ///   remotely but before bookkeeping re-runs `check_remote_head`,
     ///   which keeps BOTH versions instead of silently superseding.
+    /// - Rows stuck in `Downloading` are re-fetched and downloaded again
+    ///   from the current remote head (TG-17). The final path was never
+    ///   renamed into place, so no partial bytes are trusted.
     /// - Stale `*.pds-part` transfer temps (upload scratch in the visible
     ///   root, hydration scratch in the backing dir) are deleted; a
     ///   half-written temp has no consistent content to resume from.
     ///
     /// In placeholder mode recovered rows upload from the backing dir via
     /// `content_root`, same as any other dirty file.
-    fn recover_interrupted_transfers(&mut self) -> Result<()> {
+    async fn recover_interrupted_transfers(&mut self) -> Result<()> {
         let stuck = self.db.nodes_with_state(SyncState::Uploading)?;
+        let interrupted_downloads = self.db.nodes_with_state(SyncState::Downloading)?;
         for row in stuck {
             // The file must still exist locally; if the user (or a crash
             // during a VFS unlink) removed it, the delete path owns the
@@ -860,6 +997,19 @@ impl<S: SidecarApi + 'static> Engine<S> {
                         debug!(path = %path.display(), "swept stale transfer temp");
                     }
                 }
+            }
+        }
+        // Re-download AFTER the sweep so a stale temp can never be mistaken
+        // for the recovered content. `download_file` re-reads the node, so
+        // the freshest remote bytes win over the interrupted attempt.
+        for row in interrupted_downloads {
+            warn!(path = %row.local_path, "recovering download interrupted by a previous run");
+            if let Err(e) = self.download_file(&row.node_uid, &row.local_path).await {
+                warn!(
+                    path = %row.local_path,
+                    error = %e,
+                    "interrupted download recovery failed; a later event will retry"
+                );
             }
         }
         Ok(())
@@ -943,6 +1093,19 @@ impl<S: SidecarApi + 'static> Engine<S> {
             reserved,
             Some("reserved engine-internal name; left untouched, not uploaded or deleted".into()),
         );
+    }
+
+    /// Why `rel` cannot be materialized in the sync root, if it cannot.
+    fn unmaterializable_reason(&self, rel: &str) -> Option<String> {
+        path_limit_reason(&self.root, rel)
+    }
+
+    /// Surface a remote path the local filesystem cannot represent (over
+    /// `PATH_MAX`/`NAME_MAX`) and skip it: no DB row, no transfer, so the
+    /// event loop cannot retry it in a storm. The rest of the sync continues.
+    fn report_unmaterializable(&mut self, rel: &str, reason: &str) {
+        warn!(path = %rel, reason, "remote path cannot be materialized; skipped");
+        self.emit_activity(ActivityKind::Skipped, rel, Some(reason.to_string()));
     }
 
     async fn main_loop(&mut self, fs_rx: &mut mpsc::Receiver<Vec<DebouncedEvent>>) -> Result<()> {
@@ -1051,8 +1214,18 @@ impl<S: SidecarApi + 'static> Engine<S> {
                 }
             }
             // F4: when running, pump queued work (tombstones → uploads → events).
-            if self.state == EngineState::Running && self.pump_work().await? {
-                continue;
+            if self.state == EngineState::Running {
+                match self.pump_work().await {
+                    Ok(true) => continue,
+                    Ok(false) => {}
+                    Err(e) if self.needs_sign_in || is_connection_lost_anyhow(&e) => {
+                        if !self.needs_sign_in {
+                            self.note_sidecar_failure(&e.to_string());
+                        }
+                        warn!(error = %e, "sync work parked after a session/sidecar failure");
+                    }
+                    Err(e) => return Err(e),
+                }
             }
             // If dirty rows are only waiting out a retry backoff, wake up
             // when the earliest one matures (F2 — no busy loop, no stall).
@@ -1064,15 +1237,31 @@ impl<S: SidecarApi + 'static> Engine<S> {
                         Some(c) => self.handle_command(c)?,
                     }
                 }
-                n = self.notifications.recv() => {
+                n = self.notifications.recv(), if !self.notifications_closed => {
                     match n {
                         Some(n) => self.handle_notification(n).await?,
-                        None => return Err(anyhow!("sidecar notification stream closed")),
+                        None => {
+                            // The child process exited / stdout closed: keep
+                            // the engine alive in a visible degraded state.
+                            // Pending work stays durable; recovery needs a
+                            // host restart (no automatic respawn yet).
+                            self.note_sidecar_failure("sidecar notification stream closed");
+                            self.notifications_closed = true;
+                        }
                     }
                 }
                 batch = fs_rx.recv() => {
-                    if let Some(events) = batch {
-                        self.handle_fs_batch(events).await?;
+                    if let Some(events) = batch
+                        && let Err(e) = self.handle_fs_batch(events).await
+                    {
+                        if self.needs_sign_in || is_connection_lost_anyhow(&e) {
+                            if !self.needs_sign_in {
+                                self.note_sidecar_failure(&e.to_string());
+                            }
+                            warn!(error = %e, "local batch parked after a session/sidecar failure");
+                        } else {
+                            return Err(e);
+                        }
                     }
                 }
                 _ = async {
@@ -1153,7 +1342,9 @@ impl<S: SidecarApi + 'static> Engine<S> {
                     if !self.placeholders {
                         // Placeholder mode: the FUSE mount *is* the tree.
                         let abs = to_abs(&self.root, &rel);
-                        if !abs.exists() {
+                        if let Some(reason) = self.unmaterializable_reason(&rel) {
+                            self.report_unmaterializable(&rel, &reason);
+                        } else if !abs.exists() {
                             std::fs::create_dir_all(&abs)?;
                         }
                     }
@@ -1281,6 +1472,20 @@ impl<S: SidecarApi + 'static> Engine<S> {
                 Err(e) => warn!(from = %old, to = %new, error = %e, "local folder rename failed"),
             }
         }
+        // Case-only file renames have the same delete+create shape on a
+        // case-sensitive filesystem; pair them by inode before the delete
+        // path can trash the node (TG-12).
+        for (old, new) in self.detect_case_only_file_renames() {
+            match self.apply_local_rename(None, &old, &new).await {
+                Ok(()) => {
+                    events.retain(|ev| match to_rel_checked(&self.root, &ev.path) {
+                        RelCheck::Valid(rel) => rel != old,
+                        _ => true,
+                    });
+                }
+                Err(e) => warn!(from = %old, to = %new, error = %e, "local case-only rename failed"),
+            }
+        }
         // Queue of (rel, is_dir) to process, parent dirs before their
         // children so uploads can rely on the remote folder chain.
         let mut queue: Vec<(String, bool)> = Vec::new();
@@ -1332,6 +1537,7 @@ impl<S: SidecarApi + 'static> Engine<S> {
                 self.remember_dir_inode(&rel);
             } else if abs.is_file() {
                 self.upsert_local_file(&rel).await?;
+                self.remember_file_inode(&rel);
             } else {
                 self.handle_local_delete(&rel).await?;
             }
@@ -1339,10 +1545,11 @@ impl<S: SidecarApi + 'static> Engine<S> {
         Ok(())
     }
 
-    /// Remember the identity of every directory currently on disk, so later
-    /// watcher batches can tell a rename from a delete + create.
-    fn index_dir_inodes(&mut self) {
+    /// Remember the identity of every tracked item currently on disk, so
+    /// later watcher batches can tell a rename from a delete + create.
+    fn index_local_inodes(&mut self) {
         self.dir_ids.clear();
+        self.file_ids.clear();
         let mut stack = vec![String::new()];
         while let Some(rel) = stack.pop() {
             let abs = if rel.is_empty() {
@@ -1366,13 +1573,16 @@ impl<S: SidecarApi + 'static> Engine<S> {
                 let Ok(meta) = entry.metadata() else {
                     continue;
                 };
-                if !meta.is_dir() {
-                    continue;
+                if meta.is_dir() {
+                    if let Some(id) = dir_identity(&meta) {
+                        self.dir_ids.insert(child.clone(), id);
+                    }
+                    stack.push(child);
+                } else if meta.is_file()
+                    && let Some(id) = dir_identity(&meta)
+                {
+                    self.file_ids.insert(child, id);
                 }
-                if let Some(id) = dir_identity(&meta) {
-                    self.dir_ids.insert(child.clone(), id);
-                }
-                stack.push(child);
             }
         }
     }
@@ -1384,6 +1594,105 @@ impl<S: SidecarApi + 'static> Engine<S> {
         {
             self.dir_ids.insert(rel.to_string(), id);
         }
+    }
+
+    /// Index the inode of every ancestor of `rel`. A folder created together
+    /// with its contents can miss its own watcher event (the recursive watch
+    /// is attached after the fact) while the children still arrive; without
+    /// this, a later rename of that folder looks like a delete + create and
+    /// can trip the mass-deletion guard before the destination event lands.
+    fn remember_ancestor_dir_inodes(&mut self, rel: &str) {
+        let Some((parent, _)) = rel.rsplit_once('/') else {
+            return;
+        };
+        let mut prefix = String::new();
+        for part in parent.split('/') {
+            if !prefix.is_empty() {
+                prefix.push('/');
+            }
+            prefix.push_str(part);
+            if !self.dir_ids.contains_key(&prefix) {
+                self.remember_dir_inode(&prefix);
+            }
+        }
+    }
+
+    fn remember_file_inode(&mut self, rel: &str) {
+        if let Ok(meta) = std::fs::metadata(to_abs(&self.root, rel))
+            && meta.is_file()
+            && let Some(id) = dir_identity(&meta)
+        {
+            self.file_ids.insert(rel.to_string(), id);
+        }
+    }
+
+    /// Pair tracked files that vanished from disk with a still-untracked
+    /// sibling in the same directory whose name differs only by ASCII case
+    /// and whose filesystem identity is unchanged. On a case-sensitive
+    /// filesystem a case-only rename arrives as delete + create; replaying it
+    /// through the rename machinery preserves the node (uid, revisions)
+    /// instead of trashing it and uploading a new one (TG-12).
+    fn detect_case_only_file_renames(&mut self) -> Vec<(String, String)> {
+        let vanished: Vec<(String, (u64, u64))> = self
+            .file_ids
+            .iter()
+            .filter(|(rel, _)| !to_abs(&self.root, rel).is_file())
+            .filter(|(rel, _)| {
+                self.db
+                    .node_by_path(rel)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|row| row.is_file())
+            })
+            .map(|(rel, id)| (rel.clone(), *id))
+            .collect();
+        if vanished.is_empty() {
+            return Vec::new();
+        }
+        let mut used = HashSet::new();
+        let mut pairs = Vec::new();
+        for (old_rel, id) in vanished {
+            let (parent, old_name) = match old_rel.rsplit_once('/') {
+                Some((parent, name)) => (parent.to_string(), name.to_string()),
+                None => (String::new(), old_rel.clone()),
+            };
+            let parent_abs = if parent.is_empty() {
+                self.root.clone()
+            } else {
+                to_abs(&self.root, &parent)
+            };
+            let Ok(entries) = std::fs::read_dir(&parent_abs) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let Ok(name) = entry.file_name().into_string() else {
+                    continue;
+                };
+                if name == old_name || !name.eq_ignore_ascii_case(&old_name) {
+                    continue;
+                }
+                let new_rel = if parent.is_empty() {
+                    name
+                } else {
+                    format!("{parent}/{name}")
+                };
+                if used.contains(&new_rel)
+                    || self.db.node_by_path(&new_rel).ok().flatten().is_some()
+                {
+                    continue;
+                }
+                let Ok(meta) = entry.metadata() else {
+                    continue;
+                };
+                if !meta.is_file() || dir_identity(&meta) != Some(id) {
+                    continue;
+                }
+                used.insert(new_rel.clone());
+                pairs.push((old_rel.clone(), new_rel));
+                break;
+            }
+        }
+        pairs
     }
 
     /// Pair tracked directories that vanished from disk with newly appeared,
@@ -1571,12 +1880,17 @@ impl<S: SidecarApi + 'static> Engine<S> {
     /// Earliest backoff expiry among scheduled retries, if any. Stale
     /// entries are harmless (the wake just finds nothing eligible).
     fn next_retry_wake(&self) -> Option<Instant> {
-        self.retry_at.values().copied().min()
+        self.retry_at
+            .values()
+            .copied()
+            .chain(self.sidecar_probe_at)
+            .min()
     }
 
     /// Create/write-close on a file: hash, then upload (new node or new
     /// revision) or mark dirty while paused (F4 buffering).
     async fn upsert_local_file(&mut self, rel: &str) -> Result<()> {
+        self.remember_ancestor_dir_inodes(rel);
         let abs = self.content_path(rel);
         let meta = match std::fs::metadata(&abs) {
             Ok(m) => m,
@@ -1674,8 +1988,8 @@ impl<S: SidecarApi + 'static> Engine<S> {
             self.retry_at.remove(rel);
         }
 
-        if self.state != EngineState::Running {
-            debug!(path = %rel, "paused: buffered dirty file");
+        if self.state != EngineState::Running || self.needs_sign_in || self.sidecar_down {
+            debug!(path = %rel, "paused/degraded: buffered dirty file");
             return Ok(());
         }
         self.upload_one(rel).await
@@ -1708,6 +2022,10 @@ impl<S: SidecarApi + 'static> Engine<S> {
         // superseding it.
         if !row.node_uid.starts_with("pending:") {
             self.check_remote_head(rel, &row).await?;
+            // Auth expiry / transport death parks the whole queue.
+            if self.needs_sign_in || self.sidecar_down {
+                return Ok(());
+            }
             // The check may have re-keyed the row (vanished node) or left it
             // untouched (fast path / conflict downloaded); re-read it.
             let Some(row) = self.db.node_by_path(rel)? else {
@@ -1745,6 +2063,17 @@ impl<S: SidecarApi + 'static> Engine<S> {
     async fn check_remote_head(&mut self, rel: &str, row: &NodeRow) -> Result<()> {
         let node = match self.sidecar.get_node(&row.node_uid).await {
             Ok(n) => n,
+            Err(e) if is_connection_lost(&e) => {
+                // Transport death must NOT be mistaken for "node vanished"
+                // (that would re-key the row and upload a duplicate later).
+                self.note_sidecar_failure(&e.to_string());
+                return Ok(());
+            }
+            Err(e) if e.code().is_some_and(is_auth_error) => {
+                let code = e.code().expect("checked above");
+                self.note_auth_required(Some(rel), code, &e.to_string());
+                return Ok(());
+            }
             Err(e) => {
                 // Node gone remotely (trashed by another client; the event
                 // hasn't reached us). Re-upload as a NEW file rather than
@@ -1794,7 +2123,7 @@ impl<S: SidecarApi + 'static> Engine<S> {
         if let Some(dir) = abs.parent() {
             std::fs::create_dir_all(dir)?;
         }
-        let tmp_rel = format!("{conflict_rel}.pds-part");
+        let tmp_rel = transfer_temp_rel(&conflict_rel);
         let tmp = self.content_path(&tmp_rel);
         let sidecar = Arc::clone(&self.sidecar);
         self.run_transfer(
@@ -1891,6 +2220,7 @@ impl<S: SidecarApi + 'static> Engine<S> {
         self.db.upsert_node(&row)?;
         self.clear_upload_blocks(rel)?;
         self.retry_at.remove(rel);
+        self.note_sidecar_ok();
         info!(path = %rel, "uploaded");
         self.emit_activity(ActivityKind::Uploaded, rel, None);
         Ok(())
@@ -1915,11 +2245,23 @@ impl<S: SidecarApi + 'static> Engine<S> {
     ) -> Result<()> {
         let (code, message, retryable, retry_after) = match failure {
             TransferFailure::Aborted(e) => {
-                // Shutdown/transport teardown — leave dirty for next run.
+                // Leave the row Dirty for the next run/session.
                 if self.db.node_by_path(rel)?.is_some() {
                     self.db.set_sync_state(rel, SyncState::Dirty)?;
                 }
-                return Err(e);
+                if self.shutting_down {
+                    return Err(e); // normal teardown, not a failure to surface
+                }
+                if !is_connection_lost_anyhow(&e) {
+                    return Err(e); // e.g. a local DB failure, not a sidecar loss
+                }
+                // Transport death mid-transfer (sidecar process exit, EOF).
+                // Keep the engine alive in a visible degraded state and
+                // avoid an immediate retry spin; no respawn is attempted.
+                self.note_sidecar_failure(&e.to_string());
+                self.retry_at
+                    .insert(rel.to_string(), Instant::now() + RETRY_BACKOFF_MAX);
+                return Ok(());
             }
             TransferFailure::Remote {
                 code,
@@ -1932,6 +2274,13 @@ impl<S: SidecarApi + 'static> Engine<S> {
             return Ok(()); // vanished mid-transfer; delete path owns it
         }
         self.db.set_sync_state(rel, SyncState::Dirty)?;
+
+        // Auth expired mid-transfer: park, never loop (the sidecar would
+        // reject every attempt until the host signs in again).
+        if is_auth_error(code) {
+            self.note_auth_required(Some(rel), code, &message);
+            return Ok(());
+        }
 
         // The 409 class: the remote head moved under us (e.g. its event was
         // applied first and updated our synced head, so the getNode
@@ -2112,6 +2461,8 @@ impl<S: SidecarApi + 'static> Engine<S> {
                 }
             }
             self.db.remove_node(old_rel)?;
+            self.file_ids.remove(old_rel);
+            self.remember_file_inode(new_rel);
             let uid = dest.node_uid.clone();
             self.db.upsert_node(&NodeRow {
                 sync_state: SyncState::Dirty,
@@ -2222,36 +2573,22 @@ impl<S: SidecarApi + 'static> Engine<S> {
                 store.set_backing(new_rel, own);
             }
         }
-        // Directory identities follow the rows, so the next rename inside
+        // Filesystem identities follow the rows, so the next rename inside
         // the moved subtree is recognized without re-indexing the root.
-        if !row.is_file() {
-            self.rekey_dir_inodes(old_rel, new_rel);
+        self.rekey_local_inodes(old_rel, new_rel);
+        if row.is_file() {
+            self.remember_file_inode(new_rel);
         }
         info!(from = %old_rel, to = %new_rel, "rename applied");
         Ok(())
     }
 
-    /// Move tracked `(device, inode)` entries from the old path prefix to
-    /// the new one after a local (or mirrored remote) rename.
-    fn rekey_dir_inodes(&mut self, old_rel: &str, new_rel: &str) {
-        let old_prefix = format!("{old_rel}/");
-        let moved: Vec<(String, (u64, u64))> = self
-            .dir_ids
-            .iter()
-            .filter(|(path, _)| *path == old_rel || path.starts_with(&old_prefix))
-            .map(|(path, id)| (path.clone(), *id))
-            .collect();
-        for (path, _) in &moved {
-            self.dir_ids.remove(path);
-        }
-        for (path, id) in moved {
-            let moved_path = if path == old_rel {
-                new_rel.to_string()
-            } else {
-                format!("{new_rel}/{}", &path[old_rel.len() + 1..])
-            };
-            self.dir_ids.insert(moved_path, id);
-        }
+    /// Move tracked `(device, inode)` entries (directories and files) from
+    /// the old path prefix to the new one after a local (or mirrored remote)
+    /// rename.
+    fn rekey_local_inodes(&mut self, old_rel: &str, new_rel: &str) {
+        rekey_inode_map(&mut self.dir_ids, old_rel, new_rel);
+        rekey_inode_map(&mut self.file_ids, old_rel, new_rel);
     }
 
     async fn handle_local_delete(&mut self, rel: &str) -> Result<()> {
@@ -2269,6 +2606,9 @@ impl<S: SidecarApi + 'static> Engine<S> {
             debug!(path = %rel, "delete of unknown local item: no remote action");
             return Ok(());
         };
+        // The path no longer holds this tracked inode; the next create/rename
+        // registers its own identity.
+        self.file_ids.remove(rel);
         if row.sync_state != SyncState::Synced {
             // Never confirmed synced → local removal only (F3.1). An
             // inbound overwrite-rename owns this path: its merge keeps
@@ -2331,6 +2671,7 @@ impl<S: SidecarApi + 'static> Engine<S> {
             .trash(std::slice::from_ref(&t.node_uid))
             .await?;
         if results.iter().any(|r| r.uid == t.node_uid && r.ok) {
+            self.note_sidecar_ok();
             info!(path = %t.local_path, uid = %t.node_uid, "trashed remotely");
             self.remove_node_recursive(&t.local_path)?;
             self.db.remove_tombstone(&t.local_path)?;
@@ -2364,10 +2705,23 @@ impl<S: SidecarApi + 'static> Engine<S> {
     async fn handle_notification(&mut self, n: Notification) -> Result<()> {
         match n {
             Notification::DriveEvent(ev) => {
-                if self.state == EngineState::Running {
-                    self.apply_event(*ev).await?;
+                if self.state == EngineState::Running && !self.needs_sign_in && !self.sidecar_down {
+                    let event = (*ev).clone();
+                    match self.apply_event(event).await {
+                        Ok(()) => {}
+                        Err(e) if self.needs_sign_in || is_connection_lost_anyhow(&e) => {
+                            if !self.needs_sign_in && !self.sidecar_down {
+                                self.note_sidecar_failure(&e.to_string());
+                            }
+                            // apply_event persists the cursor last, so the
+                            // event is safe to replay after recovery.
+                            debug!(event = %ev.event_id, "parking event after a session/sidecar failure");
+                            self.buffered_events.push_back(*ev);
+                        }
+                        Err(e) => return Err(e),
+                    }
                 } else {
-                    debug!(event = %ev.event_id, "paused: buffering remote event");
+                    debug!(event = %ev.event_id, "paused/degraded: buffering remote event");
                     self.buffered_events.push_back(*ev);
                 }
             }
@@ -2397,6 +2751,12 @@ impl<S: SidecarApi + 'static> Engine<S> {
                     if ev.is_trashed == Some(true) {
                         self.apply_remote_delete(&uid)?;
                     } else if let Err(e) = self.apply_node_upsert(&uid).await {
+                        // Auth/transport failures mean the event was not
+                        // applied: propagate so the caller parks it for replay
+                        // instead of advancing the cursor past it.
+                        if self.needs_sign_in || is_connection_lost_anyhow(&e) {
+                            return Err(e);
+                        }
                         warn!(uid = %uid, error = %e, "failed to apply node event");
                     }
                 }
@@ -2412,6 +2772,10 @@ impl<S: SidecarApi + 'static> Engine<S> {
                 if !self.placeholders {
                     let files = self.remote_files_needing_download()?;
                     for (rel, uid) in files {
+                        if let Some(reason) = self.unmaterializable_reason(&rel) {
+                            self.report_unmaterializable(&rel, &reason);
+                            continue;
+                        }
                         self.download_file(&uid, &rel).await?;
                     }
                 }
@@ -2438,15 +2802,17 @@ impl<S: SidecarApi + 'static> Engine<S> {
         let root_uid = self.db_root_uid()?;
         let mut chain = Vec::new();
         let mut parent = node.parent_uid.clone();
-        let mut depth = 0;
+        let mut seen = HashSet::from([node.uid.clone()]);
         while let Some(uid) = parent {
-            depth += 1;
             // The root is a path boundary, not a node row: never fetch or
             // insert it (its empty name would corrupt every derived path).
-            if depth > 64
-                || Some(uid.as_str()) == root_uid.as_deref()
+            if Some(uid.as_str()) == root_uid.as_deref()
                 || self.db.node_by_uid(&uid)?.is_some()
             {
+                break;
+            }
+            if !seen.insert(uid.clone()) {
+                warn!(uid = %uid, "remote parent cycle detected; stopping ancestor walk");
                 break;
             }
             let ancestor = match self.sidecar.get_node(&uid).await {
@@ -2466,6 +2832,12 @@ impl<S: SidecarApi + 'static> Engine<S> {
             if self.placeholders || !ancestor.is_folder() {
                 continue;
             }
+            if self.unmaterializable_reason(&rel).is_some() {
+                // Keep the logical row (descendant paths stay correct) but do
+                // not attempt a directory the OS cannot create. The node that
+                // triggered this walk gets its own visible skip.
+                continue;
+            }
             std::fs::create_dir_all(to_abs(&self.root, &rel))?;
             self.remember_dir_inode(&rel);
         }
@@ -2477,7 +2849,16 @@ impl<S: SidecarApi + 'static> Engine<S> {
         let node = match self.sidecar.get_node(uid).await {
             Ok(n) => n,
             Err(e) => {
-                debug!(uid = %uid, error = %e, "node vanished before fetch; skipping");
+                let err = anyhow::Error::from(e);
+                if let Some((code, message)) = auth_error_in_anyhow(&err) {
+                    self.note_auth_required(None, code, &message);
+                    return Err(err);
+                }
+                if is_connection_lost_anyhow(&err) {
+                    self.note_sidecar_failure(&err.to_string());
+                    return Err(err);
+                }
+                debug!(uid = %uid, error = %err, "node vanished before fetch; skipping");
                 return Ok(());
             }
         };
@@ -2487,6 +2868,19 @@ impl<S: SidecarApi + 'static> Engine<S> {
         // lost (TG-02 event ordering).
         self.resolve_unknown_ancestors(&node).await?;
         let rel = self.local_path_for(&node)?;
+        // A remote path the local filesystem cannot hold must fail visibly
+        // BEFORE any FS/transfer work (TG-14): no partial dir chain, no temp
+        // file, and — for a file — no DB row to retry forever.
+        if !self.placeholders
+            && let Some(reason) = self.unmaterializable_reason(&rel)
+        {
+            if node.is_folder() {
+                // Keep the logical row so descendant paths still resolve.
+                self.upsert_from_node(&node, &rel, SyncState::Synced)?;
+            }
+            self.report_unmaterializable(&rel, &reason);
+            return Ok(());
+        }
         // Resolve by node uid FIRST: a remote rename/move changes the path
         // derived from the node's current name/parent, while the DB row (and
         // its hydrated content) still sits at the old path. Without this the
@@ -2691,7 +3085,7 @@ impl<S: SidecarApi + 'static> Engine<S> {
                 store.set_backing(&new_rel, to);
             }
         }
-        self.rekey_dir_inodes(rel, &new_rel);
+        self.rekey_local_inodes(rel, &new_rel);
         info!(from = %rel, to = %new_rel, "local item renamed aside for conflict");
         Ok(new_rel)
     }
@@ -2762,8 +3156,9 @@ impl<S: SidecarApi + 'static> Engine<S> {
                 store.set_backing(new_rel, to);
             }
         }
-        if !old.is_file() {
-            self.rekey_dir_inodes(&old_rel, new_rel);
+        self.rekey_local_inodes(&old_rel, new_rel);
+        if old.is_file() {
+            self.remember_file_inode(new_rel);
         }
         info!(from = %old_rel, to = %new_rel, uid = %node.uid, "remote rename/move applied");
         Ok(())
@@ -2771,13 +3166,16 @@ impl<S: SidecarApi + 'static> Engine<S> {
 
     /// Compute the local relative path for a remote node by walking parent
     /// uids through the DB. Unknown parents fall back to the sync root.
+    /// Iterative and uncapped: a deep tree (TG-14) must keep its full path,
+    /// not silently re-anchor 64 levels down. A parent cycle (corrupt state)
+    /// stops at the last known ancestor instead of looping forever.
     fn local_path_for(&self, node: &Node) -> Result<String> {
         let mut parts = vec![node.name.clone()];
         let mut parent = node.parent_uid.clone();
-        let mut depth = 0;
+        let mut seen = HashSet::from([node.uid.clone()]);
         while let Some(uid) = parent {
-            depth += 1;
-            if depth > 64 {
+            if !seen.insert(uid.clone()) {
+                warn!(uid = %uid, "remote parent cycle detected; stopping path walk");
                 break;
             }
             match self.db.node_by_uid(&uid)? {
@@ -2796,11 +3194,6 @@ impl<S: SidecarApi + 'static> Engine<S> {
         let Some(row) = self.db.node_by_uid(uid)? else {
             return Ok(());
         };
-        if !row.is_file() {
-            let prefix = format!("{}/", row.local_path);
-            self.dir_ids
-                .retain(|rel, _| rel != &row.local_path && !rel.starts_with(&prefix));
-        }
         let content_abs = self.content_path(&row.local_path);
         // F7 (M4 soak find): the row's state alone can LIE — a local write
         // still inside the watcher's debounce window has not marked the row
@@ -2836,6 +3229,15 @@ impl<S: SidecarApi + 'static> Engine<S> {
             } else {
                 std::fs::remove_file(&abs).ok();
             }
+        }
+        if row.is_file() {
+            self.file_ids.remove(&row.local_path);
+        } else {
+            let prefix = format!("{}/", row.local_path);
+            self.dir_ids
+                .retain(|rel, _| rel != &row.local_path && !rel.starts_with(&prefix));
+            self.file_ids
+                .retain(|rel, _| rel != &row.local_path && !rel.starts_with(&prefix));
         }
         self.remove_node_recursive(&row.local_path)?;
         Ok(())
@@ -3038,6 +3440,13 @@ impl<S: SidecarApi + 'static> Engine<S> {
         mtime: Option<i64>,
         mode: Option<u32>,
     ) -> Result<()> {
+        if let Some(reason) = path_limit_reason(&self.backing_dir, rel) {
+            // Hydration target is the backing cache: same OS limits, and the
+            // cache path is longer than the visible root's. Surface it once
+            // instead of letting the reader see a bare EIO.
+            self.report_unmaterializable(rel, &reason);
+            anyhow::bail!("{reason}");
+        }
         let abs = to_abs(&self.backing_dir, rel);
         if abs.is_file() {
             return Ok(()); // already hydrated (lost wake-up)
@@ -3045,7 +3454,7 @@ impl<S: SidecarApi + 'static> Engine<S> {
         if let Some(dir) = abs.parent() {
             std::fs::create_dir_all(dir)?;
         }
-        let tmp = to_abs(&self.backing_dir, &format!("{rel}.pds-part"));
+        let tmp = to_abs(&self.backing_dir, &transfer_temp_rel(rel));
         // Surface an unwritable backing dir before the transfer (see
         // `try_download_file`); this is also the temp the transfer writes.
         std::fs::File::create(&tmp)
@@ -3056,6 +3465,20 @@ impl<S: SidecarApi + 'static> Engine<S> {
             .await
         {
             Ok(outcome) => outcome,
+            Err(TransferFailure::Remote { code, message, .. }) if is_auth_error(code) => {
+                let _ = std::fs::remove_file(&tmp);
+                self.note_auth_required(Some(rel), code, &message);
+                return Err(anyhow!(
+                    "sign-in required while downloading `{rel}`: {message}"
+                ));
+            }
+            Err(TransferFailure::Aborted(e)) => {
+                let _ = std::fs::remove_file(&tmp);
+                if !self.shutting_down && is_connection_lost_anyhow(&e) {
+                    self.note_sidecar_failure(&e.to_string());
+                }
+                return Err(e);
+            }
             Err(e) => {
                 let _ = std::fs::remove_file(&tmp);
                 return Err(anyhow::Error::new(e).context(format!("hydrate `{rel}`")));
@@ -3286,6 +3709,10 @@ impl<S: SidecarApi + 'static> Engine<S> {
     /// the row as `Downloading` with the error and a backoff, leaving any
     /// existing local content untouched (TG-19).
     async fn download_file(&mut self, uid: &str, rel: &str) -> Result<()> {
+        if let Some(reason) = self.unmaterializable_reason(rel) {
+            self.report_unmaterializable(rel, &reason);
+            return Ok(());
+        }
         match self.try_download_file(uid, rel).await {
             Ok(()) => Ok(()),
             Err(e) => {
@@ -3318,7 +3745,7 @@ impl<S: SidecarApi + 'static> Engine<S> {
         // already knows the user's `chmod` keeps it across re-downloads.
         let existing_mode = self.db.node_by_path(rel)?.and_then(|r| r.mode);
         let remote_mtime = node.as_ref().and_then(|n| n.mtime);
-        let tmp_rel = format!("{rel}.pds-part");
+        let tmp_rel = transfer_temp_rel(rel);
         let tmp = self.content_path(&tmp_rel);
         if let Some(dir) = abs.parent() {
             std::fs::create_dir_all(dir)
@@ -3332,17 +3759,32 @@ impl<S: SidecarApi + 'static> Engine<S> {
         std::fs::File::create(&tmp)
             .with_context(|| format!("prepare download target {}", abs.display()))?;
         let sidecar = Arc::clone(&self.sidecar);
-        let outcome = match self
+        match self
             .run_transfer("download", Some(rel), sidecar.download(uid, &tmp))
             .await
         {
-            Ok(outcome) => outcome,
+            Ok(_) => {}
+            Err(TransferFailure::Remote { code, message, .. }) if is_auth_error(code) => {
+                // Park the event (the caller re-buffers it) and surface the
+                // sign-in requirement instead of dying or advancing the
+                // cursor past a file we never materialized. The row stays
+                // `Downloading` so it is retried once the session is valid.
+                self.note_auth_required(Some(rel), code, &message);
+                return Err(anyhow!(
+                    "sign-in required while downloading `{rel}`: {message}"
+                ));
+            }
+            Err(TransferFailure::Aborted(e)) => {
+                if !self.shutting_down && is_connection_lost_anyhow(&e) {
+                    self.note_sidecar_failure(&e.to_string());
+                }
+                return Err(e);
+            }
             Err(e) => {
                 let _ = std::fs::remove_file(&tmp);
                 return Err(anyhow::Error::new(e).context(format!("download `{rel}`")));
             }
-        };
-        let _ = outcome;
+        }
         if let Err(e) = std::fs::rename(&tmp, &abs) {
             let _ = std::fs::remove_file(&tmp);
             return Err(anyhow::Error::new(e)
@@ -3364,7 +3806,9 @@ impl<S: SidecarApi + 'static> Engine<S> {
             synced_sha1: node.as_ref().and_then(|n| n.sha1.clone()),
         })?;
         self.clear_upload_blocks(rel)?;
+        self.note_sidecar_ok();
         self.retry_at.remove(rel);
+        self.remember_file_inode(rel);
         info!(path = %rel, "downloaded");
         self.emit_activity(ActivityKind::Downloaded, rel, None);
         Ok(())
@@ -3401,9 +3845,26 @@ impl<S: SidecarApi + 'static> Engine<S> {
         local_path: Option<&str>,
         start: impl std::future::Future<Output = Result<String, pds_sidecar_client::Error>>,
     ) -> Result<TransferOutcome, TransferFailure> {
-        let transfer_id = start
-            .await
-            .map_err(|e| TransferFailure::Aborted(e.into()))?;
+        let transfer_id = start.await.map_err(|e| {
+            // Preserve a request-level code (session expired, rate limit,
+            // conflict) instead of collapsing every failure into an abort;
+            // transport death stays Aborted so it is retried/degraded.
+            if is_connection_lost(&e) {
+                TransferFailure::Aborted(e.into())
+            } else {
+                match &e {
+                    pds_sidecar_client::Error::Rpc(rpc) => TransferFailure::Remote {
+                        code: rpc.code,
+                        message: rpc.message.clone(),
+                        retryable: rpc.code == pds_sidecar_client::types::error_codes::RATE_LIMITED,
+                        retry_after: rpc
+                            .retry_after()
+                            .map(|secs| Duration::from_secs_f64(secs.max(0.0))),
+                    },
+                    _ => TransferFailure::Aborted(e.into()),
+                }
+            }
+        })?;
         self.active_transfer = Some(transfer_id.clone());
         self.db
             .upsert_transfer(
@@ -3459,7 +3920,9 @@ impl<S: SidecarApi + 'static> Engine<S> {
                             });
                         }
                         Some(other) => self.backlog.push_back(other),
-                        None => break Err(TransferFailure::Aborted(anyhow!("sidecar closed during transfer"))),
+                        None => break Err(TransferFailure::Aborted(
+                            pds_sidecar_client::Error::Closed.into(),
+                        )),
                     }
                 }
             }
@@ -3526,6 +3989,19 @@ impl<S: SidecarApi + 'static> Engine<S> {
                 }
                 // Explicit resume = "try now": drop pending retry backoffs.
                 self.retry_at.clear();
+                // Resume is also the host's "sign-in finished" signal (the
+                // desktop app restarts the engine after login; embedding
+                // callers may just resume). Re-probe a transiently failed
+                // sidecar, but a closed notification stream cannot recover
+                // without a restart.
+                if self.needs_sign_in {
+                    info!("session restored: resuming parked sync work");
+                    self.needs_sign_in = false;
+                }
+                if self.sidecar_down && !self.notifications_closed {
+                    self.sidecar_down = false;
+                    self.sidecar_probe_at = None;
+                }
                 if let Some(tid) = self.active_transfer.clone() {
                     let sidecar = Arc::clone(&self.sidecar);
                     tokio::spawn(async move {
@@ -3560,6 +4036,8 @@ impl<S: SidecarApi + 'static> Engine<S> {
                     cache_cap: self.eviction_cap,
                     cache_used,
                     cache_path,
+                    needs_sign_in: self.needs_sign_in,
+                    sidecar_unavailable: self.sidecar_down || self.notifications_closed,
                 });
             }
             Command::Shutdown => {}
@@ -3649,9 +4127,40 @@ impl<S: SidecarApi + 'static> Engine<S> {
     /// drain order "uploads then events", accepted for F7 safety.)
     /// Returns true if any work was done.
     async fn pump_work(&mut self) -> Result<bool> {
+        // The sidecar process is gone: no retry can succeed without a host
+        // restart (no automatic respawn). Stay alive for status/commands.
+        if self.notifications_closed {
+            return Ok(false);
+        }
+        if self.sidecar_down {
+            let due = self.sidecar_probe_at.is_none_or(|at| at <= Instant::now());
+            if !due {
+                return Ok(false);
+            }
+            // Probe once; the handlers re-enter degraded mode on failure.
+            self.sidecar_down = false;
+            self.sidecar_probe_at = None;
+        }
+        // No session: every remote call would fail. Keep the queues intact
+        // until an explicit resume (host re-authenticated) or restart.
+        if self.needs_sign_in {
+            return Ok(false);
+        }
         if !self.db.tombstones()?.is_empty() {
             // Guard may auto-pause; false means "stop pumping".
-            self.drain_one_tombstone().await?;
+            match self.drain_one_tombstone().await {
+                Ok(_) => {}
+                Err(e) if is_connection_lost_anyhow(&e) => {
+                    self.note_sidecar_failure(&e.to_string());
+                    return Ok(false);
+                }
+                Err(e) if auth_error_in_anyhow(&e).is_some() => {
+                    let (code, message) = auth_error_in_anyhow(&e).expect("checked above");
+                    self.note_auth_required(None, code, &message);
+                    return Ok(false);
+                }
+                Err(e) => return Err(e),
+            }
             // Write-through: the VFS tree must drop the path right away.
             if let Some(store) = &self.store
                 && let Err(e) = self.publish_vfs_snapshot(store)
@@ -3661,7 +4170,21 @@ impl<S: SidecarApi + 'static> Engine<S> {
             return Ok(true);
         }
         if let Some(ev) = self.buffered_events.pop_front() {
-            self.apply_event(ev).await?;
+            match self.apply_event(ev.clone()).await {
+                Ok(()) => {}
+                Err(_) if self.needs_sign_in => {
+                    // Retry after sign-in: the event was not committed
+                    // (apply_event saves the cursor last).
+                    self.buffered_events.push_front(ev);
+                    return Ok(false);
+                }
+                Err(e) if is_connection_lost_anyhow(&e) => {
+                    self.note_sidecar_failure(&e.to_string());
+                    self.buffered_events.push_front(ev);
+                    return Ok(false);
+                }
+                Err(e) => return Err(e),
+            }
             return Ok(true);
         }
         // Failed downloads/hydrations: retry once their backoff matures (an
@@ -3697,7 +4220,16 @@ impl<S: SidecarApi + 'static> Engine<S> {
                     && self.retry_at.get(&r.local_path).is_none_or(|t| *t <= now)
             })
         {
-            self.upload_one(&row.local_path).await?;
+            match self.upload_one(&row.local_path).await {
+                Ok(()) => {}
+                Err(e) if self.needs_sign_in || is_connection_lost_anyhow(&e) => {
+                    if !self.needs_sign_in {
+                        self.note_sidecar_failure(&e.to_string());
+                    }
+                    return Ok(false);
+                }
+                Err(e) => return Err(e),
+            }
             return Ok(true);
         }
         Ok(false)
@@ -3971,9 +4503,56 @@ fn dir_identity(meta: &std::fs::Metadata) -> Option<(u64, u64)> {
     Some((meta.dev(), meta.ino()))
 }
 
+/// Move every tracked identity at `old_rel` or below to the `new_rel`
+/// prefix. Shared by the directory and file maps so both follow a rename.
+fn rekey_inode_map(
+    map: &mut std::collections::HashMap<String, (u64, u64)>,
+    old_rel: &str,
+    new_rel: &str,
+) {
+    let old_prefix = format!("{old_rel}/");
+    let moved: Vec<(String, (u64, u64))> = map
+        .iter()
+        .filter(|(path, _)| *path == old_rel || path.starts_with(&old_prefix))
+        .map(|(path, id)| (path.clone(), *id))
+        .collect();
+    for (path, _) in &moved {
+        map.remove(path);
+    }
+    for (path, id) in moved {
+        let moved_path = if path == old_rel {
+            new_rel.to_string()
+        } else {
+            format!("{new_rel}/{}", &path[old_rel.len() + 1..])
+        };
+        map.insert(moved_path, id);
+    }
+}
+
 /// Absolute path from a root-relative '/'-separated path.
 pub fn to_abs(root: &Path, rel: &str) -> PathBuf {
     rel.split('/').fold(root.to_path_buf(), |p, c| p.join(c))
+}
+
+/// Linux filesystem limits, in bytes. `PATH_MAX` includes the terminating
+/// NUL, so a valid path must be strictly shorter; `NAME_MAX` bounds one
+/// component. Both are enforced by the kernel at syscall time, but checking
+/// first turns an over-long REMOTE path into a visible skip instead of a
+/// partial directory chain, a half-written temp file, or a retry loop.
+const PATH_MAX_BYTES: usize = 4096;
+const NAME_MAX_BYTES: usize = 255;
+
+/// Why `rel` cannot be materialized under `base`, if it cannot.
+fn path_limit_reason(base: &Path, rel: &str) -> Option<String> {
+    if let Some(component) = rel.split('/').find(|c| c.len() > NAME_MAX_BYTES) {
+        return Some(format!(
+            "name component is {} bytes (NAME_MAX {NAME_MAX_BYTES}); skipped",
+            component.len()
+        ));
+    }
+    let len = to_abs(base, rel).as_os_str().len();
+    (len >= PATH_MAX_BYTES)
+        .then(|| format!("path is {len} bytes (PATH_MAX {PATH_MAX_BYTES}); skipped"))
 }
 
 /// Relative-path classification: the Drive protocol only carries UTF-8
@@ -4077,6 +4656,23 @@ fn is_temp_file(rel: &str) -> bool {
                 _ => b.is_ascii_hexdigit(),
             })
     })
+}
+
+/// Short, unique temp sibling for a download target.
+///
+/// The final `rename` needs the temp in the same directory to stay atomic,
+/// but appending `.pds-part` to a `NAME_MAX`-sized component overflows the
+/// filesystem limit. Hash the target path instead, keeping the suffix and
+/// directory (the stale-temp sweep keys off the suffix).
+fn transfer_temp_rel(rel: &str) -> String {
+    use sha1::Digest;
+    let mut hasher = sha1::Sha1::new();
+    hasher.update(rel.as_bytes());
+    let name = format!(".pds-{:x}.pds-part", hasher.finalize());
+    match rel.rsplit_once('/') {
+        Some((dir, _)) => format!("{dir}/{name}"),
+        None => name,
+    }
 }
 
 /// Insert `suffix` before the extension: `a.txt` + ` (2)` → `a (2).txt`.
@@ -4341,6 +4937,25 @@ mod tests {
         assert!(!is_temp_file("report.pds-part.txt"));
         assert!(!is_temp_file("foo.pdstmp-bar"));
         assert!(!is_temp_file("foo.pdstmp-abc123"));
+    }
+
+    #[test]
+    fn transfer_temps_stay_next_to_the_target_within_name_max() {
+        // Same directory so the final rename is atomic; short name so a
+        // 255-byte target component still fits the temp (TG-14).
+        let long = format!("{}.bin", "y".repeat(251));
+        let tmp = transfer_temp_rel(&long);
+        assert_eq!(tmp.len(), ".pds-".len() + 40 + ".pds-part".len());
+        assert!(is_temp_file(&tmp));
+        assert!(tmp.starts_with(".pds-"));
+        assert_ne!(tmp, transfer_temp_rel(&format!("{long}.other")));
+
+        let nested = transfer_temp_rel(&format!("docs/{long}"));
+        assert_eq!(
+            nested.rsplit_once('/').map(|(dir, _)| dir),
+            Some("docs")
+        );
+        assert!(!nested.contains(&long));
     }
 
     /// External-backing layout (the desktop app): switching a mirror root
