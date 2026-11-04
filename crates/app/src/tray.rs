@@ -248,13 +248,11 @@ fn open_window(cx: &mut App, view: Entity<AppView>) -> anyhow::Result<WindowHand
             if quitting {
                 return false;
             }
-            let tray_available = cx
-                .try_global::<TrayAvailable>()
-                .is_some_and(|flag| flag.0);
-            if tray_available {
+            if crate::ui::close_hides(window, cx) {
                 window.minimize_window();
             } else {
-                // No tray to restore from: closing means quit.
+                // No tray to restore from, or no minimized state on this
+                // compositor: closing means quit.
                 let _ = weak.update(cx, |view, cx| view.request_quit(cx));
             }
             false
