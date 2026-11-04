@@ -9,6 +9,8 @@
 //! then the `transfer.done` notification, per the protocol's ordering).
 
 use std::collections::{HashMap, VecDeque};
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -30,7 +32,19 @@ struct MockNode {
     mtime: Option<i64>,
     sha1: Option<String>,
     content: Option<Arc<Vec<u8>>>, // files only
+    /// Sparse remote content (large files): `drive.download` materializes a
+    /// sparse file with these marker ranges instead of buffering the bytes.
+    sparse: Option<SparseContent>,
     trashed: bool,
+}
+
+/// Marker ranges inside a sparse remote file. Used to prove large-file
+/// offset handling (e.g. a tail marker beyond 4 GiB) without allocating the
+/// file's nominal size.
+#[derive(Debug, Clone)]
+struct SparseContent {
+    size: u64,
+    markers: Vec<(u64, Vec<u8>)>,
 }
 
 /// Scripted upload failures for a node uid: `(code, message, retryable,
@@ -48,6 +62,16 @@ struct State {
     calls: Vec<(String, Vec<String>)>,
     /// `(name, mtime)` of every `drive.upload` request, in call order.
     upload_mtimes: Vec<(String, i64)>,
+    /// `(name, bytes actually read)` of every `drive.upload`, in call order.
+    /// Populated in both modes so tests can assert large sizes survive the
+    /// u32/i32 boundary.
+    upload_sizes: Vec<(String, u64)>,
+    /// Total bytes kept in memory for uploads. Streaming mode leaves this at
+    /// zero, proving a large upload was counted/hashed without buffering.
+    upload_buffered_bytes: u64,
+    /// Read/hash uploads incrementally instead of `fs::read`-ing the whole
+    /// file. Tests enable this for multi-GiB sparse files.
+    stream_uploads: bool,
     /// Scripted `transfer.error`s for revision uploads, per node uid; popped
     /// one per `drive.upload` attempt (content is NOT applied on failure).
     upload_failures: HashMap<String, ScriptedFailures>,
@@ -170,6 +194,28 @@ impl MockHandle {
         self.state.lock().unwrap().upload_mtimes.clone()
     }
 
+    /// `(name, bytes)` of every `drive.upload`, in call order. The size is
+    /// what the mock actually read from the request's `path`, not the
+    /// client-declared `size` — a u32 truncation anywhere on the way would
+    /// show up here.
+    pub fn uploaded_sizes(&self) -> Vec<(String, u64)> {
+        self.state.lock().unwrap().upload_sizes.clone()
+    }
+
+    /// Total upload bytes the mock buffered in memory. Zero after a
+    /// streaming upload, however large the file.
+    pub fn upload_buffered_bytes(&self) -> u64 {
+        self.state.lock().unwrap().upload_buffered_bytes
+    }
+
+    /// Stream/hash uploads in fixed-size chunks without retaining content.
+    /// Required for multi-GiB sparse-file tests: the default mode buffers
+    /// each whole file so `file_content`/`remote_update_file` keep working
+    /// for ordinary tests.
+    pub fn enable_streaming_uploads(&self) {
+        self.state.lock().unwrap().stream_uploads = true;
+    }
+
     /// Current mtime of a remote node (Unix seconds).
     pub fn node_mtime(&self, uid: &str) -> Option<i64> {
         self.state
@@ -178,6 +224,26 @@ impl MockHandle {
             .nodes
             .get(uid)
             .and_then(|n| n.mtime)
+    }
+
+    /// Current size of a remote node (bytes; folders are `None`).
+    pub fn node_size(&self, uid: &str) -> Option<i64> {
+        self.state
+            .lock()
+            .unwrap()
+            .nodes
+            .get(uid)
+            .and_then(|n| n.size)
+    }
+
+    /// Current content hash of a remote file node.
+    pub fn node_sha1(&self, uid: &str) -> Option<String> {
+        self.state
+            .lock()
+            .unwrap()
+            .nodes
+            .get(uid)
+            .and_then(|n| n.sha1.clone())
     }
 
     /// Current (non-trashed) remote children names of a folder.
@@ -216,6 +282,58 @@ impl MockHandle {
             mtime: Some(1_700_000_000),
             sha1: Some(hex_sha1(content)),
             content: Some(Arc::new(content.to_vec())),
+            sparse: None,
+            trashed: false,
+        };
+        st.nodes.insert(uid.clone(), node);
+        let event_id = st.alloc_event_id();
+        let scope = st.scope_id.clone();
+        st.emit(json!({
+            "scopeId": scope,
+            "eventId": event_id,
+            "type": "node_created",
+            "nodeUid": uid,
+            "parentNodeUid": parent_uid,
+        }));
+        uid
+    }
+
+    /// Inject a large sparse remote file: nominal `size` bytes, with
+    /// `markers` written at absolute offsets when the file is downloaded.
+    /// The mock never allocates the nominal size. `sha1` is a deterministic
+    /// stand-in (the real hash of a multi-GiB sparse file is not worth the
+    /// CI time; these tests exercise size/offset paths, not hashing).
+    pub fn remote_create_sparse_file(
+        &self,
+        parent_uid: &str,
+        name: &str,
+        size: u64,
+        markers: &[(u64, &[u8])],
+    ) -> String {
+        let mut st = self.state.lock().unwrap();
+        let uid = st.alloc_uid();
+        assert!(
+            markers.iter().all(|(offset, bytes)| {
+                offset.saturating_add(bytes.len() as u64) <= size
+            }),
+            "sparse marker outside the file"
+        );
+        let node = MockNode {
+            uid: uid.clone(),
+            parent_uid: Some(parent_uid.to_string()),
+            name: name.to_string(),
+            kind: "file",
+            size: Some(size as i64),
+            mtime: Some(1_700_000_000),
+            sha1: Some(format!("{size:040x}")),
+            content: None,
+            sparse: Some(SparseContent {
+                size,
+                markers: markers
+                    .iter()
+                    .map(|(offset, bytes)| (*offset, bytes.to_vec()))
+                    .collect(),
+            }),
             trashed: false,
         };
         st.nodes.insert(uid.clone(), node);
@@ -238,6 +356,7 @@ impl MockHandle {
             n.size = Some(content.len() as i64);
             n.sha1 = Some(hex_sha1(content));
             n.content = Some(Arc::new(content.to_vec()));
+            n.sparse = None;
             n.trashed = false;
         }
         let event_id = st.alloc_event_id();
@@ -300,6 +419,7 @@ impl MockHandle {
                 mtime: Some(1_700_000_000),
                 sha1: None,
                 content: None,
+                sparse: None,
                 trashed: false,
             },
         );
@@ -340,6 +460,7 @@ impl MockHandle {
                 mtime: Some(1_700_000_000),
                 sha1: None,
                 content: None,
+                sparse: None,
                 trashed: false,
             },
         );
@@ -420,6 +541,7 @@ impl MockHandle {
             n.size = Some(content.len() as i64);
             n.sha1 = Some(hex_sha1(content));
             n.content = Some(Arc::new(content.to_vec()));
+            n.sparse = None;
             n.trashed = false;
         }
     }
@@ -559,6 +681,45 @@ fn hex_sha1(bytes: &[u8]) -> String {
     h.finalize().iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// Streaming SHA-1 + byte count, matching the real sidecar's transfer path
+/// without ever holding the whole file in memory.
+fn stream_sha1(path: &str) -> std::io::Result<(String, u64)> {
+    use sha1::Digest;
+    let mut file = std::fs::File::open(path)?;
+    let mut hasher = sha1::Sha1::new();
+    let mut size = 0u64;
+    let mut buf = [0u8; 256 * 1024];
+    loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+        size += n as u64;
+    }
+    Ok((
+        hasher.finalize().iter().map(|b| format!("{b:02x}")).collect(),
+        size,
+    ))
+}
+
+/// Write a sparse file: `set_len(size)` plus the marker ranges. The holes
+/// are real holes on supporting filesystems, so tests can use 5 GiB nominal
+/// sizes without 5 GiB of disk or memory.
+fn write_sparse(path: &Path, sparse: &SparseContent) -> std::io::Result<()> {
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(path)?;
+    file.set_len(sparse.size)?;
+    for (offset, bytes) in &sparse.markers {
+        file.seek(SeekFrom::Start(*offset))?;
+        file.write_all(bytes)?;
+    }
+    file.flush()
+}
+
 /// A deterministic in-process sidecar.
 pub struct MockSidecar {
     state: Arc<Mutex<State>>,
@@ -588,6 +749,7 @@ impl MockSidecar {
                 mtime: None,
                 sha1: None,
                 content: None,
+                sparse: None,
                 trashed: false,
             },
         );
@@ -602,6 +764,7 @@ impl MockSidecar {
                 mtime: Some(1_700_000_000),
                 sha1: None,
                 content: None,
+                sparse: None,
                 trashed: false,
             },
         );
@@ -617,6 +780,7 @@ impl MockSidecar {
                 mtime: Some(1_700_000_000),
                 sha1: Some(hex_sha1(&content)),
                 content: Some(Arc::new(content)),
+                sparse: None,
                 trashed: false,
             },
         );
@@ -629,6 +793,9 @@ impl MockSidecar {
                 scope_id,
                 calls: Vec::new(),
                 upload_mtimes: Vec::new(),
+                upload_sizes: Vec::new(),
+                upload_buffered_bytes: 0,
+                stream_uploads: false,
                 upload_failures: HashMap::new(),
                 download_failures: HashMap::new(),
                 get_root_failures: 0,
@@ -778,6 +945,7 @@ impl MockSidecar {
                     mtime: Some(1_700_000_000),
                     sha1: None,
                     content: None,
+                    sparse: None,
                     trashed: false,
                 };
                 st.nodes.insert(uid.clone(), node);
@@ -950,14 +1118,35 @@ impl MockSidecar {
                     return vec![ok(json!({"transferId": transfer_id})), err];
                 }
 
-                let content = std::fs::read(&path).unwrap_or_default();
+                // Keep ordinary tests byte-for-byte compatible (their
+                // assertions read `file_content`), but never buffer a
+                // multi-GiB sparse file: streaming mode hashes/counts in
+                // chunks and stores no content.
+                let (content, size, sha1) = if st.stream_uploads {
+                    match stream_sha1(&path) {
+                        Ok((sha1, size)) => (None, size, sha1),
+                        Err(_) => (
+                            None,
+                            std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0),
+                            String::new(),
+                        ),
+                    }
+                } else {
+                    let content = std::fs::read(&path).unwrap_or_default();
+                    st.upload_buffered_bytes += content.len() as u64;
+                    let size = content.len() as u64;
+                    let sha1 = hex_sha1(&content);
+                    (Some(Arc::new(content)), size, sha1)
+                };
+                st.upload_sizes.push((name.clone(), size));
                 let uid = if let Some(existing) = node_uid {
                     // New revision of an existing node.
                     if let Some(n) = st.nodes.get_mut(&existing) {
-                        n.size = Some(content.len() as i64);
-                        n.sha1 = Some(hex_sha1(&content));
+                        n.size = Some(size as i64);
+                        n.sha1 = Some(sha1);
                         n.mtime = Some(mtime);
-                        n.content = Some(Arc::new(content));
+                        n.content = content;
+                        n.sparse = None;
                         n.trashed = false;
                     }
                     existing
@@ -970,10 +1159,11 @@ impl MockSidecar {
                             parent_uid,
                             name,
                             kind: "file",
-                            size: Some(content.len() as i64),
+                            size: Some(size as i64),
                             mtime: Some(mtime),
-                            sha1: Some(hex_sha1(&content)),
-                            content: Some(Arc::new(content)),
+                            sha1: Some(sha1),
+                            content,
+                            sparse: None,
                             trashed: false,
                         },
                     );
@@ -1014,12 +1204,33 @@ impl MockSidecar {
                     .to_string();
                     return vec![ok(json!({"transferId": transfer_id})), err];
                 }
-                let content = st
-                    .nodes
-                    .get(&uid)
-                    .and_then(|n| n.content.clone())
-                    .unwrap_or_default();
-                let _ = std::fs::write(pstr("path"), &*content);
+                let path = pstr("path");
+                let sparse = st.nodes.get(&uid).and_then(|n| n.sparse.clone());
+                if let Some(sparse) = sparse {
+                    // Materialize only the markers; the holes stay sparse on
+                    // disk so a 5 GiB download costs a few blocks.
+                    if let Err(e) = write_sparse(Path::new(&path), &sparse) {
+                        let err = json!({
+                            "jsonrpc": "2.0",
+                            "method": "transfer.error",
+                            "params": {
+                                "transferId": transfer_id,
+                                "code": error_codes::INTERNAL,
+                                "message": format!("mock sparse download failed: {e}"),
+                                "retryable": false,
+                            },
+                        })
+                        .to_string();
+                        return vec![ok(json!({"transferId": transfer_id})), err];
+                    }
+                } else {
+                    let content = st
+                        .nodes
+                        .get(&uid)
+                        .and_then(|n| n.content.clone())
+                        .unwrap_or_default();
+                    let _ = std::fs::write(&path, &*content);
+                }
                 let done = json!({
                     "jsonrpc": "2.0",
                     "method": "transfer.done",

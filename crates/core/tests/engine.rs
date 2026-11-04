@@ -1,6 +1,7 @@
 //! Engine integration tests against the in-process MockSidecar.
 //! No real Proton account required; all timing uses generous polling.
 
+use std::io::{Seek as _, SeekFrom, Write as _};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -81,14 +82,20 @@ async fn start_with_client(
 }
 
 async fn wait_for(cond: impl Fn() -> bool) {
-    let deadline = Instant::now() + Duration::from_secs(30);
+    wait_for_within(Duration::from_secs(30), cond).await;
+}
+
+/// Same as [`wait_for`], with an explicit bound for tests that must hash
+/// multi-GiB sparse files (debug builds are much slower than release).
+async fn wait_for_within(timeout: Duration, cond: impl Fn() -> bool) {
+    let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
         if cond() {
             return;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    panic!("condition not met within 30 s");
+    panic!("condition not met within {timeout:?}");
 }
 
 /// Wait until the node's upload bookkeeping is fully settled: `Synced` with
@@ -2658,6 +2665,191 @@ async fn replayed_event_after_reconnect_does_not_duplicate_downloads() {
     assert_eq!(rows[0].node_uid, uid);
     assert_ne!(fx.db.event_cursor("scope-1").unwrap().unwrap(), cursor);
     fx.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------
+// Wave 4b — large files and many small files (TG-16)
+// ---------------------------------------------------------------------------
+
+/// TG-16: a >4 GiB local file uploads with its true size (no u32 truncation)
+/// and a valid hash/mtime. The file is sparse, and the mock runs in streaming
+/// mode so neither process materializes 5 GiB in memory.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn large_sparse_local_file_uploads_without_truncation() {
+    const SIZE: u64 = 5 * 1024 * 1024 * 1024;
+    const TAIL: &[u8] = b"PDS-5G-TAIL";
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("sync");
+    std::fs::create_dir_all(&root).unwrap();
+    let path = root.join("huge-local.bin");
+    {
+        let mut file = std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        file.set_len(SIZE).unwrap();
+        file.seek(SeekFrom::Start(SIZE - TAIL.len() as u64))
+            .unwrap();
+        file.write_all(TAIL).unwrap();
+    }
+
+    let (mut client, mock) = MockSidecar::new().connect();
+    mock.enable_streaming_uploads();
+    let notifications = client.take_notifications();
+    let db_path = root.join(STATE_DIR).join("state.db");
+    let (engine, handle) = Engine::new(
+        Arc::new(client),
+        notifications,
+        EngineConfig {
+            root: root.clone(),
+            db_path: db_path.clone(),
+            retry_base: pds_core::RETRY_BASE_DEFAULT,
+            placeholders: false,
+            eviction_cap: None,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let engine_task = tokio::spawn(engine.run());
+
+    wait_for_within(Duration::from_secs(180), || {
+        mock.uploaded_names().iter().any(|n| n == "huge-local.bin")
+    })
+    .await;
+    let db = Db::open(&db_path).unwrap();
+    wait_for_synced(&db, "huge-local.bin").await;
+
+    let row = db.node_by_path("huge-local.bin").unwrap().unwrap();
+    assert_eq!(
+        row.size,
+        Some(SIZE as i64),
+        "size must survive as 5 GiB, not a truncated 32-bit value"
+    );
+    let captured = mock
+        .uploaded_sizes()
+        .into_iter()
+        .find(|(name, _)| name == "huge-local.bin")
+        .expect("upload captured")
+        .1;
+    assert_eq!(captured, SIZE, "the mock must read all 5 GiB");
+
+    let uid = mock.find_uid("root", "huge-local.bin").unwrap();
+    assert_eq!(mock.node_size(&uid), Some(SIZE as i64));
+    let sha1 = row.sha1.clone().expect("content hash stored");
+    assert_eq!(sha1.len(), 40, "hex SHA-1 length");
+    assert!(sha1.chars().all(|c| c.is_ascii_hexdigit()));
+    assert_eq!(
+        mock.node_sha1(&uid).as_deref(),
+        Some(sha1.as_str()),
+        "the sidecar sees the same content hash as the engine"
+    );
+    assert_eq!(
+        mock.uploaded_mtimes()
+            .into_iter()
+            .find(|(name, _)| name == "huge-local.bin")
+            .map(|(_, mtime)| mtime),
+        row.mtime,
+        "mtime path carries the local timestamp"
+    );
+
+    // Streaming mode proves the mock never buffered a whole-file Vec.
+    assert_eq!(mock.upload_buffered_bytes(), 0);
+    assert!(
+        mock.file_content(&uid).is_none(),
+        "streaming upload must not store the 5 GiB payload"
+    );
+    assert_eq!(mock.upload_attempts("huge-local.bin"), 1, "one upload");
+
+    handle.shutdown().await.unwrap();
+    let _ = engine_task.await;
+}
+
+/// TG-16: sync a few thousand tiny files, assert one upload each and no
+/// duplicate rows/uploads. 1500 keeps CI bounded; the ignored variant below
+/// runs the full 5000 manually.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn many_small_files_converge_without_duplicate_uploads() {
+    many_small_files(1_500).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+#[ignore = "manual full-count run: cargo test -p pds-core --test engine many_small_files_full_5000 -- --ignored --nocapture"]
+async fn many_small_files_full_5000() {
+    many_small_files(5_000).await;
+}
+
+async fn many_small_files(count: usize) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("sync");
+    std::fs::create_dir_all(&root).unwrap();
+    for i in 0..count {
+        std::fs::write(root.join(format!("tiny-{i:04}.txt")), format!("content {i}")).unwrap();
+    }
+
+    let (mut client, mock) = MockSidecar::new().connect();
+    let notifications = client.take_notifications();
+    let db_path = root.join(STATE_DIR).join("state.db");
+    let (engine, handle) = Engine::new(
+        Arc::new(client),
+        notifications,
+        EngineConfig {
+            root: root.clone(),
+            db_path: db_path.clone(),
+            retry_base: pds_core::RETRY_BASE_DEFAULT,
+            placeholders: false,
+            eviction_cap: None,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let engine_task = tokio::spawn(engine.run());
+
+    wait_for(|| mock.child_names("root").len() >= count + 2).await; // + Documents/hello.txt
+    let db = Db::open(&db_path).unwrap();
+    wait_for(|| {
+        db.all_nodes()
+            .map(|rows| {
+                rows.iter()
+                    .filter(|r| r.local_path.starts_with("tiny-") && r.is_file())
+                    .all(|r| r.sync_state == pds_core::SyncState::Synced)
+                    && rows
+                        .iter()
+                        .filter(|r| r.local_path.starts_with("tiny-") && r.is_file())
+                        .count()
+                        == count
+            })
+            .unwrap_or(false)
+    })
+    .await;
+
+    let names = mock.uploaded_names();
+    assert_eq!(
+        names.len(),
+        count,
+        "exactly one upload per local file (no duplicates)"
+    );
+    for i in 0..count {
+        let name = format!("tiny-{i:04}.txt");
+        assert_eq!(mock.upload_attempts(&name), 1, "duplicate upload for {name}");
+    }
+    let rows = db.all_nodes().unwrap();
+    let tiny: Vec<_> = rows
+        .iter()
+        .filter(|r| r.local_path.starts_with("tiny-") && r.is_file())
+        .collect();
+    assert_eq!(tiny.len(), count, "one DB row per file, no duplicates");
+    assert!(
+        tiny.iter().all(|r| !r.node_uid.is_empty() && !r.node_uid.starts_with("pending:")),
+        "every local file received a real remote uid"
+    );
+
+    handle.shutdown().await.unwrap();
+    let _ = engine_task.await;
 }
 
 // Helper so tests can use `futures::executor::block_on` without an extra dep.
