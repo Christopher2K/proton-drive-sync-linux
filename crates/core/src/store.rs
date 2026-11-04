@@ -28,6 +28,9 @@ pub struct VNode {
     pub is_dir: bool,
     pub size: u64,
     pub mtime: i64,
+    /// POSIX permission bits for the VFS attrs (files default 0644, dirs
+    /// 0755; a locally persisted executable bit survives eviction).
+    pub mode: u32,
     /// Backing file with the full content, ready to serve.
     pub content_ready: bool,
 }
@@ -54,6 +57,10 @@ struct Inner {
     pending_writes: VecDeque<String>,
     /// Files the engine is currently uploading from the write queue.
     uploading: HashSet<String>,
+    /// Metadata-only changes from the VFS (`setattr(mtime/mode)`):
+    /// (rel, mtime, mode). Drained by the engine into the DB/snapshot
+    /// WITHOUT queueing a content upload — the hash is unchanged.
+    pending_metadata: VecDeque<(String, Option<i64>, Option<u32>)>,
     /// Folders created through the mount, awaiting a remote mirror.
     pending_mkdirs: VecDeque<String>,
     /// Paths deleted through the mount, awaiting a remote trash.
@@ -271,6 +278,34 @@ impl Store {
         if first {
             self.notify.notify_one();
         }
+    }
+
+    /// Record a metadata-only change (`setattr` mtime/mode) for the engine.
+    /// Coalesced per path (latest value wins) and deliberately separate from
+    /// [`Store::record_write`]: unchanged content must not create a revision.
+    /// `None` fields are left untouched.
+    pub fn record_metadata(&self, rel: &str, mtime: Option<i64>, mode: Option<u32>) {
+        let mut inner = self.lock();
+        inner.deleted.remove(rel);
+        if let Some(entry) = inner.pending_metadata.iter_mut().find(|(r, _, _)| r == rel) {
+            if mtime.is_some() {
+                entry.1 = mtime;
+            }
+            if mode.is_some() {
+                entry.2 = mode;
+            }
+        } else {
+            inner
+                .pending_metadata
+                .push_back((rel.to_string(), mtime, mode));
+        }
+        drop(inner);
+        self.notify.notify_one();
+    }
+
+    /// Next metadata-only change to apply (engine main loop).
+    pub fn next_metadata_request(&self) -> Option<(String, Option<i64>, Option<u32>)> {
+        self.lock().pending_metadata.pop_front()
     }
 
     /// Next write-created/-modified file to upload, if any (engine).
@@ -704,6 +739,7 @@ mod tests {
             is_dir,
             size: 123,
             mtime: 0,
+            mode: 0o644,
             content_ready: false,
         }
     }

@@ -738,6 +738,7 @@ async fn fuse_mount_over_nonempty_root_shadows_and_preserves_leftovers() {
                 is_dir,
                 size,
                 mtime: 1_700_000_000,
+                mode: if is_dir { 0o755 } else { 0o644 },
                 content_ready: false,
             },
         )

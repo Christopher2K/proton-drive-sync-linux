@@ -37,6 +37,17 @@ struct MockNode {
 /// retry_after)` tuples, popped one per `drive.upload` attempt.
 type ScriptedFailures = VecDeque<(i64, String, bool, Option<Duration>)>;
 
+/// A download parked mid-stream by [`MockHandle::hold_next_download`]: the
+/// sidecar wrote only part of the content and waits for `transfer.resume`
+/// before finishing and emitting `transfer.done` (F4 pause semantics).
+#[derive(Debug)]
+struct HeldDownload {
+    path: String,
+    content: Arc<Vec<u8>>,
+    written: usize,
+    done: Value,
+}
+
 #[derive(Debug)]
 struct State {
     nodes: HashMap<String, MockNode>,
@@ -46,9 +57,16 @@ struct State {
     scope_id: String,
     /// Call log for assertions: ("trash", uids), ("upload", name), ...
     calls: Vec<(String, Vec<String>)>,
+    /// `(name, mtime)` of every `drive.upload` request, in call order.
+    upload_mtimes: Vec<(String, i64)>,
     /// Scripted `transfer.error`s for revision uploads, per node uid; popped
     /// one per `drive.upload` attempt (content is NOT applied on failure).
     upload_failures: HashMap<String, ScriptedFailures>,
+    /// Node uids whose next download stops after this many bytes until the
+    /// matching `transfer.resume` arrives (or `transfer.cancel` drops it).
+    download_holds: HashMap<String, usize>,
+    /// Parked downloads by transfer id (see [`HeldDownload`]).
+    held_downloads: HashMap<String, HeldDownload>,
     /// Outbound notification queue (drained by the server task).
     outbox: mpsc::UnboundedSender<String>,
 }
@@ -154,6 +172,21 @@ impl MockHandle {
             .filter(|(m, _)| m == "upload")
             .flat_map(|(_, u)| u.clone())
             .collect()
+    }
+
+    /// `(name, mtime)` of every `drive.upload` request, in call order.
+    pub fn uploaded_mtimes(&self) -> Vec<(String, i64)> {
+        self.state.lock().unwrap().upload_mtimes.clone()
+    }
+
+    /// Current mtime of a remote node (Unix seconds).
+    pub fn node_mtime(&self, uid: &str) -> Option<i64> {
+        self.state
+            .lock()
+            .unwrap()
+            .nodes
+            .get(uid)
+            .and_then(|n| n.mtime)
     }
 
     /// Current (non-trashed) remote children names of a folder.
@@ -371,6 +404,46 @@ impl MockHandle {
             .collect()
     }
 
+    /// Freeze the next download of `node_uid` after `bytes` bytes until the
+    /// engine sends `transfer.resume` (or `transfer.cancel`). Lets a test
+    /// hold a transfer in flight without sleeps — the mock is the transfer
+    /// authority, exactly like the real sidecar's pause controller.
+    pub fn hold_next_download(&self, node_uid: &str, bytes: usize) {
+        self.state
+            .lock()
+            .unwrap()
+            .download_holds
+            .insert(node_uid.to_string(), bytes);
+    }
+
+    /// Number of downloads currently parked waiting for `transfer.resume`.
+    pub fn held_downloads(&self) -> usize {
+        self.state.lock().unwrap().held_downloads.len()
+    }
+
+    /// Transfer-control methods the engine sent, in call order
+    /// (`pause` / `resume` / `cancel`).
+    pub fn transfer_controls(&self) -> Vec<String> {
+        self.state
+            .lock()
+            .unwrap()
+            .calls
+            .iter()
+            .filter(|(m, _)| matches!(m.as_str(), "pause" | "resume" | "cancel"))
+            .map(|(m, _)| m.clone())
+            .collect()
+    }
+
+    /// Remote file size in bytes, if the uid is a file.
+    pub fn file_size(&self, uid: &str) -> Option<i64> {
+        self.state.lock().unwrap().nodes.get(uid).and_then(|n| n.size)
+    }
+
+    /// Hex SHA-1 of a remote file's current content.
+    pub fn file_sha1(&self, uid: &str) -> Option<String> {
+        self.state.lock().unwrap().nodes.get(uid).and_then(|n| n.sha1.clone())
+    }
+
     /// Emit a `node_deleted` event for a uid and remove it remotely.
     pub fn remote_delete(&self, uid: &str) {
         let mut st = self.state.lock().unwrap();
@@ -472,9 +545,11 @@ impl State {
         self.next_event += 1;
         format!("evt-{}", self.next_event)
     }
+    fn enqueue(&self, msg: Value) {
+        let _ = self.outbox.send(msg.to_string());
+    }
     fn emit(&self, params: Value) {
-        let msg = json!({"jsonrpc": "2.0", "method": "drive.event", "params": params}).to_string();
-        let _ = self.outbox.send(msg);
+        self.enqueue(json!({"jsonrpc": "2.0", "method": "drive.event", "params": params}));
     }
 }
 
@@ -554,7 +629,10 @@ impl MockSidecar {
                 next_event: 0,
                 scope_id,
                 calls: Vec::new(),
+                upload_mtimes: Vec::new(),
                 upload_failures: HashMap::new(),
+                download_holds: HashMap::new(),
+                held_downloads: HashMap::new(),
                 outbox,
             })),
         }
@@ -833,7 +911,12 @@ impl MockSidecar {
                     .get("parentUid")
                     .and_then(Value::as_str)
                     .map(str::to_string);
+                let mtime = params
+                    .get("mtime")
+                    .and_then(Value::as_i64)
+                    .unwrap_or(1_700_000_000);
                 st.calls.push(("upload".into(), vec![name.clone()]));
+                st.upload_mtimes.push((name.clone(), mtime));
 
                 // Scripted failure (e.g. the 409 stale-revision class):
                 // respond with the transfer id, then a transfer.error —
@@ -865,6 +948,7 @@ impl MockSidecar {
                     if let Some(n) = st.nodes.get_mut(&existing) {
                         n.size = Some(content.len() as i64);
                         n.sha1 = Some(hex_sha1(&content));
+                        n.mtime = Some(mtime);
                         n.content = Some(Arc::new(content));
                         n.trashed = false;
                     }
@@ -879,7 +963,7 @@ impl MockSidecar {
                             name,
                             kind: "file",
                             size: Some(content.len() as i64),
-                            mtime: Some(1_700_000_000),
+                            mtime: Some(mtime),
                             sha1: Some(hex_sha1(&content)),
                             content: Some(Arc::new(content)),
                             trashed: false,
@@ -899,21 +983,39 @@ impl MockSidecar {
             "drive.download" => {
                 let mut st = self.state.lock().unwrap();
                 st.next_transfer += 1;
-                st.calls.push(("download".into(), vec![pstr("nodeUid")]));
+                let node_uid = pstr("nodeUid");
+                let path = pstr("path");
+                st.calls.push(("download".into(), vec![node_uid.clone()]));
                 let transfer_id = format!("transfer-{}", st.next_transfer);
                 let content = st
                     .nodes
-                    .get(&pstr("nodeUid"))
+                    .get(&node_uid)
                     .and_then(|n| n.content.clone())
                     .unwrap_or_default();
-                let _ = std::fs::write(pstr("path"), &*content);
                 let done = json!({
                     "jsonrpc": "2.0",
                     "method": "transfer.done",
                     "params": {"transferId": transfer_id},
-                })
-                .to_string();
-                vec![ok(json!({"transferId": transfer_id})), done]
+                });
+                if let Some(hold_after) = st.download_holds.remove(&node_uid) {
+                    // Park mid-stream: write the prefix, keep the completion
+                    // for `transfer.resume`, like a paused real transfer.
+                    let written = hold_after.min(content.len());
+                    let _ = std::fs::write(&path, &content[..written]);
+                    st.held_downloads.insert(
+                        transfer_id.clone(),
+                        HeldDownload {
+                            path,
+                            content,
+                            written,
+                            done,
+                        },
+                    );
+                    return vec![ok(json!({"transferId": transfer_id}))];
+                }
+                let _ = std::fs::write(&path, &*content);
+                st.enqueue(done);
+                vec![ok(json!({"transferId": transfer_id}))]
             }
             "drive.events.start" => {
                 let mut st = self.state.lock().unwrap();
@@ -928,7 +1030,37 @@ impl MockSidecar {
                 vec![ok(json!({})), ff]
             }
             "drive.events.stop" => vec![ok(json!({}))],
-            "transfer.pause" | "transfer.resume" | "transfer.cancel" => vec![ok(json!({}))],
+            "transfer.pause" => {
+                let tid = pstr("transferId");
+                self.state
+                    .lock()
+                    .unwrap()
+                    .calls
+                    .push(("pause".into(), vec![tid]));
+                vec![ok(json!({}))]
+            }
+            "transfer.resume" => {
+                let tid = pstr("transferId");
+                let mut st = self.state.lock().unwrap();
+                st.calls.push(("resume".into(), vec![tid.clone()]));
+                if let Some(held) = st.held_downloads.remove(&tid) {
+                    // Finish the parked transfer: write the remaining bytes,
+                    // then emit completion (after the response, per protocol).
+                    let mut content = Vec::with_capacity(held.content.len());
+                    content.extend_from_slice(&held.content[..held.written]);
+                    content.extend_from_slice(&held.content[held.written..]);
+                    let _ = std::fs::write(&held.path, &content);
+                    st.enqueue(held.done);
+                }
+                vec![ok(json!({}))]
+            }
+            "transfer.cancel" => {
+                let tid = pstr("transferId");
+                let mut st = self.state.lock().unwrap();
+                st.calls.push(("cancel".into(), vec![tid.clone()]));
+                st.held_downloads.remove(&tid);
+                vec![ok(json!({}))]
+            }
             _ => vec![err(-32601, "method not found")],
         }
     }

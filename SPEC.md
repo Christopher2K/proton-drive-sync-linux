@@ -45,6 +45,8 @@ Login (browser session-fork, 2FA supported) → sync root (default `~/ProtonDriv
 
 Filesystem watcher reports create/close-write → hash → upload via sidecar (SDK handles block splitting/encryption) → SQLite mapping updated. Debounce rapid writes; retry with exponential backoff; resumable block uploads for large files. **M4 ✅:** exponential schedule verified (`base·2ⁿ` capped at 5 min, unit-tested); a server `Retry-After` hint (rate-limit 1003 → `transfer.error.retryAfter`) is honored in place of the computed schedule; explicit resume drops pending backoffs ("try now"); a terminally errored node heals on a fresh local edit.
 
+**Metadata fidelity (D6/D2):** the upload carries the file's own mtime (not the wall clock at upload time), and the local row records it. Downloads apply the remote mtime to the local file in both mirror and placeholder modes, including after eviction/rehydration. POSIX permission bits are persisted **locally only** (`nodes.mode`, owner-exec included) and reapplied on download/hydration; Drive's node metadata has no mode field, so mode is never sent remotely. A timestamp-only `setattr` updates SQLite and the VFS snapshot but deliberately does **not** queue a revision — the content hash is unchanged, so uploading would be pure metadata churn; the stored mtime rides along on the next real content edit instead of being lost.
+
 ### F3 — Trash on local delete (conservative)
 
 1. Only propagate deletes for nodes **previously confirmed synced** (present in SQLite). Unknown/never-synced items deleted locally are simply removed locally.

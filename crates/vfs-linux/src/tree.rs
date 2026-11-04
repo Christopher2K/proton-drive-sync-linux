@@ -24,6 +24,7 @@ pub struct TNode {
     pub is_dir: bool,
     pub size: u64,
     pub mtime: i64,
+    pub mode: u32,
     pub content_ready: bool,
 }
 
@@ -92,6 +93,7 @@ impl Tree {
                     is_dir: vnode.is_dir,
                     size: vnode.size,
                     mtime: vnode.mtime,
+                    mode: vnode.mode,
                     content_ready: vnode.content_ready,
                 },
             );
@@ -172,6 +174,7 @@ impl Tree {
                 is_dir: true,
                 size: 0,
                 mtime: 0,
+                mode: 0o755,
                 content_ready: true,
             });
         }
@@ -181,6 +184,7 @@ impl Tree {
                 is_dir: true,
                 size: 0,
                 mtime: 0,
+                mode: 0o755,
                 content_ready: true,
             });
         }
@@ -227,6 +231,7 @@ mod tests {
             is_dir,
             size: 1,
             mtime: 0,
+            mode: 0o644,
             content_ready: false,
         }
     }
