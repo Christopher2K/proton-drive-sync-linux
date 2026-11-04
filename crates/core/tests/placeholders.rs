@@ -233,6 +233,56 @@ async fn status_reports_backing_cache_usage() {
     fx.shutdown().await;
 }
 
+/// A cache-cap change that arrives while a hydration is in flight must not
+/// race the eviction pass: the download completes, the cap is applied on the
+/// next pass, and nothing is double-evicted or lost (the placeholder can be
+/// rehydrated to the same bytes).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn cache_cap_change_during_hydration_evicts_next_pass_without_loss() {
+    let fx = start_with_cap(None).await;
+    wait_for(|| fx.store.snapshot().by_path.contains_key("hello.txt")).await;
+    fx.mock.set_download_delay(Duration::from_millis(400));
+
+    assert!(fx.store.begin_hydrate("hello.txt"));
+    wait_for(|| fx.mock.downloaded_uids().iter().any(|u| u == "node-hello")).await;
+
+    // The engine is still awaiting the download, so this command is queued.
+    fx.handle.set_cache_cap(Some(0)).await.unwrap();
+
+    // Hydration landed, then the live cap pass evicted it on the next pass.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while fx.handle.status().await.unwrap().cache_used != 0 {
+        assert!(Instant::now() < deadline, "shrunk cap was never applied");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(
+        fx.mock
+            .downloaded_uids()
+            .iter()
+            .filter(|u| *u == "node-hello")
+            .count(),
+        1,
+        "the in-flight hydration must not be re-issued"
+    );
+    assert!(
+        fx.store.snapshot().by_path.contains_key("hello.txt"),
+        "eviction must leave the placeholder, not delete the node"
+    );
+    assert!(!fx.store.snapshot().by_path["hello.txt"].content_ready);
+
+    // Content is not lost: a fresh open hydrates the same bytes again.
+    fx.mock.set_download_delay(Duration::ZERO);
+    assert!(fx.store.begin_hydrate("hello.txt"));
+    wait_for(|| fx.store.snapshot().by_path["hello.txt"].content_ready).await;
+    let backing = fx
+        .store
+        .backing_path("hello.txt")
+        .expect("hydrated backing path");
+    assert_eq!(std::fs::read(backing).unwrap(), b"hello drive");
+    fx.shutdown().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
 async fn hydrate_request_downloads_to_backing() {
