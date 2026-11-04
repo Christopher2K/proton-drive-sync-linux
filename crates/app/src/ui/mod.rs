@@ -253,20 +253,21 @@ impl AppView {
         self.start_engine(cx);
     }
 
-    /// Close the window. Mirrors the window manager's close request: with a
-    /// tray to restore from and a compositor that keeps a minimized state,
-    /// the window is hidden; otherwise the app quits. Bound to ctrl-w.
+    /// Close the window. Bound to the titlebar's close button and ctrl-w.
     ///
-    /// Minimizing is only a real "hide" where the compositor implements it
-    /// (GNOME, KDE, X11 WMs). Tiling compositors advertise no `minimize`
-    /// capability (niri) or ignore `xdg_toplevel.set_minimized` (sway), so
-    /// there a minimize would leave the window on screen and the close
-    /// button looking broken — hence the capability check.
+    /// Mirrors the window manager's close request: hide to the tray where
+    /// that actually works (X11 with a tray host), quit everywhere else.
+    /// Wayland's `xdg_toplevel.set_minimized` is silently ignored by the
+    /// tiling compositors that need our own titlebar (niri, sway), and gpui
+    /// reports `minimize` as supported whenever the compositor sends no
+    /// capability list — so asking those compositors to minimize leaves the
+    /// window on screen, which is exactly the "close button does nothing"
+    /// bug. See `close_hides` for how that is decided.
     pub(crate) fn close_window(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.state.quitting {
             return;
         }
-        if close_hides(window, cx) {
+        if close_hides(cx) {
             window.minimize_window();
         } else {
             self.request_quit(cx);
@@ -1005,15 +1006,20 @@ impl AppView {
     }
 }
 
-/// Whether a close request can hide the dashboard (minimize) rather than
-/// stop the app. Hiding needs something to restore the window from (a tray
-/// host) and a compositor that keeps a minimized state; niri does not
-/// advertise minimize at all, so close has to quit there.
-pub(crate) fn close_hides(window: &Window, cx: &App) -> bool {
+/// Whether a compositor close request can hide the dashboard (minimize)
+/// rather than stop the app. Hiding needs something to restore the window
+/// from (a tray host) *and* a compositor whose minimize is reliable.
+///
+/// On Wayland neither condition can be verified: gpui reports "minimize
+/// supported" even for tiling compositors (niri, sway) that silently ignore
+/// `xdg_toplevel.set_minimized`, so a minimize there just leaves the window
+/// on screen. Close therefore quits on Wayland; X11 window managers own
+/// iconification and keep the old hide-to-tray behaviour.
+pub(crate) fn close_hides(cx: &App) -> bool {
     let tray_available = cx
         .try_global::<crate::tray::TrayAvailable>()
         .is_some_and(|flag| flag.0);
-    tray_available && window.window_controls().minimize
+    tray_available && cx.compositor_name() == "X11"
 }
 
 impl Render for AppView {
