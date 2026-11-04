@@ -127,6 +127,23 @@ impl MockHandle {
             .collect()
     }
 
+    /// `(uid, newParentUid)` pairs passed to `drive.move`, in call order.
+    pub fn moves(&self) -> Vec<(String, String)> {
+        self.state
+            .lock()
+            .unwrap()
+            .calls
+            .iter()
+            .filter(|(m, _)| m == "move")
+            .map(|(_, u)| {
+                (
+                    u.first().cloned().unwrap_or_default(),
+                    u.get(1).cloned().unwrap_or_default(),
+                )
+            })
+            .collect()
+    }
+
     /// Names passed to `drive.upload`, in call order.
     pub fn uploaded_names(&self) -> Vec<String> {
         self.state
@@ -272,6 +289,74 @@ impl MockHandle {
             "parentNodeUid": parent_uid,
         }));
         uid
+    }
+
+    /// Move a remote node under `new_parent_uid` WITHOUT emitting an event —
+    /// for tests that need to control event ordering (e.g. deliver the child
+    /// update before the parent folder's).
+    pub fn remote_move_silent(&self, uid: &str, new_parent_uid: &str) {
+        let mut st = self.state.lock().unwrap();
+        if let Some(n) = st.nodes.get_mut(uid) {
+            n.parent_uid = Some(new_parent_uid.to_string());
+        }
+    }
+
+    /// Inject a remote folder under `parent_uid` WITHOUT emitting an event.
+    pub fn remote_create_folder_silent(&self, parent_uid: &str, name: &str) -> String {
+        let mut st = self.state.lock().unwrap();
+        let uid = st.alloc_uid();
+        st.nodes.insert(
+            uid.clone(),
+            MockNode {
+                uid: uid.clone(),
+                parent_uid: Some(parent_uid.to_string()),
+                name: name.to_string(),
+                kind: "folder",
+                size: None,
+                mtime: Some(1_700_000_000),
+                sha1: None,
+                content: None,
+                trashed: false,
+            },
+        );
+        uid
+    }
+
+    /// Trash a remote node and emit the real event shape (`node_updated`
+    /// with `isTrashed: true`), as Proton reports a trash from another
+    /// client.
+    pub fn remote_trash(&self, uid: &str) {
+        let mut st = self.state.lock().unwrap();
+        if let Some(n) = st.nodes.get_mut(uid) {
+            n.trashed = true;
+        }
+        let event_id = st.alloc_event_id();
+        let scope = st.scope_id.clone();
+        st.emit(json!({
+            "scopeId": scope,
+            "eventId": event_id,
+            "type": "node_updated",
+            "nodeUid": uid,
+            "isTrashed": true,
+        }));
+    }
+
+    /// Restore a remote node and emit the real event shape (`node_updated`
+    /// with `isTrashed: false`), the counterpart of [`MockHandle::remote_trash`].
+    pub fn remote_restore(&self, uid: &str) {
+        let mut st = self.state.lock().unwrap();
+        if let Some(n) = st.nodes.get_mut(uid) {
+            n.trashed = false;
+        }
+        let event_id = st.alloc_event_id();
+        let scope = st.scope_id.clone();
+        st.emit(json!({
+            "scopeId": scope,
+            "eventId": event_id,
+            "type": "node_updated",
+            "nodeUid": uid,
+            "isTrashed": false,
+        }));
     }
 
     /// Uids passed to `drive.download`, in call order.

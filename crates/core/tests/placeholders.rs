@@ -781,6 +781,202 @@ async fn remote_folder_rename_moves_hydrated_backing_subtree() {
     fx.shutdown().await;
 }
 
+// TG-06 (placeholder mode): renaming a hydrated folder subtree moves the
+// backing files with the rows; rehydration works from the new path.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn local_folder_rename_moves_hydrated_subtree_and_rehydrates() {
+    let fx = start().await;
+    let photos = fx.mock.remote_create_folder("root", "Photos");
+    fx.mock.remote_create_file(&photos, "a.txt", b"alpha");
+    fx.mock.remote_create_file(&photos, "b.txt", b"beta");
+    let sub = fx.mock.remote_create_folder(&photos, "sub");
+    fx.mock.remote_create_file(&sub, "c.txt", b"gamma");
+    wait_for(|| {
+        fx.store
+            .snapshot()
+            .by_path
+            .contains_key("Photos/sub/c.txt")
+    })
+    .await;
+    for rel in ["Photos/a.txt", "Photos/b.txt", "Photos/sub/c.txt"] {
+        assert!(fx.store.begin_hydrate(rel));
+        wait_for(|| {
+            fx.store
+                .snapshot()
+                .by_path
+                .get(rel)
+                .is_some_and(|n| n.content_ready)
+        })
+        .await;
+    }
+    let downloads = fx.mock.downloaded_uids().len();
+
+    // The VFS queues a rename of the whole folder (the mount reports it as
+    // one path rename; children follow).
+    fx.store.record_rename("Photos", "Albums");
+    wait_for(|| {
+        fx.store
+            .snapshot()
+            .by_path
+            .get("Albums/sub/c.txt")
+            .is_some_and(|n| n.content_ready)
+            && !fx.store.snapshot().by_path.contains_key("Photos")
+    })
+    .await;
+
+    // Backing content moved under the new prefix, not re-downloaded.
+    for (rel, bytes) in [
+        ("Albums/a.txt", b"alpha".as_slice()),
+        ("Albums/b.txt", b"beta".as_slice()),
+        ("Albums/sub/c.txt", b"gamma".as_slice()),
+    ] {
+        let backing = fx.store.backing_path(rel).expect("backing follows rename");
+        assert_eq!(std::fs::read(&backing).unwrap(), bytes);
+        assert!(fx.store.backing_path(&rel.replacen("Albums", "Photos", 1)).is_none());
+    }
+    assert_eq!(fx.mock.downloaded_uids().len(), downloads, "rename must not re-download");
+    assert!(fx.mock.trashed_uids().is_empty());
+    assert_eq!(
+        fx.mock.find_uid("root", "Albums").as_deref(),
+        Some(photos.as_str()),
+        "remote folder uid preserved"
+    );
+    assert!(
+        fx.mock
+            .renames()
+            .iter()
+            .any(|(uid, name)| uid == &photos && name == "Albums"),
+        "expected a remote rename: {:?}",
+        fx.mock.renames()
+    );
+
+    // Dehydrate, then rehydrate through the new path.
+    fx.handle.set_cache_cap(Some(0)).await.unwrap();
+    wait_for(|| fx.store.backing_path("Albums/sub/c.txt").is_none()).await;
+    let downloads = fx.mock.downloaded_uids().len();
+    assert!(fx.store.begin_hydrate("Albums/sub/c.txt"));
+    wait_for(|| {
+        fx.store
+            .backing_path("Albums/sub/c.txt")
+            .map(|p| std::fs::read(p).ok().as_deref() == Some(b"gamma".as_slice()))
+            .unwrap_or(false)
+    })
+    .await;
+    assert!(fx.mock.downloaded_uids().len() > downloads);
+    fx.shutdown().await;
+}
+
+// TG-07 (placeholder mode): deleting a folder subtree through the mount
+// trashes each node once and drops every path from the VFS snapshot.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn placeholder_folder_delete_trashes_once_and_leaves_snapshot() {
+    let fx = start().await;
+    // Filler nodes keep the guard's ratio limb out of the way.
+    for i in 0..20 {
+        fx.mock
+            .remote_create_file("root", &format!("filler{i:02}.txt"), b"filler");
+    }
+    wait_for(|| {
+        fx.store
+            .snapshot()
+            .by_path
+            .contains_key("filler19.txt")
+    })
+    .await;
+    let vault = fx.mock.remote_create_folder("root", "Vault");
+    let a = fx.mock.remote_create_file(&vault, "a.txt", b"a bytes");
+    let b = fx.mock.remote_create_file(&vault, "b.txt", b"b bytes");
+    let sub = fx.mock.remote_create_folder(&vault, "sub");
+    let c = fx.mock.remote_create_file(&sub, "c.txt", b"c bytes");
+    wait_for(|| fx.store.snapshot().by_path.contains_key("Vault/sub/c.txt")).await;
+
+    // Pause so all five deletes are recorded before the first drains.
+    fx.handle.pause().await.unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while fx.handle.status().await.unwrap().state != EngineState::Paused {
+        assert!(Instant::now() < deadline, "engine did not pause");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    for rel in ["Vault/a.txt", "Vault/b.txt", "Vault/sub/c.txt", "Vault/sub", "Vault"] {
+        fx.store.record_delete(rel);
+    }
+    wait_for(|| {
+        pds_core::Db::open(&fx.root.join(STATE_DIR).join("state.db"))
+            .ok()
+            .and_then(|db| db.tombstones().ok())
+            .is_some_and(|t| t.len() == 5)
+    })
+    .await;
+    fx.handle.resume().await.unwrap();
+
+    wait_for(|| {
+        fx.store
+            .snapshot()
+            .by_path
+            .keys()
+            .all(|p| !p.starts_with("Vault"))
+    })
+    .await;
+    wait_for(|| fx.mock.child_names("root").iter().all(|n| n != "Vault")).await;
+    let trashed = fx.mock.trashed_uids();
+    for uid in [&vault, &a, &b, &sub, &c] {
+        assert_eq!(
+            trashed.iter().filter(|u| *u == uid).count(),
+            1,
+            "uid {uid} must be trashed exactly once: {trashed:?}"
+        );
+    }
+    fx.shutdown().await;
+}
+
+// TG-08 (placeholder mode): the trashed row leaves the snapshot; restore
+// recreates the row and a hydratable placeholder at the original path.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn remote_trash_then_restore_round_trips_placeholders() {
+    let fx = start().await;
+    wait_for(|| fx.store.snapshot().by_path.contains_key("hello.txt")).await;
+    let cursor_before = pds_core::Db::open(&fx.root.join(STATE_DIR).join("state.db"))
+        .unwrap()
+        .event_cursor("scope-1")
+        .unwrap();
+
+    fx.mock.remote_trash("node-hello");
+    wait_for(|| !fx.store.snapshot().by_path.contains_key("hello.txt")).await;
+    let db = pds_core::Db::open(&fx.root.join(STATE_DIR).join("state.db")).unwrap();
+    assert!(db.node_by_path("hello.txt").unwrap().is_none());
+    let cursor_trashed = db.event_cursor("scope-1").unwrap();
+    assert!(cursor_trashed != cursor_before);
+
+    fx.mock.remote_restore("node-hello");
+    wait_for(|| {
+        fx.store
+            .snapshot()
+            .by_path
+            .get("hello.txt")
+            .is_some_and(|n| !n.content_ready)
+    })
+    .await;
+    let db = pds_core::Db::open(&fx.root.join(STATE_DIR).join("state.db")).unwrap();
+    let row = db.node_by_path("hello.txt").unwrap().expect("restore recreates the row");
+    assert_eq!(row.node_uid, "node-hello");
+    assert!(db.event_cursor("scope-1").unwrap() != cursor_trashed);
+
+    // Hydratable from the restored placeholder.
+    assert!(fx.store.begin_hydrate("hello.txt"));
+    wait_for(|| {
+        fx.store
+            .backing_path("hello.txt")
+            .map(|p| std::fs::read(p).ok().as_deref() == Some(b"hello drive".as_slice()))
+            .unwrap_or(false)
+    })
+    .await;
+    assert!(fx.mock.trashed_uids().is_empty());
+    fx.shutdown().await;
+}
+
 // Keep imports honest even if a test is skipped.
 #[allow(dead_code)]
 fn _t(_: HashMap<String, String>) {}
