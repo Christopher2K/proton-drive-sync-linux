@@ -2,7 +2,8 @@
 //!
 //! The app is its own sync service: the engine, the placeholder mount, and the
 //! tray icon all live in one process. Autostart therefore just launches that
-//! process with `--minimized` after the graphical session comes up. We use
+//! process with `--minimized` (tray only, no dashboard window) after the
+//! graphical session comes up. We use
 //! `~/.config/autostart` (honoring `$XDG_CONFIG_HOME`) rather than a systemd
 //! user unit because the app needs the user's graphical session for the tray
 //! icon, and the FUSE mount must live exactly as long as the process does.
@@ -41,15 +42,15 @@ pub fn is_enabled() -> bool {
 /// Turn start-at-login on or off, persisting the decision and updating the
 /// XDG entry.
 pub fn set_enabled(enabled: bool) -> Result<()> {
-    // Only hide the dashboard at login when the desktop can show the tray
-    // icon; otherwise the user would have no way back to the window.
-    let minimized = crate::tray::host_available();
+    // Only start without a window at login when the desktop can show the
+    // tray icon; otherwise the user would have no way back to the window.
+    let background = crate::tray::host_available();
     set_enabled_in(
         &app_config_dir(),
         &autostart_dir(),
         &launch_path()?,
         enabled,
-        minimized,
+        background,
     )
 }
 
@@ -61,7 +62,7 @@ pub fn set_enabled(enabled: bool) -> Result<()> {
 ///
 /// Called once at startup. Headless/smoke runs skip it.
 pub fn init_on_launch() {
-    let minimized = crate::tray::host_available();
+    let background = crate::tray::host_available();
     let exe = match launch_path() {
         Ok(exe) => exe,
         Err(e) => {
@@ -77,7 +78,7 @@ pub fn init_on_launch() {
             // choice is the source of truth; turning it off in Settings
             // changes the choice too.
             if !dir.join(DESKTOP_FILE).is_file()
-                && let Err(e) = install_in(&dir, &exe, minimized)
+                && let Err(e) = install_in(&dir, &exe, background)
             {
                 warn!("autostart: could not reinstall the login entry: {e:#}");
             }
@@ -91,14 +92,14 @@ pub fn init_on_launch() {
         None => {
             let default_enabled = !is_dev_build(&exe);
             if let Err(e) =
-                set_enabled_in(&config, &dir, &exe, default_enabled, minimized)
+                set_enabled_in(&config, &dir, &exe, default_enabled, background)
             {
                 warn!("autostart: first-run setup failed: {e:#}");
                 return;
             }
             if default_enabled {
                 info!(
-                    minimized,
+                    background,
                     "autostart: enabled for the next login"
                 );
             }
@@ -163,19 +164,19 @@ fn set_enabled_in(
     dir: &Path,
     exe: &Path,
     enabled: bool,
-    minimized: bool,
+    background: bool,
 ) -> Result<()> {
     if enabled {
-        install_in(dir, exe, minimized)?;
+        install_in(dir, exe, background)?;
     } else {
         remove_in(dir)?;
     }
     write_choice_in(config_dir, enabled)
 }
 
-fn install_in(dir: &Path, exe: &Path, minimized: bool) -> Result<()> {
+fn install_in(dir: &Path, exe: &Path, background: bool) -> Result<()> {
     std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
-    let body = desktop_entry(exe, minimized);
+    let body = desktop_entry(exe, background);
     write_atomic(&dir.join(DESKTOP_FILE), body.as_bytes())
 }
 
@@ -200,7 +201,7 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
 }
 
 /// The `.desktop` entry launched by the session at login.
-fn desktop_entry(exe: &Path, minimized: bool) -> String {
+fn desktop_entry(exe: &Path, background: bool) -> String {
     format!(
         "[Desktop Entry]\n\
          Type=Application\n\
@@ -216,7 +217,7 @@ fn desktop_entry(exe: &Path, minimized: bool) -> String {
          X-GNOME-Autostart-Delay=3\n\
          X-KDE-autostart-after=panel\n",
         exec_quote(exe),
-        if minimized { " --minimized" } else { "" }
+        if background { " --minimized" } else { "" }
     )
 }
 
@@ -245,7 +246,7 @@ mod tests {
     }
 
     #[test]
-    fn desktop_entry_launches_minimized_with_quoted_path() {
+    fn desktop_entry_launches_in_background_with_quoted_path() {
         let entry = desktop_entry(Path::new("/home/me/My Apps/proton-drive-sync"), true);
         assert!(entry.contains(
             "Exec=\"/home/me/My Apps/proton-drive-sync\" --minimized"

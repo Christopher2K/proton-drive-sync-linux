@@ -9,7 +9,12 @@
 //! still succeeds — so `host_available()` probes the bus first and callers
 //! degrade gracefully.
 
-use gpui::{App, Global, MenuItem, SharedString, WindowHandle};
+use std::cell::Cell;
+
+use gpui::{
+    App, Bounds, Entity, Global, MenuItem, SharedString, TitlebarOptions, WindowBounds,
+    WindowHandle, WindowOptions, px, size,
+};
 use gpui_tray::{Icon, Tray};
 use pds_core::EngineState;
 use tracing::warn;
@@ -18,11 +23,27 @@ use crate::actions::{OpenDashboard, OpenSettings, OpenSyncFolder, Quit, TogglePa
 use crate::state::{APP_TITLE, AppState, Page, Phase};
 use crate::ui::AppView;
 
-/// The window the tray re-opens. It is created once at startup; closing it
-/// minimizes it instead of quitting, so this handle stays valid for the
-/// process lifetime.
-pub struct WindowHolder(pub WindowHandle<AppView>);
-impl Global for WindowHolder {}
+/// The root view and the window showing it, if one has been opened yet.
+///
+/// The view lives for the whole process lifetime so engine updates keep
+/// flowing into the tray status even while no window exists. The window is
+/// created lazily on first use: a login start (`--minimized`) lives in the
+/// tray alone until the user asks for the dashboard. Closing the window
+/// minimizes it instead of quitting, so the handle stays valid once created.
+pub struct Dashboard {
+    pub view: Entity<AppView>,
+    window: Cell<Option<WindowHandle<AppView>>>,
+}
+
+impl Dashboard {
+    pub fn new(view: Entity<AppView>) -> Self {
+        Self {
+            view,
+            window: Cell::new(None),
+        }
+    }
+}
+impl Global for Dashboard {}
 
 pub struct TrayHolder(pub Tray);
 impl Global for TrayHolder {}
@@ -127,7 +148,11 @@ pub fn build(cx: &mut App) -> gpui_tray::Result<Tray> {
         .title(APP_TITLE)
         .tooltip(tooltip(&status))
         .menu(menu)
-        .on_activate_with(|_token, cx| show_dashboard(cx, None))
+        .on_activate_with(|_token, cx| {
+            if let Err(e) = show_dashboard(cx, None) {
+                warn!("tray: could not open the dashboard: {e:#}");
+            }
+        })
         .build(cx)
 }
 
@@ -159,31 +184,91 @@ pub fn refresh(cx: &mut App, state: &AppState) {
     }
 }
 
-/// Show and focus the dashboard. `page` selects a section first.
-pub fn show_dashboard(cx: &mut App, page: Option<Page>) {
-    let Some(holder) = cx.try_global::<WindowHolder>() else {
-        return;
+/// Show and focus the dashboard, opening the window the first time. `page`
+/// selects a section first. The view is updated even while no window exists,
+/// so the page is already correct when the window appears.
+pub fn show_dashboard(cx: &mut App, page: Option<Page>) -> anyhow::Result<()> {
+    let Some(dashboard) = cx.try_global::<Dashboard>() else {
+        anyhow::bail!("the dashboard is not initialized");
     };
-    let handle = holder.0;
-    let result = handle.update(cx, |view, window, cx| {
-        if let Some(page) = page {
-            view.set_page(page, cx);
-        }
-        window.activate_window();
-    });
-    if result.is_err() {
-        // The window should never be destroyed (close is vetoed), but a
-        // compositor/driver failure must not leave the tray dead.
-        warn!("tray: dashboard window is unavailable");
+    let view = dashboard.view.clone();
+    let existing = dashboard.window.get();
+
+    if let Some(page) = page {
+        view.update(cx, |view, cx| view.set_page(page, cx));
     }
+
+    let handle = match existing {
+        Some(handle) => handle,
+        None => open_window(cx, view)?,
+    };
+    // The window should never be destroyed (close is vetoed), but a
+    // compositor/driver failure must not leave the tray dead.
+    handle
+        .update(cx, |_view, window, _cx| window.activate_window())
+        .map_err(|e| anyhow::anyhow!("dashboard window is unavailable: {e:#}"))
+}
+
+/// Create the dashboard window around the (already live) view. Called from
+/// the tray on first use, or at startup when the app is not launched in the
+/// background.
+fn open_window(cx: &mut App, view: Entity<AppView>) -> anyhow::Result<WindowHandle<AppView>> {
+    let bounds = Bounds::centered(None, size(px(1080.0), px(720.0)), cx);
+    let options = WindowOptions {
+        window_bounds: Some(WindowBounds::Windowed(bounds)),
+        titlebar: Some(TitlebarOptions {
+            title: Some(APP_TITLE.into()),
+            appears_transparent: false,
+            traffic_light_position: None,
+        }),
+        app_id: Some("proton-drive-sync".into()),
+        window_min_size: Some(size(px(900.0), px(620.0))),
+        ..Default::default()
+    };
+
+    let window_view = view.clone();
+    let handle = cx.open_window(options, move |window, cx| {
+        window.focus(window_view.read(cx).focus_handle());
+
+        // Closing the dashboard puts the app back in the tray; only the
+        // tray's Quit (or the in-app quit buttons) actually stops sync.
+        let weak = window_view.downgrade();
+        window.on_window_should_close(cx, move |window, cx| {
+            let quitting = weak
+                .read_with(cx, |view, _| view.state.quitting)
+                .unwrap_or(true);
+            if quitting {
+                return false;
+            }
+            let tray_available = cx
+                .try_global::<TrayAvailable>()
+                .is_some_and(|flag| flag.0);
+            if tray_available {
+                window.minimize_window();
+            } else {
+                // No tray to restore from: closing means quit.
+                let _ = weak.update(cx, |view, cx| view.request_quit(cx));
+            }
+            false
+        });
+
+        window_view
+    })?;
+
+    if let Some(dashboard) = cx.try_global::<Dashboard>() {
+        dashboard.window.set(Some(handle));
+    }
+    Ok(handle)
 }
 
 fn current_status(cx: &App) -> TrayStatus {
-    cx.try_global::<WindowHolder>()
-        .and_then(|holder| holder.0.read(cx).ok())
-        .map(|view| TrayStatus {
-            kind: StatusKind::from_state(&view.state),
-            email: view.state.email.clone(),
+    cx.try_global::<Dashboard>()
+        .map(|dashboard| {
+            let view = dashboard.view.read(cx);
+            TrayStatus {
+                kind: StatusKind::from_state(&view.state),
+                email: view.state.email.clone(),
+            }
         })
         .unwrap_or_default()
 }
@@ -219,18 +304,22 @@ fn menu(cx: &mut App) -> Vec<MenuItem> {
 // -- actions -------------------------------------------------------------
 
 pub fn on_open_dashboard(_: &OpenDashboard, cx: &mut App) {
-    show_dashboard(cx, None);
+    if let Err(e) = show_dashboard(cx, None) {
+        warn!("tray: could not open the dashboard: {e:#}");
+    }
 }
 
 pub fn on_open_settings(_: &OpenSettings, cx: &mut App) {
-    show_dashboard(cx, Some(Page::Settings));
+    if let Err(e) = show_dashboard(cx, Some(Page::Settings)) {
+        warn!("tray: could not open the dashboard: {e:#}");
+    }
 }
 
 pub fn on_open_sync_folder(_: &OpenSyncFolder, cx: &mut App) {
-    let root = cx
-        .try_global::<WindowHolder>()
-        .and_then(|holder| holder.0.read(cx).ok())
-        .map(|view| view.state.root.clone());
+    let root = cx.try_global::<Dashboard>().map(|dashboard| {
+        let view = dashboard.view.read(cx);
+        view.state.root.clone()
+    });
     if let Some(root) = root {
         crate::platform::open_folder(&root);
     }
@@ -248,16 +337,16 @@ pub fn on_quit(_: &Quit, cx: &mut App) {
 /// They only run when no window is active (the root handles the action
 /// otherwise), so a click never toggles twice.
 pub fn toggle_pause(cx: &mut App) {
-    if let Some(holder) = cx.try_global::<WindowHolder>() {
-        let handle = holder.0;
-        let _ = handle.update(cx, |view, _, cx| view.toggle_pause(cx));
+    if let Some(dashboard) = cx.try_global::<Dashboard>() {
+        let view = dashboard.view.clone();
+        view.update(cx, |view, cx| view.toggle_pause(cx));
     }
 }
 
 pub fn quit(cx: &mut App) {
-    if let Some(holder) = cx.try_global::<WindowHolder>() {
-        let handle = holder.0;
-        let _ = handle.update(cx, |view, _, cx| view.request_quit(cx));
+    if let Some(dashboard) = cx.try_global::<Dashboard>() {
+        let view = dashboard.view.clone();
+        view.update(cx, |view, cx| view.request_quit(cx));
     } else {
         cx.quit();
     }

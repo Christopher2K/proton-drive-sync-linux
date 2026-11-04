@@ -91,6 +91,22 @@ async fn wait_for(cond: impl Fn() -> bool) {
     panic!("condition not met within 30 s");
 }
 
+/// Wait until the node's upload bookkeeping is fully settled: `Synced` with
+/// no recorded upload error. The mock applies the uploaded bytes BEFORE the
+/// engine's success handler writes that bookkeeping, so waiting only on
+/// `MockHandle::file_content` can observe the content while the row is still
+/// Dirty/errored (CI flake, 2026-11-04).
+async fn wait_for_synced(db: &Db, rel: &str) {
+    wait_for(|| {
+        let Ok(Some(row)) = db.node_by_path(rel) else {
+            return false;
+        };
+        row.sync_state == pds_core::SyncState::Synced
+            && db.upload_error(rel).is_ok_and(|error| error.is_none())
+    })
+    .await;
+}
+
 /// Wait until every one of `total` local deletes is accounted for — already
 /// trashed remotely, or still pending as a tombstone.
 ///
@@ -925,6 +941,7 @@ async fn crashed_upload_recovers_on_restart() {
 
     // F7 safety net intact: the revision landed on the SAME node.
     let db = Db::open(&db_path).unwrap();
+    wait_for_synced(&db, "hello.txt").await;
     let row = db.node_by_path("hello.txt").unwrap().unwrap();
     assert_eq!(row.node_uid, "node-hello");
     assert!(row.synced_sha1.is_some());
@@ -1095,7 +1112,11 @@ async fn fresh_edit_heals_errored_node() {
 
     // The user fixes the file: fresh edit → error cleared → upload proceeds.
     std::fs::write(fx.root.join("hello.txt"), b"fixed by user").unwrap();
-    wait_for(|| fx.mock.file_content("node-hello").as_deref() == Some(b"fixed by user")).await;
+    wait_for_synced(&fx.db, "hello.txt").await;
+    assert_eq!(
+        fx.mock.file_content("node-hello").as_deref(),
+        Some(b"fixed by user".as_slice())
+    );
     let st = fx.handle.status().await.unwrap();
     assert_eq!(st.errored_nodes, 0);
     let row = fx.db.node_by_path("hello.txt").unwrap().unwrap();
