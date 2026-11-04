@@ -533,6 +533,11 @@ pub struct Engine<S: SidecarApi> {
     /// stable across the rename and lets [`Engine::detect_dir_renames`] pair
     /// the two without guessing from names/content.
     dir_ids: HashMap<String, (u64, u64)>,
+    /// The same identity map for tracked files. A case-only file rename on a
+    /// case-sensitive filesystem also arrives as delete + create; the stable
+    /// inode lets [`Engine::detect_case_only_file_renames`] preserve the node
+    /// instead of trashing it and re-uploading as a new one (TG-12).
+    file_ids: HashMap<String, (u64, u64)>,
 }
 
 impl<S: SidecarApi + 'static> Engine<S> {
@@ -621,6 +626,7 @@ impl<S: SidecarApi + 'static> Engine<S> {
             activity_tx: activity_tx.clone(),
             non_utf8_reported: HashSet::new(),
             dir_ids: HashMap::new(),
+            file_ids: HashMap::new(),
         };
         Ok((
             engine,
@@ -706,6 +712,10 @@ impl<S: SidecarApi + 'static> Engine<S> {
             info!("mirror mode: materializing files not yet on disk");
             let files = self.remote_files_needing_download()?;
             for (rel, uid) in files {
+                if let Some(reason) = self.unmaterializable_reason(&rel) {
+                    self.report_unmaterializable(&rel, &reason);
+                    continue;
+                }
                 let abs = to_abs(&self.root, &rel);
                 if let Some(dir) = abs.parent() {
                     std::fs::create_dir_all(dir)?;
@@ -714,11 +724,11 @@ impl<S: SidecarApi + 'static> Engine<S> {
             }
         }
         self.db.set_meta(META_MATERIALIZED_FOR_MODE, if self.placeholders { "0" } else { "1" })?;
-        // Remember every existing directory's inode so a later local rename
-        // (reported by the watcher as "old gone + new appeared") can be
-        // paired without guessing from names or content (TG-06).
+        // Remember every existing directory/file's inode so a later local
+        // rename (reported by the watcher as "old gone + new appeared") can be
+        // paired without guessing from names or content (TG-06/TG-12).
         if !self.placeholders {
-            self.index_dir_inodes();
+            self.index_local_inodes();
         }
 
         // 2. Resume the event stream from the persisted cursor (F6).
@@ -731,7 +741,7 @@ impl<S: SidecarApi + 'static> Engine<S> {
         // 3. Crash recovery (M4): transfers interrupted by a previous run
         // leave rows stuck in `Uploading` (never drained: upload_one
         // requires Dirty) and `.pds-part` temps in the backing dir.
-        if let Err(e) = self.recover_interrupted_transfers() {
+        if let Err(e) = self.recover_interrupted_transfers().await {
             warn!(error = %e, "interrupted-transfer recovery failed");
         }
 
@@ -783,14 +793,18 @@ impl<S: SidecarApi + 'static> Engine<S> {
     ///   retries, pause buffering). A crash AFTER the transfer landed
     ///   remotely but before bookkeeping re-runs `check_remote_head`,
     ///   which keeps BOTH versions instead of silently superseding.
+    /// - Rows stuck in `Downloading` are re-fetched and downloaded again
+    ///   from the current remote head (TG-17). The final path was never
+    ///   renamed into place, so no partial bytes are trusted.
     /// - Stale `*.pds-part` transfer temps (upload scratch in the visible
     ///   root, hydration scratch in the backing dir) are deleted; a
     ///   half-written temp has no consistent content to resume from.
     ///
     /// In placeholder mode recovered rows upload from the backing dir via
     /// `content_root`, same as any other dirty file.
-    fn recover_interrupted_transfers(&mut self) -> Result<()> {
+    async fn recover_interrupted_transfers(&mut self) -> Result<()> {
         let stuck = self.db.nodes_with_state(SyncState::Uploading)?;
+        let interrupted_downloads = self.db.nodes_with_state(SyncState::Downloading)?;
         for row in stuck {
             // The file must still exist locally; if the user (or a crash
             // during a VFS unlink) removed it, the delete path owns the
@@ -837,6 +851,19 @@ impl<S: SidecarApi + 'static> Engine<S> {
                         debug!(path = %path.display(), "swept stale transfer temp");
                     }
                 }
+            }
+        }
+        // Re-download AFTER the sweep so a stale temp can never be mistaken
+        // for the recovered content. `download_file` re-reads the node, so
+        // the freshest remote bytes win over the interrupted attempt.
+        for row in interrupted_downloads {
+            warn!(path = %row.local_path, "recovering download interrupted by a previous run");
+            if let Err(e) = self.download_file(&row.node_uid, &row.local_path).await {
+                warn!(
+                    path = %row.local_path,
+                    error = %e,
+                    "interrupted download recovery failed; a later event will retry"
+                );
             }
         }
         Ok(())
@@ -890,6 +917,19 @@ impl<S: SidecarApi + 'static> Engine<S> {
                 "non-UTF-8 filename (hex {hex}); left untouched, not uploaded or deleted"
             )),
         );
+    }
+
+    /// Why `rel` cannot be materialized in the sync root, if it cannot.
+    fn unmaterializable_reason(&self, rel: &str) -> Option<String> {
+        path_limit_reason(&self.root, rel)
+    }
+
+    /// Surface a remote path the local filesystem cannot represent (over
+    /// `PATH_MAX`/`NAME_MAX`) and skip it: no DB row, no transfer, so the
+    /// event loop cannot retry it in a storm. The rest of the sync continues.
+    fn report_unmaterializable(&mut self, rel: &str, reason: &str) {
+        warn!(path = %rel, reason, "remote path cannot be materialized; skipped");
+        self.emit_activity(ActivityKind::Skipped, rel, Some(reason.to_string()));
     }
 
     async fn main_loop(&mut self, fs_rx: &mut mpsc::Receiver<Vec<DebouncedEvent>>) -> Result<()> {
@@ -1093,6 +1133,10 @@ impl<S: SidecarApi + 'static> Engine<S> {
         // Mirror: materialize every remote file that is missing or changed.
         let files = self.remote_files_needing_download()?;
         for (rel, uid) in files {
+            if let Some(reason) = self.unmaterializable_reason(&rel) {
+                self.report_unmaterializable(&rel, &reason);
+                continue;
+            }
             let abs = to_abs(&self.root, &rel);
             if let Some(dir) = abs.parent() {
                 std::fs::create_dir_all(dir)?;
@@ -1130,7 +1174,9 @@ impl<S: SidecarApi + 'static> Engine<S> {
                     if !self.placeholders {
                         // Placeholder mode: the FUSE mount *is* the tree.
                         let abs = to_abs(&self.root, &rel);
-                        if !abs.exists() {
+                        if let Some(reason) = self.unmaterializable_reason(&rel) {
+                            self.report_unmaterializable(&rel, &reason);
+                        } else if !abs.exists() {
                             std::fs::create_dir_all(&abs)?;
                         }
                     }
@@ -1257,6 +1303,20 @@ impl<S: SidecarApi + 'static> Engine<S> {
                 Err(e) => warn!(from = %old, to = %new, error = %e, "local folder rename failed"),
             }
         }
+        // Case-only file renames have the same delete+create shape on a
+        // case-sensitive filesystem; pair them by inode before the delete
+        // path can trash the node (TG-12).
+        for (old, new) in self.detect_case_only_file_renames() {
+            match self.apply_local_rename(None, &old, &new).await {
+                Ok(()) => {
+                    events.retain(|ev| match to_rel_checked(&self.root, &ev.path) {
+                        RelCheck::Valid(rel) => rel != old,
+                        _ => true,
+                    });
+                }
+                Err(e) => warn!(from = %old, to = %new, error = %e, "local case-only rename failed"),
+            }
+        }
         // Queue of (rel, is_dir) to process, parent dirs before their
         // children so uploads can rely on the remote folder chain.
         let mut queue: Vec<(String, bool)> = Vec::new();
@@ -1304,6 +1364,7 @@ impl<S: SidecarApi + 'static> Engine<S> {
                 self.remember_dir_inode(&rel);
             } else if abs.is_file() {
                 self.upsert_local_file(&rel).await?;
+                self.remember_file_inode(&rel);
             } else {
                 self.handle_local_delete(&rel).await?;
             }
@@ -1311,10 +1372,11 @@ impl<S: SidecarApi + 'static> Engine<S> {
         Ok(())
     }
 
-    /// Remember the identity of every directory currently on disk, so later
-    /// watcher batches can tell a rename from a delete + create.
-    fn index_dir_inodes(&mut self) {
+    /// Remember the identity of every tracked item currently on disk, so
+    /// later watcher batches can tell a rename from a delete + create.
+    fn index_local_inodes(&mut self) {
         self.dir_ids.clear();
+        self.file_ids.clear();
         let mut stack = vec![String::new()];
         while let Some(rel) = stack.pop() {
             let abs = if rel.is_empty() {
@@ -1338,13 +1400,16 @@ impl<S: SidecarApi + 'static> Engine<S> {
                 let Ok(meta) = entry.metadata() else {
                     continue;
                 };
-                if !meta.is_dir() {
-                    continue;
+                if meta.is_dir() {
+                    if let Some(id) = dir_identity(&meta) {
+                        self.dir_ids.insert(child.clone(), id);
+                    }
+                    stack.push(child);
+                } else if meta.is_file()
+                    && let Some(id) = dir_identity(&meta)
+                {
+                    self.file_ids.insert(child, id);
                 }
-                if let Some(id) = dir_identity(&meta) {
-                    self.dir_ids.insert(child.clone(), id);
-                }
-                stack.push(child);
             }
         }
     }
@@ -1356,6 +1421,105 @@ impl<S: SidecarApi + 'static> Engine<S> {
         {
             self.dir_ids.insert(rel.to_string(), id);
         }
+    }
+
+    /// Index the inode of every ancestor of `rel`. A folder created together
+    /// with its contents can miss its own watcher event (the recursive watch
+    /// is attached after the fact) while the children still arrive; without
+    /// this, a later rename of that folder looks like a delete + create and
+    /// can trip the mass-deletion guard before the destination event lands.
+    fn remember_ancestor_dir_inodes(&mut self, rel: &str) {
+        let Some((parent, _)) = rel.rsplit_once('/') else {
+            return;
+        };
+        let mut prefix = String::new();
+        for part in parent.split('/') {
+            if !prefix.is_empty() {
+                prefix.push('/');
+            }
+            prefix.push_str(part);
+            if !self.dir_ids.contains_key(&prefix) {
+                self.remember_dir_inode(&prefix);
+            }
+        }
+    }
+
+    fn remember_file_inode(&mut self, rel: &str) {
+        if let Ok(meta) = std::fs::metadata(to_abs(&self.root, rel))
+            && meta.is_file()
+            && let Some(id) = dir_identity(&meta)
+        {
+            self.file_ids.insert(rel.to_string(), id);
+        }
+    }
+
+    /// Pair tracked files that vanished from disk with a still-untracked
+    /// sibling in the same directory whose name differs only by ASCII case
+    /// and whose filesystem identity is unchanged. On a case-sensitive
+    /// filesystem a case-only rename arrives as delete + create; replaying it
+    /// through the rename machinery preserves the node (uid, revisions)
+    /// instead of trashing it and uploading a new one (TG-12).
+    fn detect_case_only_file_renames(&mut self) -> Vec<(String, String)> {
+        let vanished: Vec<(String, (u64, u64))> = self
+            .file_ids
+            .iter()
+            .filter(|(rel, _)| !to_abs(&self.root, rel).is_file())
+            .filter(|(rel, _)| {
+                self.db
+                    .node_by_path(rel)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|row| row.is_file())
+            })
+            .map(|(rel, id)| (rel.clone(), *id))
+            .collect();
+        if vanished.is_empty() {
+            return Vec::new();
+        }
+        let mut used = HashSet::new();
+        let mut pairs = Vec::new();
+        for (old_rel, id) in vanished {
+            let (parent, old_name) = match old_rel.rsplit_once('/') {
+                Some((parent, name)) => (parent.to_string(), name.to_string()),
+                None => (String::new(), old_rel.clone()),
+            };
+            let parent_abs = if parent.is_empty() {
+                self.root.clone()
+            } else {
+                to_abs(&self.root, &parent)
+            };
+            let Ok(entries) = std::fs::read_dir(&parent_abs) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let Ok(name) = entry.file_name().into_string() else {
+                    continue;
+                };
+                if name == old_name || !name.eq_ignore_ascii_case(&old_name) {
+                    continue;
+                }
+                let new_rel = if parent.is_empty() {
+                    name
+                } else {
+                    format!("{parent}/{name}")
+                };
+                if used.contains(&new_rel)
+                    || self.db.node_by_path(&new_rel).ok().flatten().is_some()
+                {
+                    continue;
+                }
+                let Ok(meta) = entry.metadata() else {
+                    continue;
+                };
+                if !meta.is_file() || dir_identity(&meta) != Some(id) {
+                    continue;
+                }
+                used.insert(new_rel.clone());
+                pairs.push((old_rel.clone(), new_rel));
+                break;
+            }
+        }
+        pairs
     }
 
     /// Pair tracked directories that vanished from disk with newly appeared,
@@ -1552,6 +1716,7 @@ impl<S: SidecarApi + 'static> Engine<S> {
     /// Create/write-close on a file: hash, then upload (new node or new
     /// revision) or mark dirty while paused (F4 buffering).
     async fn upsert_local_file(&mut self, rel: &str) -> Result<()> {
+        self.remember_ancestor_dir_inodes(rel);
         let abs = self.content_path(rel);
         let meta = match std::fs::metadata(&abs) {
             Ok(m) => m,
@@ -1776,7 +1941,7 @@ impl<S: SidecarApi + 'static> Engine<S> {
         if let Some(dir) = abs.parent() {
             std::fs::create_dir_all(dir)?;
         }
-        let tmp_rel = format!("{conflict_rel}.pds-part");
+        let tmp_rel = transfer_temp_rel(&conflict_rel);
         let tmp = self.content_path(&tmp_rel);
         let sidecar = Arc::clone(&self.sidecar);
         self.run_transfer(
@@ -2092,6 +2257,8 @@ impl<S: SidecarApi + 'static> Engine<S> {
                 }
             }
             self.db.remove_node(old_rel)?;
+            self.file_ids.remove(old_rel);
+            self.remember_file_inode(new_rel);
             let uid = dest.node_uid.clone();
             self.db.upsert_node(&NodeRow {
                 sync_state: SyncState::Dirty,
@@ -2202,36 +2369,22 @@ impl<S: SidecarApi + 'static> Engine<S> {
                 store.set_backing(new_rel, own);
             }
         }
-        // Directory identities follow the rows, so the next rename inside
+        // Filesystem identities follow the rows, so the next rename inside
         // the moved subtree is recognized without re-indexing the root.
-        if !row.is_file() {
-            self.rekey_dir_inodes(old_rel, new_rel);
+        self.rekey_local_inodes(old_rel, new_rel);
+        if row.is_file() {
+            self.remember_file_inode(new_rel);
         }
         info!(from = %old_rel, to = %new_rel, "rename applied");
         Ok(())
     }
 
-    /// Move tracked `(device, inode)` entries from the old path prefix to
-    /// the new one after a local (or mirrored remote) rename.
-    fn rekey_dir_inodes(&mut self, old_rel: &str, new_rel: &str) {
-        let old_prefix = format!("{old_rel}/");
-        let moved: Vec<(String, (u64, u64))> = self
-            .dir_ids
-            .iter()
-            .filter(|(path, _)| *path == old_rel || path.starts_with(&old_prefix))
-            .map(|(path, id)| (path.clone(), *id))
-            .collect();
-        for (path, _) in &moved {
-            self.dir_ids.remove(path);
-        }
-        for (path, id) in moved {
-            let moved_path = if path == old_rel {
-                new_rel.to_string()
-            } else {
-                format!("{new_rel}/{}", &path[old_rel.len() + 1..])
-            };
-            self.dir_ids.insert(moved_path, id);
-        }
+    /// Move tracked `(device, inode)` entries (directories and files) from
+    /// the old path prefix to the new one after a local (or mirrored remote)
+    /// rename.
+    fn rekey_local_inodes(&mut self, old_rel: &str, new_rel: &str) {
+        rekey_inode_map(&mut self.dir_ids, old_rel, new_rel);
+        rekey_inode_map(&mut self.file_ids, old_rel, new_rel);
     }
 
     async fn handle_local_delete(&mut self, rel: &str) -> Result<()> {
@@ -2249,6 +2402,9 @@ impl<S: SidecarApi + 'static> Engine<S> {
             debug!(path = %rel, "delete of unknown local item: no remote action");
             return Ok(());
         };
+        // The path no longer holds this tracked inode; the next create/rename
+        // registers its own identity.
+        self.file_ids.remove(rel);
         if row.sync_state != SyncState::Synced {
             // Never confirmed synced → local removal only (F3.1). An
             // inbound overwrite-rename owns this path: its merge keeps
@@ -2411,6 +2567,10 @@ impl<S: SidecarApi + 'static> Engine<S> {
                 if !self.placeholders {
                     let files = self.remote_files_needing_download()?;
                     for (rel, uid) in files {
+                        if let Some(reason) = self.unmaterializable_reason(&rel) {
+                            self.report_unmaterializable(&rel, &reason);
+                            continue;
+                        }
                         self.download_file(&uid, &rel).await?;
                     }
                 }
@@ -2437,15 +2597,17 @@ impl<S: SidecarApi + 'static> Engine<S> {
         let root_uid = self.db_root_uid()?;
         let mut chain = Vec::new();
         let mut parent = node.parent_uid.clone();
-        let mut depth = 0;
+        let mut seen = HashSet::from([node.uid.clone()]);
         while let Some(uid) = parent {
-            depth += 1;
             // The root is a path boundary, not a node row: never fetch or
             // insert it (its empty name would corrupt every derived path).
-            if depth > 64
-                || Some(uid.as_str()) == root_uid.as_deref()
+            if Some(uid.as_str()) == root_uid.as_deref()
                 || self.db.node_by_uid(&uid)?.is_some()
             {
+                break;
+            }
+            if !seen.insert(uid.clone()) {
+                warn!(uid = %uid, "remote parent cycle detected; stopping ancestor walk");
                 break;
             }
             let ancestor = match self.sidecar.get_node(&uid).await {
@@ -2463,6 +2625,12 @@ impl<S: SidecarApi + 'static> Engine<S> {
             let rel = self.local_path_for(&ancestor)?;
             self.upsert_from_node(&ancestor, &rel, SyncState::Synced)?;
             if self.placeholders || !ancestor.is_folder() {
+                continue;
+            }
+            if self.unmaterializable_reason(&rel).is_some() {
+                // Keep the logical row (descendant paths stay correct) but do
+                // not attempt a directory the OS cannot create. The node that
+                // triggered this walk gets its own visible skip.
                 continue;
             }
             std::fs::create_dir_all(to_abs(&self.root, &rel))?;
@@ -2495,6 +2663,19 @@ impl<S: SidecarApi + 'static> Engine<S> {
         // lost (TG-02 event ordering).
         self.resolve_unknown_ancestors(&node).await?;
         let rel = self.local_path_for(&node)?;
+        // A remote path the local filesystem cannot hold must fail visibly
+        // BEFORE any FS/transfer work (TG-14): no partial dir chain, no temp
+        // file, and — for a file — no DB row to retry forever.
+        if !self.placeholders
+            && let Some(reason) = self.unmaterializable_reason(&rel)
+        {
+            if node.is_folder() {
+                // Keep the logical row so descendant paths still resolve.
+                self.upsert_from_node(&node, &rel, SyncState::Synced)?;
+            }
+            self.report_unmaterializable(&rel, &reason);
+            return Ok(());
+        }
         // Resolve by node uid FIRST: a remote rename/move changes the path
         // derived from the node's current name/parent, while the DB row (and
         // its hydrated content) still sits at the old path. Without this the
@@ -2702,7 +2883,7 @@ impl<S: SidecarApi + 'static> Engine<S> {
                 store.set_backing(&new_rel, to);
             }
         }
-        self.rekey_dir_inodes(rel, &new_rel);
+        self.rekey_local_inodes(rel, &new_rel);
         info!(from = %rel, to = %new_rel, "local item renamed aside for conflict");
         Ok(new_rel)
     }
@@ -2773,8 +2954,9 @@ impl<S: SidecarApi + 'static> Engine<S> {
                 store.set_backing(new_rel, to);
             }
         }
-        if !old.is_file() {
-            self.rekey_dir_inodes(&old_rel, new_rel);
+        self.rekey_local_inodes(&old_rel, new_rel);
+        if old.is_file() {
+            self.remember_file_inode(new_rel);
         }
         info!(from = %old_rel, to = %new_rel, uid = %node.uid, "remote rename/move applied");
         Ok(())
@@ -2782,13 +2964,16 @@ impl<S: SidecarApi + 'static> Engine<S> {
 
     /// Compute the local relative path for a remote node by walking parent
     /// uids through the DB. Unknown parents fall back to the sync root.
+    /// Iterative and uncapped: a deep tree (TG-14) must keep its full path,
+    /// not silently re-anchor 64 levels down. A parent cycle (corrupt state)
+    /// stops at the last known ancestor instead of looping forever.
     fn local_path_for(&self, node: &Node) -> Result<String> {
         let mut parts = vec![node.name.clone()];
         let mut parent = node.parent_uid.clone();
-        let mut depth = 0;
+        let mut seen = HashSet::from([node.uid.clone()]);
         while let Some(uid) = parent {
-            depth += 1;
-            if depth > 64 {
+            if !seen.insert(uid.clone()) {
+                warn!(uid = %uid, "remote parent cycle detected; stopping path walk");
                 break;
             }
             match self.db.node_by_uid(&uid)? {
@@ -2807,11 +2992,6 @@ impl<S: SidecarApi + 'static> Engine<S> {
         let Some(row) = self.db.node_by_uid(uid)? else {
             return Ok(());
         };
-        if !row.is_file() {
-            let prefix = format!("{}/", row.local_path);
-            self.dir_ids
-                .retain(|rel, _| rel != &row.local_path && !rel.starts_with(&prefix));
-        }
         let content_abs = self.content_path(&row.local_path);
         // F7 (M4 soak find): the row's state alone can LIE — a local write
         // still inside the watcher's debounce window has not marked the row
@@ -2847,6 +3027,15 @@ impl<S: SidecarApi + 'static> Engine<S> {
             } else {
                 std::fs::remove_file(&abs).ok();
             }
+        }
+        if row.is_file() {
+            self.file_ids.remove(&row.local_path);
+        } else {
+            let prefix = format!("{}/", row.local_path);
+            self.dir_ids
+                .retain(|rel, _| rel != &row.local_path && !rel.starts_with(&prefix));
+            self.file_ids
+                .retain(|rel, _| rel != &row.local_path && !rel.starts_with(&prefix));
         }
         self.remove_node_recursive(&row.local_path)?;
         Ok(())
@@ -3029,6 +3218,13 @@ impl<S: SidecarApi + 'static> Engine<S> {
         mtime: Option<i64>,
         mode: Option<u32>,
     ) -> Result<()> {
+        if let Some(reason) = path_limit_reason(&self.backing_dir, rel) {
+            // Hydration target is the backing cache: same OS limits, and the
+            // cache path is longer than the visible root's. Surface it once
+            // instead of letting the reader see a bare EIO.
+            self.report_unmaterializable(rel, &reason);
+            anyhow::bail!("{reason}");
+        }
         let abs = to_abs(&self.backing_dir, rel);
         if abs.is_file() {
             return Ok(()); // already hydrated (lost wake-up)
@@ -3036,7 +3232,7 @@ impl<S: SidecarApi + 'static> Engine<S> {
         if let Some(dir) = abs.parent() {
             std::fs::create_dir_all(dir)?;
         }
-        let tmp = to_abs(&self.backing_dir, &format!("{rel}.pds-part"));
+        let tmp = to_abs(&self.backing_dir, &transfer_temp_rel(rel));
         let sidecar = Arc::clone(&self.sidecar);
         match self
             .run_transfer("download", Some(rel), sidecar.download(uid, &tmp))
@@ -3262,14 +3458,53 @@ impl<S: SidecarApi + 'static> Engine<S> {
 
     /// Download `uid` to `rel` and mark the row synced.
     async fn download_file(&mut self, uid: &str, rel: &str) -> Result<()> {
+        if let Some(reason) = self.unmaterializable_reason(rel) {
+            self.report_unmaterializable(rel, &reason);
+            return Ok(());
+        }
         let abs = self.content_path(rel);
         let node = self.sidecar.get_node(uid).await.ok();
         // Mode is local-only (D2): the remote has none, but a row that
         // already knows the user's `chmod` keeps it across re-downloads.
         let existing_mode = self.db.node_by_path(rel)?.and_then(|r| r.mode);
         let remote_mtime = node.as_ref().and_then(|n| n.mtime);
-        let tmp_rel = format!("{rel}.pds-part");
+        let tmp_rel = transfer_temp_rel(rel);
         let tmp = self.content_path(&tmp_rel);
+
+        // Persist the download intent BEFORE the transfer (TG-17): an
+        // interrupted transfer must leave a recoverable row, never a row that
+        // claims to be Synced with a hash whose bytes never landed. A path
+        // with no row yet (remote create event) gets one so a crash is just
+        // as recoverable.
+        let mut prior_state = None;
+        let mut created_row = false;
+        match self.db.node_by_path(rel)? {
+            Some(row) if row.node_uid == uid => {
+                prior_state = Some(row.sync_state);
+                self.db.set_sync_state(rel, SyncState::Downloading)?;
+            }
+            Some(_) => {} // another node owns this path; collision handling ran first
+            None => {
+                if let Some(node) = &node {
+                    self.db.upsert_node(&NodeRow {
+                        local_path: rel.to_string(),
+                        node_uid: uid.to_string(),
+                        parent_uid: node.parent_uid.clone(),
+                        name: rel.rsplit('/').next().unwrap_or(rel).to_string(),
+                        kind: NodeKind::File,
+                        size: node.size,
+                        sha1: node.sha1.clone(),
+                        mtime: node.mtime,
+                        sync_state: SyncState::Downloading,
+                        pinned: false,
+                        synced_sha1: node.sha1.clone(),
+                        mode: existing_mode,
+                    })?;
+                    created_row = true;
+                }
+            }
+        }
+
         let sidecar = Arc::clone(&self.sidecar);
         match self
             .run_transfer("download", Some(rel), sidecar.download(uid, &tmp))
@@ -3279,7 +3514,8 @@ impl<S: SidecarApi + 'static> Engine<S> {
             Err(TransferFailure::Remote { code, message, .. }) if is_auth_error(code) => {
                 // Park the event (the caller re-buffers it) and surface the
                 // sign-in requirement instead of dying or advancing the
-                // cursor past a file we never materialized.
+                // cursor past a file we never materialized. The row stays
+                // `Downloading` so it is retried once the session is valid.
                 self.note_auth_required(Some(rel), code, &message);
                 return Err(anyhow!(
                     "sign-in required while downloading `{rel}`: {message}"
@@ -3291,7 +3527,19 @@ impl<S: SidecarApi + 'static> Engine<S> {
                 }
                 return Err(e);
             }
-            Err(e) => return Err(e.into()),
+            Err(e) => {
+                // A live failure restores the previous state so reconciliation
+                // can retry later; a shutdown leaves `Downloading` for startup
+                // recovery to finish.
+                if !self.shutting_down {
+                    if let Some(state) = prior_state {
+                        self.db.set_sync_state(rel, state)?;
+                    } else if created_row {
+                        self.db.remove_node(rel)?;
+                    }
+                }
+                return Err(e.into());
+            }
         }
         std::fs::rename(&tmp, &abs)?;
         apply_file_metadata(&abs, remote_mtime, existing_mode);
@@ -3311,6 +3559,7 @@ impl<S: SidecarApi + 'static> Engine<S> {
         })?;
         self.clear_upload_blocks(rel)?;
         self.note_sidecar_ok();
+        self.remember_file_inode(rel);
         info!(path = %rel, "downloaded");
         self.emit_activity(ActivityKind::Downloaded, rel, None);
         Ok(())
@@ -3963,9 +4212,56 @@ fn dir_identity(meta: &std::fs::Metadata) -> Option<(u64, u64)> {
     Some((meta.dev(), meta.ino()))
 }
 
+/// Move every tracked identity at `old_rel` or below to the `new_rel`
+/// prefix. Shared by the directory and file maps so both follow a rename.
+fn rekey_inode_map(
+    map: &mut std::collections::HashMap<String, (u64, u64)>,
+    old_rel: &str,
+    new_rel: &str,
+) {
+    let old_prefix = format!("{old_rel}/");
+    let moved: Vec<(String, (u64, u64))> = map
+        .iter()
+        .filter(|(path, _)| *path == old_rel || path.starts_with(&old_prefix))
+        .map(|(path, id)| (path.clone(), *id))
+        .collect();
+    for (path, _) in &moved {
+        map.remove(path);
+    }
+    for (path, id) in moved {
+        let moved_path = if path == old_rel {
+            new_rel.to_string()
+        } else {
+            format!("{new_rel}/{}", &path[old_rel.len() + 1..])
+        };
+        map.insert(moved_path, id);
+    }
+}
+
 /// Absolute path from a root-relative '/'-separated path.
 pub fn to_abs(root: &Path, rel: &str) -> PathBuf {
     rel.split('/').fold(root.to_path_buf(), |p, c| p.join(c))
+}
+
+/// Linux filesystem limits, in bytes. `PATH_MAX` includes the terminating
+/// NUL, so a valid path must be strictly shorter; `NAME_MAX` bounds one
+/// component. Both are enforced by the kernel at syscall time, but checking
+/// first turns an over-long REMOTE path into a visible skip instead of a
+/// partial directory chain, a half-written temp file, or a retry loop.
+const PATH_MAX_BYTES: usize = 4096;
+const NAME_MAX_BYTES: usize = 255;
+
+/// Why `rel` cannot be materialized under `base`, if it cannot.
+fn path_limit_reason(base: &Path, rel: &str) -> Option<String> {
+    if let Some(component) = rel.split('/').find(|c| c.len() > NAME_MAX_BYTES) {
+        return Some(format!(
+            "name component is {} bytes (NAME_MAX {NAME_MAX_BYTES}); skipped",
+            component.len()
+        ));
+    }
+    let len = to_abs(base, rel).as_os_str().len();
+    (len >= PATH_MAX_BYTES)
+        .then(|| format!("path is {len} bytes (PATH_MAX {PATH_MAX_BYTES}); skipped"))
 }
 
 /// Relative-path classification: the Drive protocol only carries UTF-8
@@ -4057,6 +4353,23 @@ fn is_internal_path(rel: &str) -> bool {
 fn is_temp_file(rel: &str) -> bool {
     let name = rel.rsplit('/').next().unwrap_or(rel);
     name.contains(".pds-part") || name.contains(".pdstmp-")
+}
+
+/// Short, unique temp sibling for a download target.
+///
+/// The final `rename` needs the temp in the same directory to stay atomic,
+/// but appending `.pds-part` to a `NAME_MAX`-sized component overflows the
+/// filesystem limit. Hash the target path instead, keeping the suffix and
+/// directory (the stale-temp sweep keys off the suffix).
+fn transfer_temp_rel(rel: &str) -> String {
+    use sha1::Digest;
+    let mut hasher = sha1::Sha1::new();
+    hasher.update(rel.as_bytes());
+    let name = format!(".pds-{:x}.pds-part", hasher.finalize());
+    match rel.rsplit_once('/') {
+        Some((dir, _)) => format!("{dir}/{name}"),
+        None => name,
+    }
 }
 
 /// Insert `suffix` before the extension: `a.txt` + ` (2)` → `a (2).txt`.
@@ -4277,6 +4590,25 @@ mod tests {
         assert!(is_temp_file("x.txt.pdstmp-abc123"));
         assert!(!is_temp_file("x.txt"));
         assert!(!is_temp_file("docs/report.pds.txt"));
+    }
+
+    #[test]
+    fn transfer_temps_stay_next_to_the_target_within_name_max() {
+        // Same directory so the final rename is atomic; short name so a
+        // 255-byte target component still fits the temp (TG-14).
+        let long = format!("{}.bin", "y".repeat(251));
+        let tmp = transfer_temp_rel(&long);
+        assert_eq!(tmp.len(), ".pds-".len() + 40 + ".pds-part".len());
+        assert!(is_temp_file(&tmp));
+        assert!(tmp.starts_with(".pds-"));
+        assert_ne!(tmp, transfer_temp_rel(&format!("{long}.other")));
+
+        let nested = transfer_temp_rel(&format!("docs/{long}"));
+        assert_eq!(
+            nested.rsplit_once('/').map(|(dir, _)| dir),
+            Some("docs")
+        );
+        assert!(!nested.contains(&long));
     }
 
     /// External-backing layout (the desktop app): switching a mirror root

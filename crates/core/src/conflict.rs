@@ -64,4 +64,36 @@ mod tests {
             "a (conflict 2026-01-02 0304).txt"
         );
     }
+
+    #[test]
+    fn odd_but_legal_names_keep_a_valid_extension() {
+        // TG-13 matrix: the suffix must never eat a trailing dot/space,
+        // normalise Unicode, or introduce a path separator.
+        let cases: &[(&str, &str)] = &[
+            ("caf\u{e9}.txt", ".txt"),          // NFC
+            ("cafe\u{301}.txt", ".txt"),        // NFD
+            ("rocket \u{1f680}.txt", ".txt"),   // emoji
+            ("with space.txt", ".txt"),
+            ("it's \"quoted\".txt", ".txt"),
+            ("line\nbreak.txt", ".txt"),
+            ("trailing dot.", "."),
+            ("~leading.txt", ".txt"),
+        ];
+        for (name, ext) in cases {
+            let conflict = conflict_name(name, at());
+            assert_ne!(&conflict, name);
+            assert!(
+                !conflict.contains('/'),
+                "conflict name must stay a sibling: {conflict:?}"
+            );
+            assert!(
+                conflict.ends_with(ext),
+                "extension {ext:?} must survive for {name:?}: {conflict:?}"
+            );
+        }
+        // Extension-less names (including trailing whitespace) keep the
+        // suffix whole rather than inventing an extension.
+        let conflict = conflict_name("trailing space ", at());
+        assert_eq!(conflict, "trailing space  (conflict 2026-10-23 1405)");
+    }
 }
