@@ -452,7 +452,7 @@ async fn mass_delete_guard_auto_pauses_and_requires_resume() {
         "one explicit resume must approve and drain the whole pending batch"
     );
     assert_eq!(fx.mock.trashed_uids().len(), 25);
-    assert!(fx.db.tombstones().unwrap().is_empty());
+    wait_for(|| fx.db.tombstones().unwrap().is_empty()).await;
     fx.shutdown().await;
 }
 
@@ -491,7 +491,9 @@ async fn mass_delete_guard_re_trips_on_new_deletes_beyond_approved_set() {
     wait_for_deletes_accounted(&fx, 25).await;
     fx.handle.resume().await.unwrap();
     wait_for(|| fx.mock.trashed_uids().len() == 25).await;
-    assert!(fx.db.tombstones().unwrap().is_empty());
+    // Trashing and clearing the tombstone row are separate steps, so wait
+    // for the row to go before asserting (an immediate assert is racy).
+    wait_for(|| fx.db.tombstones().unwrap().is_empty()).await;
 
     // NEW deletes beyond the approved set must re-trip the guard (bug #2:
     // approval covers only the batch pending at resume time). 7 synced nodes
@@ -518,7 +520,7 @@ async fn mass_delete_guard_re_trips_on_new_deletes_beyond_approved_set() {
     // A second explicit resume approves the new batch and drains it.
     fx.handle.resume().await.unwrap();
     wait_for(|| fx.mock.trashed_uids().len() == 30).await;
-    assert!(fx.db.tombstones().unwrap().is_empty());
+    wait_for(|| fx.db.tombstones().unwrap().is_empty()).await;
     // And nothing more re-trips afterwards.
     tokio::time::sleep(Duration::from_millis(500)).await;
     assert_eq!(
