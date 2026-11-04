@@ -3,14 +3,16 @@
 //! The process is the sync service: it starts at login (XDG autostart), owns
 //! the engine + FUSE mount, and keeps a StatusNotifierItem tray icon alive.
 //! A login start stays in the tray only; the dashboard window is created on
-//! first use. Closing it minimizes instead of stopping sync; Quit lives in
-//! the tray and in the app's own controls.
+//! first use. Closing it hides it — minimized on X11, parked on a scratch niri
+//! workspace on Wayland — instead of stopping sync; Quit lives in the tray and
+//! in the app's own controls.
 
 mod actions;
 mod autostart;
 mod components;
 mod engine;
 mod instance;
+mod niri;
 mod platform;
 mod state;
 mod theme;

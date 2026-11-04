@@ -28,8 +28,9 @@ use crate::ui::AppView;
 /// The view lives for the whole process lifetime so engine updates keep
 /// flowing into the tray status even while no window exists. The window is
 /// created lazily on first use: a login start (`--minimized`) lives in the
-/// tray alone until the user asks for the dashboard. Closing the window
-/// minimizes it instead of quitting, so the handle stays valid once created.
+/// tray alone until the user asks for the dashboard. Closing the window hides
+/// it (X11 minimize, niri workspace parking) instead of quitting, so the
+/// handle stays valid once created.
 pub struct Dashboard {
     pub view: Entity<AppView>,
     window: Cell<Option<WindowHandle<AppView>>>,
@@ -210,6 +211,13 @@ pub fn show_dashboard(cx: &mut App, page: Option<Page>) -> anyhow::Result<()> {
         Some(handle) => handle,
         None => open_window(cx, view)?,
     };
+    // niri cannot minimize, so a "closed" dashboard sits on a scratch
+    // workspace. Bring it back to the focused workspace before activating it.
+    if cx.compositor_name() != "X11"
+        && let Err(error) = crate::niri::restore()
+    {
+        tracing::debug!("dashboard was not parked (nothing to restore): {error:#}");
+    }
     // The window should never be destroyed (close is vetoed), but a
     // compositor/driver failure must not leave the tray dead.
     handle
@@ -238,9 +246,10 @@ fn open_window(cx: &mut App, view: Entity<AppView>) -> anyhow::Result<WindowHand
     let handle = cx.open_window(options, move |window, cx| {
         window.focus(window_view.read(cx).focus_handle());
 
-        // Closing the dashboard puts the app back in the tray where
-        // minimizing is reliable (X11); elsewhere closing stops sync, as the
-        // tray's Quit (or the in-app quit buttons) would.
+        // Closing the dashboard puts the app back in the tray: minimized on
+        // X11, parked on a scratch niri workspace on Wayland. Elsewhere
+        // closing stops sync, as the tray's Quit (or the in-app quit
+        // buttons) would.
         let weak = window_view.downgrade();
         window.on_window_should_close(cx, move |window, cx| {
             let quitting = weak
@@ -249,11 +258,9 @@ fn open_window(cx: &mut App, view: Entity<AppView>) -> anyhow::Result<WindowHand
             if quitting {
                 return false;
             }
-            if crate::ui::close_hides(cx) {
-                window.minimize_window();
-            } else {
-                // No tray to restore from, or a compositor whose minimize is
-                // not trustworthy (Wayland): closing means quit.
+            if !crate::ui::hide_dashboard(window, cx) {
+                // No tray to restore from, or no compositor trick that can
+                // hide the window: closing means quit.
                 let _ = weak.update(cx, |view, cx| view.request_quit(cx));
             }
             false
