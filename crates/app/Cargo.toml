@@ -11,8 +11,9 @@ path = "src/main.rs"
 
 [dependencies]
 pds-xdg.workspace = true
-gpui = "0.2"
-gpui-tray = "0.3"
+gpui = { package = "gpui-ce", version = "0.3" }
+gpui-platform = { package = "gpui_ce_platform", version = "0.3", features = ["wayland", "x11"] }
+gpui-tray = { version = "0.3", default-features = false, features = ["gpui-ce"] }
 pds-core.workspace = true
 pds-sidecar-client.workspace = true
 pds-vfs-linux = { path = "../vfs-linux" }
@@ -23,7 +24,6 @@ anyhow.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 chrono.workspace = true
-serde_json.workspace = true
 # Session-bus probe for a StatusNotifier host (same zbus major as gpui-tray).
 zbus = { version = "6", default-features = false, features = ["default-rt"] }
 

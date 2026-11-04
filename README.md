@@ -125,8 +125,9 @@ transfer.
 - **Tray icon** (StatusNotifierItem): a coloured dot shows syncing, paused,
   delete-guard, signed-out, or stopped. The menu has *Open Dashboard*,
   *Pause/Resume syncing*, *Open Sync Folder*, *Preferences…*, and *Quit*;
-  left-clicking the icon opens the dashboard. Closing the dashboard minimizes
-  it, and `Quit` is the only way to stop the service.
+  left-clicking the icon opens the dashboard. Closing the dashboard hides it
+  (the window is unmapped, syncing continues), and `Quit` is the only way to
+  stop the service.
 - **No tray host?** GNOME needs the AppIndicator extension, and some bare
   compositors (e.g. niri) need a panel such as waybar with a tray module.
   When no `StatusNotifierWatcher` is present the app still starts at login,

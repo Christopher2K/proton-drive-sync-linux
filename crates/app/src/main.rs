@@ -3,16 +3,14 @@
 //! The process is the sync service: it starts at login (XDG autostart), owns
 //! the engine + FUSE mount, and keeps a StatusNotifierItem tray icon alive.
 //! A login start stays in the tray only; the dashboard window is created on
-//! first use. Closing it hides it — minimized on X11, parked on a scratch niri
-//! workspace on Wayland — instead of stopping sync; Quit lives in the tray and
-//! in the app's own controls.
+//! first use. Closing it unmaps the window and keeps the process (and sync)
+//! running; Quit lives in the tray and in the app's own controls.
 
 mod actions;
 mod autostart;
 mod components;
 mod engine;
 mod instance;
-mod niri;
 mod platform;
 mod state;
 mod theme;
@@ -21,7 +19,7 @@ mod ui;
 
 use std::time::Duration;
 
-use gpui::{App, AppContext, Application};
+use gpui::{App, AppContext};
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
@@ -78,7 +76,7 @@ fn main() {
     let (updates_tx, updates_rx) = mpsc::unbounded_channel();
     let service = engine::start(root.clone(), sidecar_cmd.clone(), updates_tx.clone());
 
-    Application::new().run(move |cx: &mut App| {
+    gpui_platform::application().run(move |cx: &mut App| {
         cx.bind_keys(ui::key_bindings());
 
         // The view outlives any single window: it owns the state and pumps
@@ -136,9 +134,7 @@ fn main() {
         cx.spawn(async move |cx| {
             let _guard = instance_guard;
             while show_events.recv().await.is_some() {
-                let shown = cx
-                    .update(|cx| tray::show_dashboard(cx, None).is_ok())
-                    .unwrap_or(false);
+                let shown = cx.update(|cx| tray::show_dashboard(cx, None).is_ok());
                 if !shown {
                     break;
                 }
@@ -197,12 +193,12 @@ fn handle_cli() -> CliAction {
 /// Boot the GPUI event loop without a window. Used by packaging/CI checks on
 /// machines without a display; proves the platform backend links and runs.
 fn run_headless_proof() {
-    Application::headless().run(|cx: &mut App| {
+    gpui_platform::headless().run(|cx: &mut App| {
         cx.spawn(async move |cx| {
             cx.background_executor()
                 .timer(Duration::from_millis(250))
                 .await;
-            let _ = cx.update(|cx| {
+            cx.update(|cx| {
                 println!("headless proof: event loop OK");
                 cx.quit();
             });

@@ -2,7 +2,7 @@
 //! sync service.
 //!
 //! The icon lives for the whole process lifetime (the dashboard window is
-//! only hidden/minimized, never the source of truth), shows the engine state
+//! only hidden, never the source of truth), shows the engine state
 //! as a coloured dot, and offers the common actions without opening a
 //! window. The tray is best-effort: on a desktop without a StatusNotifier
 //! host (GNOME needs an extension) the icon silently never appears — building
@@ -29,8 +29,8 @@ use crate::ui::AppView;
 /// flowing into the tray status even while no window exists. The window is
 /// created lazily on first use: a login start (`--minimized`) lives in the
 /// tray alone until the user asks for the dashboard. Closing the window hides
-/// it (X11 minimize, niri workspace parking) instead of quitting, so the
-/// handle stays valid once created.
+/// it (unmaps the toplevel) instead of quitting, so the handle stays valid
+/// once created.
 pub struct Dashboard {
     pub view: Entity<AppView>,
     window: Cell<Option<WindowHandle<AppView>>>,
@@ -211,17 +211,13 @@ pub fn show_dashboard(cx: &mut App, page: Option<Page>) -> anyhow::Result<()> {
         Some(handle) => handle,
         None => open_window(cx, view)?,
     };
-    // niri cannot minimize, so a "closed" dashboard sits on a scratch
-    // workspace. Bring it back to the focused workspace before activating it.
-    if cx.compositor_name() != "X11"
-        && let Err(error) = crate::niri::restore()
-    {
-        tracing::debug!("dashboard was not parked (nothing to restore): {error:#}");
-    }
     // The window should never be destroyed (close is vetoed), but a
     // compositor/driver failure must not leave the tray dead.
     handle
-        .update(cx, |_view, window, _cx| window.activate_window())
+        .update(cx, |_view, window, _cx| {
+            window.set_visible(true);
+            window.activate();
+        })
         .map_err(|e| anyhow::anyhow!("dashboard window is unavailable: {e:#}"))
 }
 
@@ -244,12 +240,13 @@ fn open_window(cx: &mut App, view: Entity<AppView>) -> anyhow::Result<WindowHand
 
     let window_view = view.clone();
     let handle = cx.open_window(options, move |window, cx| {
-        window.focus(window_view.read(cx).focus_handle());
+        let focus_handle = window_view.read(cx).focus_handle().clone();
+        window.focus(&focus_handle, cx);
 
-        // Closing the dashboard puts the app back in the tray: minimized on
-        // X11, parked on a scratch niri workspace on Wayland. Elsewhere
-        // closing stops sync, as the tray's Quit (or the in-app quit
-        // buttons) would.
+        // Closing the dashboard puts the app back in the tray: the window is
+        // unmapped and the process keeps syncing. Without a tray host there
+        // would be no way back, so closing stops sync instead, as the tray's
+        // Quit (or the in-app quit buttons) would.
         let weak = window_view.downgrade();
         window.on_window_should_close(cx, move |window, cx| {
             let quitting = weak
@@ -259,8 +256,7 @@ fn open_window(cx: &mut App, view: Entity<AppView>) -> anyhow::Result<WindowHand
                 return false;
             }
             if !crate::ui::hide_dashboard(window, cx) {
-                // No tray to restore from, or no compositor trick that can
-                // hide the window: closing means quit.
+                // No tray to restore from: closing means quit.
                 let _ = weak.update(cx, |view, cx| view.request_quit(cx));
             }
             false
