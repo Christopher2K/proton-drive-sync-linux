@@ -99,6 +99,22 @@ mod tests {
     }
 
     #[test]
+    fn ratio_limb_boundary_on_tiny_trees() {
+        // The rule is strict `deletes > 25% of synced` (guard.rs): one
+        // delete trips on a 2-node tree (1 > 0.5) but is allowed on a
+        // 4-node tree (1 > 1.0 is false). Pin both sides so the boundary
+        // cannot drift.
+        let t0 = Instant::now();
+        let mut two = DeleteGuard::default();
+        assert!(two.record_and_check(t0, 2), "1 delete of 2 must trip");
+        let mut four = DeleteGuard::default();
+        assert!(
+            !four.record_and_check(t0, 4),
+            "1 delete of 4 is exactly 25%, allowed"
+        );
+    }
+
+    #[test]
     fn window_expiry_resets_count() {
         let mut g = DeleteGuard::default();
         let t0 = Instant::now();

@@ -521,6 +521,111 @@ async fn mass_delete_guard_re_trips_on_new_deletes_beyond_approved_set() {
     fx.shutdown().await;
 }
 
+/// TG-24: a guard pause is durable. A restart while guard-paused must not
+/// quietly drain the remaining tombstone wave through a fresh in-memory
+/// guard window — the engine comes back paused, keeps every tombstone, and
+/// needs the same explicit resume as before the restart.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn mass_delete_guard_pause_survives_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("sync");
+    std::fs::create_dir_all(&root).unwrap();
+    let (client, mock) = MockSidecar::new().connect();
+    // Same seeding order on both sides of the restart keeps the generated
+    // node uids identical, so the second mock can trash every tombstone.
+    for i in 0..40 {
+        mock.remote_create_file("root", &format!("f{i:02}.txt"), b"x");
+    }
+    let fx = start_with_client(
+        dir,
+        root.clone(),
+        client,
+        mock,
+        pds_core::RETRY_BASE_DEFAULT,
+    )
+    .await;
+
+    for i in 0..15 {
+        std::fs::remove_file(root.join(format!("f{i:02}.txt"))).unwrap();
+    }
+    wait_for(|| {
+        futures::executor::block_on(fx.handle.status())
+            .map(|s| s.state == EngineState::GuardPaused)
+            .unwrap_or(false)
+    })
+    .await;
+    wait_for_deletes_accounted(&fx, 15).await;
+    let trashed_before = fx.mock.trashed_uids().len();
+    assert!(
+        trashed_before < 15,
+        "guard must stop the first run before the whole wave drains"
+    );
+    let pending_before = fx.db.tombstones().unwrap().len();
+    assert!(pending_before > 0, "remaining deletes must stay tombstoned");
+    assert_eq!(trashed_before + pending_before, 15);
+
+    let db_path = root.join(STATE_DIR).join("state.db");
+    fx.shutdown_keep_dir().await;
+
+    let db = Db::open(&db_path).unwrap();
+    assert_eq!(
+        db.meta("guard_paused").unwrap().as_deref(),
+        Some("1"),
+        "guard pause must be persisted before shutdown"
+    );
+    assert_eq!(db.tombstones().unwrap().len(), pending_before);
+    drop(db);
+
+    // Fresh engine over the SAME root+db, with a matching mock tree.
+    let (mut client, mock2) = MockSidecar::new().connect();
+    for i in 0..40 {
+        mock2.remote_create_file("root", &format!("f{i:02}.txt"), b"x");
+    }
+    let notifications = client.take_notifications();
+    let (engine, handle) = Engine::new(
+        Arc::new(client),
+        notifications,
+        EngineConfig {
+            root: root.clone(),
+            db_path: db_path.clone(),
+            retry_base: pds_core::RETRY_BASE_DEFAULT,
+            placeholders: false,
+            eviction_cap: None,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let engine = tokio::spawn(engine.run());
+    wait_for(|| {
+        futures::executor::block_on(handle.status())
+            .map(|s| s.state == EngineState::GuardPaused)
+            .unwrap_or(false)
+    })
+    .await;
+
+    // No silent resume: nothing may drain until the user approves again.
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    assert!(
+        mock2.trashed_uids().is_empty(),
+        "restart must not drain tombstones while guard-paused"
+    );
+    let db = Db::open(&db_path).unwrap();
+    assert_eq!(
+        db.tombstones().unwrap().len(),
+        pending_before,
+        "no tombstone may be lost across the paused restart"
+    );
+
+    handle.resume().await.unwrap();
+    wait_for(|| mock2.trashed_uids().len() == pending_before).await;
+    wait_for(|| db.tombstones().unwrap().is_empty()).await;
+    assert_eq!(handle.status().await.unwrap().state, EngineState::Running);
+    assert_eq!(db.meta("guard_paused").unwrap(), None);
+    handle.shutdown().await.unwrap();
+    let _ = engine.await;
+}
+
 // ---------------------------------------------------------------------------
 // F4 — pause / resume
 // ---------------------------------------------------------------------------
@@ -1794,6 +1899,134 @@ async fn non_utf8_filename_is_skipped_and_reported_once() {
         EngineState::Running
     );
     fx.shutdown().await;
+}
+
+/// TG-15: a user file whose *name contains* a transfer-temp marker is real
+/// content. Only the generated shapes (`*.pds-part` suffix, sidecar
+/// `*.pdstmp-<uuid>`) are ignored; these must upload instead of being
+/// skipped forever.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn temp_marker_substring_files_sync_normally() {
+    let fx = start().await;
+    for (name, bytes) in [
+        ("report.pds-part.txt", b"user part".as_slice()),
+        ("foo.pdstmp-bar", b"user tmp".as_slice()),
+    ] {
+        std::fs::write(fx.root.join(name), bytes).unwrap();
+    }
+    for name in ["report.pds-part.txt", "foo.pdstmp-bar"] {
+        wait_for(|| fx.mock.uploaded_names().contains(&name.to_string())).await;
+        wait_for_synced(&fx.db, name).await;
+        assert!(fx.root.join(name).is_file(), "{name} must stay on disk");
+    }
+    assert!(fx.db.tombstones().unwrap().is_empty());
+    assert_eq!(
+        fx.db
+            .node_by_path("report.pds-part.txt")
+            .unwrap()
+            .map(|r| r.sync_state),
+        Some(pds_core::SyncState::Synced)
+    );
+    fx.shutdown().await;
+}
+
+/// TG-15: the state dir and placeholder backing dir are reserved names at
+/// the sync root. A user item using either is left untouched (never
+/// uploaded or trashed) and surfaced once as skipped in Activity.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn reserved_internal_names_are_skipped_and_reported_once() {
+    init_logs();
+    // Desktop-style layout: state lives OUTSIDE the root, so a `.pds` item
+    // inside the root is user content using a reserved name (in the classic
+    // layout the engine's own `.pds` is not reported).
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("sync");
+    let state = dir.path().join("state");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::create_dir_all(&state).unwrap();
+    let db_path = state.join("state.db");
+    let (mut client, mock) = MockSidecar::new().connect();
+    let notifications = client.take_notifications();
+    let (engine, handle) = Engine::new(
+        Arc::new(client),
+        notifications,
+        EngineConfig {
+            root: root.clone(),
+            db_path: db_path.clone(),
+            retry_base: pds_core::RETRY_BASE_DEFAULT,
+            placeholders: false,
+            eviction_cap: None,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let db = Db::open(&db_path).unwrap();
+    let engine = tokio::spawn(engine.run());
+    assert!(
+        handle.wait_for_watcher(Duration::from_secs(10)).await,
+        "watcher never attached"
+    );
+    wait_for(|| root.join("hello.txt").is_file()).await;
+
+    let mut activity = handle.subscribe_activity();
+    std::fs::create_dir_all(root.join(".pds")).unwrap();
+    std::fs::create_dir_all(root.join(".pds-vfs-backing")).unwrap();
+    std::fs::write(root.join(".pds-vfs-backing/keep.txt"), b"keep").unwrap();
+    std::fs::write(root.join(".pds/user-note.txt"), b"keep").unwrap();
+
+    let mut seen = std::collections::HashSet::new();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if seen.contains(".pds") && seen.contains(".pds-vfs-backing") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "reserved roots were not surfaced"
+        );
+        for item in drain_activity(&mut activity) {
+            if item.kind == ActivityKind::Skipped
+                && (item.path == ".pds" || item.path == ".pds-vfs-backing")
+            {
+                seen.insert(item.path);
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(
+        seen.len(),
+        2,
+        "both reserved roots must surface once: {seen:?}"
+    );
+
+    // Once per root, not once per child/watcher batch.
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    let repeats = drain_activity(&mut activity)
+        .into_iter()
+        .filter(|i| {
+            i.kind == ActivityKind::Skipped && (i.path == ".pds" || i.path == ".pds-vfs-backing")
+        })
+        .count();
+    assert_eq!(repeats, 0, "reserved warning repeated: {repeats}");
+
+    // Left untouched on disk, never uploaded, never trashed.
+    assert!(root.join(".pds/user-note.txt").is_file());
+    assert!(root.join(".pds-vfs-backing/keep.txt").is_file());
+    assert!(
+        mock.uploaded_names().iter().all(|n| !n.starts_with(".pds")),
+        "reserved items leaked into uploads: {:?}",
+        mock.uploaded_names()
+    );
+    assert!(
+        mock.child_names("root")
+            .iter()
+            .all(|n| !n.starts_with(".pds"))
+    );
+    assert!(db.tombstones().unwrap().is_empty());
+    handle.shutdown().await.unwrap();
+    let _ = engine.await;
 }
 
 // ---------------------------------------------------------------------------
