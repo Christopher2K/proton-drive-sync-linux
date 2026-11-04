@@ -256,20 +256,14 @@ impl AppView {
     /// Close the window. Bound to the titlebar's close button and ctrl-w.
     ///
     /// Mirrors the window manager's close request: hide to the tray where
-    /// that actually works (X11 with a tray host), quit everywhere else.
-    /// Wayland's `xdg_toplevel.set_minimized` is silently ignored by the
-    /// tiling compositors that need our own titlebar (niri, sway), and gpui
-    /// reports `minimize` as supported whenever the compositor sends no
-    /// capability list — so asking those compositors to minimize leaves the
-    /// window on screen, which is exactly the "close button does nothing"
-    /// bug. See `close_hides` for how that is decided.
+    /// that works (X11 minimize, niri workspace parking — see
+    /// `hide_dashboard`), quit everywhere else. Quitting is only right when
+    /// there is no way back to the window.
     pub(crate) fn close_window(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.state.quitting {
             return;
         }
-        if close_hides(cx) {
-            window.minimize_window();
-        } else {
+        if !hide_dashboard(window, cx) {
             self.request_quit(cx);
         }
     }
@@ -1006,20 +1000,41 @@ impl AppView {
     }
 }
 
-/// Whether a compositor close request can hide the dashboard (minimize)
-/// rather than stop the app. Hiding needs something to restore the window
-/// from (a tray host) *and* a compositor whose minimize is reliable.
+/// Close the dashboard without stopping sync: hide it and keep running.
 ///
-/// On Wayland neither condition can be verified: gpui reports "minimize
-/// supported" even for tiling compositors (niri, sway) that silently ignore
-/// `xdg_toplevel.set_minimized`, so a minimize there just leaves the window
-/// on screen. Close therefore quits on Wayland; X11 window managers own
-/// iconification and keep the old hide-to-tray behaviour.
-pub(crate) fn close_hides(cx: &App) -> bool {
-    let tray_available = cx
-        .try_global::<crate::tray::TrayAvailable>()
-        .is_some_and(|flag| flag.0);
-    tray_available && cx.compositor_name() == "X11"
+/// Returns whether hiding worked; the caller must quit when it did not,
+/// because there would be no way back to the window.
+///
+/// X11 window managers own iconification, so minimize is reliable there.
+/// Wayland has no such thing: `xdg_toplevel.set_minimized` is silently
+/// ignored by tiling compositors (niri, sway) and gpui wrongly reports
+/// minimize as supported when the compositor sends no capability list. niri
+/// instead gets the window parked on its trailing workspace through niri's
+/// own IPC socket ([`crate::niri`]), which leaves the process (and syncing)
+/// untouched.
+pub(crate) fn hide_dashboard(window: &mut Window, cx: &App) -> bool {
+    if !tray_available(cx) {
+        // Without a tray icon there is no way to bring the window back.
+        return false;
+    }
+    if cx.compositor_name() == "X11" {
+        window.minimize_window();
+        return true;
+    }
+    match crate::niri::park() {
+        Ok(()) => true,
+        Err(error) => {
+            warn!("could not park the dashboard off screen: {error:#}");
+            false
+        }
+    }
+}
+
+/// Whether a StatusNotifier host is registered, i.e. whether the tray icon
+/// can bring a hidden dashboard back.
+pub(crate) fn tray_available(cx: &App) -> bool {
+    cx.try_global::<crate::tray::TrayAvailable>()
+        .is_some_and(|flag| flag.0)
 }
 
 impl Render for AppView {

@@ -23,6 +23,7 @@ anyhow.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 chrono.workspace = true
+serde_json.workspace = true
 # Session-bus probe for a StatusNotifier host (same zbus major as gpui-tray).
 zbus = { version = "6", default-features = false, features = ["default-rt"] }
 
