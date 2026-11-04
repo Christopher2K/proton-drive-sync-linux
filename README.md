@@ -117,9 +117,9 @@ transfer.
   writes the standard XDG entry
   `~/.config/autostart/proton-drive-sync.desktop`, launching
   `proton-drive-sync --minimized` a few seconds after you sign in to your
-  desktop session. The app starts in the background with just its tray icon —
-  the dashboard window opens only when you ask for it. Your choice is
-  remembered in
+  desktop session. `--minimized` always wins: a login start never opens a
+  window, even if the panel (and its tray host) has not come up yet. The
+  dashboard opens only when you ask for it. Your choice is remembered in
   `~/.config/proton-drive-sync/app.conf`; toggling it off removes the entry
   and a later launch will not re-enable it.
 - **Tray icon** (StatusNotifierItem): a coloured dot shows syncing, paused,
@@ -130,8 +130,10 @@ transfer.
   stop the service.
 - **No tray host?** GNOME needs the AppIndicator extension, and some bare
   compositors (e.g. niri) need a panel such as waybar with a tray module.
-  When no `StatusNotifierWatcher` is present the app still starts at login,
-  but opens the dashboard instead of hiding and closes normally.
+  Without a `StatusNotifierWatcher` the app still starts at login and syncs
+  windowless; start it again (application menu or
+  `proton-drive-sync`) to open the dashboard, and closing the window then
+  stops the service because there is no icon to bring it back.
 - **One instance only:** launching `proton-drive-sync` again does not start a
   second engine — it asks the running instance to show its dashboard
   (`$XDG_RUNTIME_DIR/proton-drive-sync.sock`) and exits. This protects the

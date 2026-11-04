@@ -61,12 +61,17 @@ fn main() {
     // builds stay opt-in). Failures are non-fatal.
     autostart::init_on_launch();
 
-    // Never start without a window at login on a desktop that cannot show
-    // the tray icon: there would be no way back to the window.
+    // `--minimized` is authoritative: a login start never opens a window on
+    // its own. Probing the tray here is only for logging — the panel (and its
+    // StatusNotifierWatcher) may still be starting, so the probe must not
+    // change the decision. The fallback way back to the dashboard is starting
+    // the app again, which asks this instance to show it.
     let tray_host = tray::host_available();
-    let background = background && tray_host;
-    if !tray_host {
-        info!("no StatusNotifier tray host found; the dashboard opens at login");
+    if background && !tray_host {
+        info!(
+            "no StatusNotifier tray host found yet; staying windowless \
+             (start the app again to open the dashboard)"
+        );
     }
 
     let root = platform::sync_root();
@@ -94,23 +99,21 @@ fn main() {
         });
         cx.set_global(tray::Dashboard::new(view.clone()));
 
-        let tray_ready = match tray::build(cx) {
+        match tray::build(cx) {
             Ok(tray) => {
                 // `gpui-tray` builds even without a watcher (it keeps
                 // retrying registration), so the host probe — not the build
                 // result — decides whether closing hides the window.
                 cx.set_global(tray::TrayHolder(tray));
                 cx.set_global(tray::TrayAvailable(tray_host));
-                true
             }
             Err(e) => {
                 // Keep close = quit so the window can never become
                 // unreachable behind a tray that does not exist.
                 cx.set_global(tray::TrayAvailable(false));
                 warn!("tray icon unavailable: {e} (closing the window quits)");
-                false
             }
-        };
+        }
 
         cx.on_action(tray::on_open_dashboard);
         cx.on_action(tray::on_open_settings);
@@ -118,11 +121,20 @@ fn main() {
         cx.on_action(tray::on_toggle_pause);
         cx.on_action(tray::on_quit);
 
-        // Started at login: stay in the tray only. The window is created on
-        // first use (tray click, menu action, or a second launch). Without a
-        // working tray there would be no way back, so open the dashboard.
-        if background && tray_ready {
-            info!("started in the background; the dashboard is available from the tray");
+        // Started at login: stay in the tray only, whatever the tray probe
+        // and build results were. An autostart entry must never open a
+        // window on its own; if no tray icon is usable, starting the app
+        // again opens the dashboard (single instance). Otherwise the window
+        // is created on first use.
+        if background {
+            if cx.try_global::<tray::TrayHolder>().is_some() && tray_host {
+                info!("started in the background; the dashboard is available from the tray");
+            } else {
+                info!(
+                    "started in the background without a tray icon; \
+                     start the app again to open the dashboard"
+                );
+            }
         } else if let Err(e) = tray::show_dashboard(cx, None) {
             error!("could not open the application window: {e:#}");
             cx.quit();

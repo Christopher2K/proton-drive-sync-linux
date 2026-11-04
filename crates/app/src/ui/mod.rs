@@ -1007,9 +1007,16 @@ impl AppView {
 /// leaves it alive, so the event loop and the sync engine keep running.
 /// This works on tiling compositors without a minimize state (niri, sway)
 /// as well as on desktops that do implement minimize.
+///
+/// Two things must both hold: a tray object was built (otherwise there is no
+/// icon to click even if a host appears later) and a StatusNotifier host is
+/// registered. The startup probe can race the panel, so a "no" from startup
+/// is re-probed here instead of stranding the window.
 pub(crate) fn hide_dashboard(window: &mut Window, cx: &App) -> bool {
-    if !tray_available(cx) {
-        // Without a tray icon there is no way to bring the window back.
+    if cx.try_global::<crate::tray::TrayHolder>().is_none() {
+        return false;
+    }
+    if !tray_available(cx) && !crate::tray::host_available() {
         return false;
     }
     window.set_visible(false);
