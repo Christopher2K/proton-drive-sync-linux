@@ -43,6 +43,11 @@ const META_INITIAL_SYNC_DONE: &str = "initial_sync_done";
 /// Set to "1" after a mirror-mode materialization pass ran; switching from
 /// placeholders to mirror later re-triggers materialization exactly once.
 const META_MATERIALIZED_FOR_MODE: &str = "materialized_for_mirror";
+/// The mass-delete guard auto-paused and the user has not approved the
+/// pending tombstones yet. Durable so a restart cannot quietly drain a
+/// guard-blocked delete wave: the fresh engine comes back paused until an
+/// explicit resume (F3.3).
+const META_GUARD_PAUSED: &str = "guard_paused";
 
 /// First backoff delay after a retryable upload failure (F2).
 pub const RETRY_BASE_DEFAULT: Duration = Duration::from_secs(1);
@@ -469,6 +474,14 @@ pub struct Engine<S: SidecarApi> {
     store: Option<Store>,
     /// Hydrated file contents live here, outside the FUSE-visible root.
     backing_dir: PathBuf,
+    /// True when `.pds` under the root is this engine's state dir (the
+    /// classic CLI layout). A user-created `.pds` in the desktop layout is
+    /// not engine-owned and must be surfaced as reserved instead of being
+    /// ignored silently.
+    state_dir_is_engine: bool,
+    /// True when `.pds-vfs-backing` under the root is this engine's live
+    /// backing cache (classic placeholder layout).
+    backing_dir_is_engine: bool,
     /// Backing-cache size cap (placeholder mode). `None` disables eviction.
     eviction_cap: Option<u64>,
     /// The effective sync mode (F5), resolved once at construction
@@ -489,8 +502,9 @@ pub struct Engine<S: SidecarApi> {
     /// Tombstone paths (`local_path`) the user approved with an explicit
     /// resume after a guard pause (e2e-m1 bug #2). The guard's count/ratio
     /// limbs ignore these; only *new* deletes beyond the approved set can
-    /// re-trip it. In-memory only — reset on engine restart is acceptable
-    /// because the tombstones themselves are durable.
+    /// re-trip it. The pause itself is durable (`META_GUARD_PAUSED`); the
+    /// approved set is reconstructed from the pending tombstones on resume,
+    /// so a restart can never drain a guard-blocked wave unapproved.
     approved_tombstones: HashSet<String>,
     /// Earliest time each path may be retried after a retryable upload
     /// failure (F2 backoff). In-memory; the failure COUNT is durable in the
@@ -533,6 +547,11 @@ pub struct Engine<S: SidecarApi> {
     /// activity feed — the warning is emitted once per path, not once per
     /// watcher batch.
     non_utf8_reported: HashSet<Vec<u8>>,
+    /// Engine-internal root names (`.pds`, `.pds-vfs-backing`) already
+    /// surfaced once as reserved. Normalized to the top-level name so a
+    /// user item below either directory produces one warning, not one per
+    /// child.
+    reserved_reported: HashSet<String>,
     /// `(device, inode)` of every tracked local directory, keyed by relative
     /// path. `notify`'s debounced API only reports paths, so a local folder
     /// rename arrives as "old path gone + new path appeared". The inode is
@@ -587,6 +606,9 @@ impl<S: SidecarApi + 'static> Engine<S> {
         let backing_dir = external_backing
             .clone()
             .unwrap_or_else(|| config.root.join(VFS_BACKING_DIR));
+        let state_dir_is_engine = config.db_path.starts_with(config.root.join(STATE_DIR));
+        let backing_dir_is_engine =
+            placeholders && backing_dir.starts_with(config.root.join(VFS_BACKING_DIR));
         // One-time local layout conversion, only possible with an external
         // backing cache (the desktop layout; see EngineConfig::backing_dir):
         // adopting an old in-root mirror into placeholders, or materializing
@@ -611,6 +633,8 @@ impl<S: SidecarApi + 'static> Engine<S> {
             placeholders,
             store,
             backing_dir,
+            state_dir_is_engine,
+            backing_dir_is_engine,
             eviction_cap: config.eviction_cap,
             mode,
             watch_local_writes: config.watch_local_writes,
@@ -636,6 +660,7 @@ impl<S: SidecarApi + 'static> Engine<S> {
             watcher_ready: watcher_ready.clone(),
             activity_tx: activity_tx.clone(),
             non_utf8_reported: HashSet::new(),
+            reserved_reported: HashSet::new(),
             dir_ids: HashMap::new(),
             file_ids: HashMap::new(),
         };
@@ -712,6 +737,20 @@ impl<S: SidecarApi + 'static> Engine<S> {
         let Some(root_node) = self.bootstrap().await? else {
             return Ok(()); // shutdown while offline
         };
+
+        // 1b. A guard pause is durable: the previous run auto-paused with
+        // tombstones still queued. Come back paused and wait for the same
+        // explicit user confirmation, instead of letting a fresh guard
+        // window silently drain the first batch (TG-24).
+        if self.db.meta(META_GUARD_PAUSED)? == Some("1".into()) {
+            self.state = EngineState::GuardPaused;
+            warn!("restored mass-deletion guard pause from previous run");
+            self.emit_activity(
+                ActivityKind::GuardPaused,
+                "",
+                Some("guard pause restored after restart; explicit resume required".into()),
+            );
+        }
 
         // 2. Resume the event stream from the persisted cursor (F6). Starting
         // the stream can hit the same transport failure; retry it too.
@@ -1023,6 +1062,36 @@ impl<S: SidecarApi + 'static> Engine<S> {
             Some(format!(
                 "non-UTF-8 filename (hex {hex}); left untouched, not uploaded or deleted"
             )),
+        );
+    }
+
+    /// Surface an item that uses an engine-reserved top-level name
+    /// (`.pds`, `.pds-vfs-backing`) once. These hold the state DB and the
+    /// placeholder backing cache, so the sync pipeline must never upload,
+    /// trash, or adopt them — but a user who created a same-named item
+    /// should not be left wondering why it does not sync.
+    fn report_reserved(&mut self, rel: &str) {
+        let reserved = if rel == STATE_DIR || rel.starts_with(&format!("{STATE_DIR}/")) {
+            if self.state_dir_is_engine {
+                return; // the engine's own state dir, not a user item
+            }
+            STATE_DIR
+        } else if rel == VFS_BACKING_DIR || rel.starts_with(&format!("{VFS_BACKING_DIR}/")) {
+            if self.backing_dir_is_engine {
+                return; // the live backing cache, not a user item
+            }
+            VFS_BACKING_DIR
+        } else {
+            return;
+        };
+        if !self.reserved_reported.insert(reserved.to_string()) {
+            return;
+        }
+        warn!(path = %reserved, "skipping reserved engine-internal path");
+        self.emit_activity(
+            ActivityKind::Skipped,
+            reserved,
+            Some("reserved engine-internal name; left untouched, not uploaded or deleted".into()),
         );
     }
 
@@ -1360,6 +1429,7 @@ impl<S: SidecarApi + 'static> Engine<S> {
                     RelCheck::Outside => continue,
                 };
                 if is_internal_path(&rel) {
+                    self.report_reserved(&rel);
                     continue;
                 }
                 if path.is_dir() {
@@ -1430,7 +1500,11 @@ impl<S: SidecarApi + 'static> Engine<S> {
                 }
                 RelCheck::Outside => continue,
             };
-            if rel.is_empty() || is_internal_path(&rel) {
+            if rel.is_empty() {
+                continue;
+            }
+            if is_internal_path(&rel) {
+                self.report_reserved(&rel);
                 continue;
             }
             if !seen.insert(rel.clone()) {
@@ -1787,6 +1861,7 @@ impl<S: SidecarApi + 'static> Engine<S> {
                 RelCheck::Outside => continue,
             };
             if is_internal_path(&child_rel) {
+                self.report_reserved(&child_rel);
                 continue;
             }
             if is_temp_file(&child_rel) || !seen.insert(child_rel.clone()) {
@@ -2580,6 +2655,7 @@ impl<S: SidecarApi + 'static> Engine<S> {
         if !approved {
             let synced_total = self.db.count_synced()?;
             if self.guard.record_and_check(Instant::now(), synced_total) {
+                self.db.set_meta(META_GUARD_PAUSED, "1")?;
                 self.state = EngineState::GuardPaused;
                 warn!(
                     deletes = self.guard.window_len(),
@@ -3904,6 +3980,7 @@ impl<S: SidecarApi + 'static> Engine<S> {
                             self.approved_tombstones
                                 .extend(pending.into_iter().map(|t| t.local_path));
                         }
+                        self.db.remove_meta(META_GUARD_PAUSED)?;
                         self.guard.reset();
                         self.state = EngineState::Running;
                         info!("resumed after mass-delete guard");
@@ -4549,10 +4626,6 @@ fn local_content_diverged(row: &NodeRow, abs: &Path) -> bool {
     }
 }
 
-/// Transient transfer temp files: ours are `*.pds-part`, and the sidecar
-/// downloads via `{path}.pdstmp-{transferId}` + rename — so its temps match
-/// neither a `.pds-part` suffix check nor our names exactly. Ignore both on
-/// create AND delete events (they are rename artifacts, never user content).
 /// Paths the sync pipeline must ignore: engine state, and the VFS backing
 /// dir whose contents mirror remote files (placeholder mode). Without the
 /// backing-dir filter, hydration/eviction/revision writes would re-enter
@@ -4564,9 +4637,25 @@ fn is_internal_path(rel: &str) -> bool {
         || rel.starts_with(&format!("{VFS_BACKING_DIR}/"))
 }
 
+/// Transient transfer temp files: ours end with `*.pds-part`, and the
+/// sidecar downloads via `{path}.pdstmp-{uuid}` + rename. Only those exact
+/// shapes are ignored — a *user* file whose name merely contains a marker
+/// (`report.pds-part.txt`, `foo.pdstmp-bar`) is ordinary content and must
+/// sync, never vanish silently (TG-15).
 fn is_temp_file(rel: &str) -> bool {
     let name = rel.rsplit('/').next().unwrap_or(rel);
-    name.contains(".pds-part") || name.contains(".pdstmp-")
+    if name.ends_with(".pds-part") {
+        return true;
+    }
+    // `crypto.randomUUID()`: 8-4-4-4-12 lowercase hex.
+    name.rsplit_once(".pdstmp-").is_some_and(|(base, id)| {
+        !base.is_empty()
+            && id.len() == 36
+            && id.bytes().enumerate().all(|(i, b)| match i {
+                8 | 13 | 18 | 23 => b == b'-',
+                _ => b.is_ascii_hexdigit(),
+            })
+    })
 }
 
 /// Short, unique temp sibling for a download target.
@@ -4798,12 +4887,56 @@ mod tests {
     }
 
     #[test]
-    fn temp_file_detection_covers_sidecar_temps() {
+    fn conflict_name_colliding_with_itself_gets_a_free_sibling() {
+        use chrono::TimeZone;
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open_memory().unwrap();
+        let at = chrono::Local
+            .with_ymd_and_hms(2026, 1, 1, 12, 0, 0)
+            .unwrap();
+        // The user already has a file named exactly like a conflict copy,
+        // and even a doubly-conflicted sibling. The next conflict for the
+        // same name+minute must advance past both instead of looping or
+        // overwriting either one (TG-15).
+        let stamped = conflict_name("report.txt", at);
+        std::fs::write(dir.path().join(&stamped), b"user copy").unwrap();
+        let taken2 = with_suffix_before_ext(&stamped, " (2)");
+        std::fs::write(dir.path().join(&taken2), b"user copy 2").unwrap();
+        // A conflicting name that itself looks like a conflict copy.
+        let nested = conflict_name(&stamped, at);
+        std::fs::write(dir.path().join(&nested), b"nested").unwrap();
+
+        let rel = local_free_conflict_rel_at(&db, dir.path(), "report.txt", at).unwrap();
+        assert_eq!(rel, with_suffix_before_ext(&stamped, " (3)"));
+        assert_eq!(
+            std::fs::read(dir.path().join(&stamped)).unwrap(),
+            b"user copy"
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join(&taken2)).unwrap(),
+            b"user copy 2"
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join(&nested)).unwrap(),
+            b"nested"
+        );
+    }
+
+    #[test]
+    fn temp_file_detection_matches_only_generated_shapes() {
         assert!(is_temp_file("docs/x.txt.pds-part"));
-        assert!(is_temp_file("x.txt.pds-part.pdstmp-abc123"));
-        assert!(is_temp_file("x.txt.pdstmp-abc123"));
+        assert!(is_temp_file(
+            "x.txt.pds-part.pdstmp-123e4567-e89b-12d3-a456-426614174000"
+        ));
+        assert!(is_temp_file(
+            "x.txt.pdstmp-123e4567-e89b-12d3-a456-426614174000"
+        ));
         assert!(!is_temp_file("x.txt"));
         assert!(!is_temp_file("docs/report.pds.txt"));
+        // User files that merely *contain* a marker are real content.
+        assert!(!is_temp_file("report.pds-part.txt"));
+        assert!(!is_temp_file("foo.pdstmp-bar"));
+        assert!(!is_temp_file("foo.pdstmp-abc123"));
     }
 
     #[test]
