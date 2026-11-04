@@ -452,7 +452,7 @@ async fn mass_delete_guard_auto_pauses_and_requires_resume() {
         "one explicit resume must approve and drain the whole pending batch"
     );
     assert_eq!(fx.mock.trashed_uids().len(), 25);
-    assert!(fx.db.tombstones().unwrap().is_empty());
+    wait_for(|| fx.db.tombstones().unwrap().is_empty()).await;
     fx.shutdown().await;
 }
 
@@ -491,7 +491,9 @@ async fn mass_delete_guard_re_trips_on_new_deletes_beyond_approved_set() {
     wait_for_deletes_accounted(&fx, 25).await;
     fx.handle.resume().await.unwrap();
     wait_for(|| fx.mock.trashed_uids().len() == 25).await;
-    assert!(fx.db.tombstones().unwrap().is_empty());
+    // Trashing and clearing the tombstone row are separate steps, so wait
+    // for the row to go before asserting (an immediate assert is racy).
+    wait_for(|| fx.db.tombstones().unwrap().is_empty()).await;
 
     // NEW deletes beyond the approved set must re-trip the guard (bug #2:
     // approval covers only the batch pending at resume time). 7 synced nodes
@@ -518,7 +520,7 @@ async fn mass_delete_guard_re_trips_on_new_deletes_beyond_approved_set() {
     // A second explicit resume approves the new batch and drains it.
     fx.handle.resume().await.unwrap();
     wait_for(|| fx.mock.trashed_uids().len() == 30).await;
-    assert!(fx.db.tombstones().unwrap().is_empty());
+    wait_for(|| fx.db.tombstones().unwrap().is_empty()).await;
     // And nothing more re-trips afterwards.
     tokio::time::sleep(Duration::from_millis(500)).await;
     assert_eq!(
@@ -1949,6 +1951,134 @@ async fn non_utf8_filename_is_skipped_and_reported_once() {
     fx.shutdown().await;
 }
 
+/// TG-29: symlinks, FIFOs, sockets, and device nodes inside the root are
+/// never followed, opened, hashed, or uploaded — the scanner classifies
+/// with `symlink_metadata` first, so a FIFO can never wedge the engine in
+/// `sha1_file`. Hardlinks (nlink > 1) are ordinary regular files and upload
+/// as independent nodes (documented policy). A normal file created after the
+/// specials still syncs, proving the engine stayed responsive.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn special_files_are_skipped_before_hashing_and_engine_stays_responsive() {
+    use std::os::unix::ffi::OsStrExt;
+
+    init_logs();
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("sync");
+    std::fs::create_dir_all(&root).unwrap();
+
+    let passwd_before = std::fs::read("/etc/passwd").expect("read /etc/passwd");
+    // Symlink inside the root (target exists later) and outside it.
+    std::os::unix::fs::symlink("hello.txt", root.join("link-inside")).unwrap();
+    std::os::unix::fs::symlink("/etc/passwd", root.join("link-outside")).unwrap();
+    // FIFO: `File::open` on it would block forever.
+    let fifo = std::ffi::CString::new(root.join("pipe").as_os_str().as_bytes()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o644) }, 0, "mkfifo");
+    // Unix socket node.
+    let _socket = std::os::unix::net::UnixListener::bind(root.join("sock")).unwrap();
+    // Hardlinked regular file: both names upload independently.
+    std::fs::write(root.join("hard.txt"), b"hard data").unwrap();
+    std::fs::hard_link(root.join("hard.txt"), root.join("hard-link.txt")).unwrap();
+
+    let (mut client, mock) = MockSidecar::new().connect();
+    let notifications = client.take_notifications();
+    let db_path = root.join(STATE_DIR).join("state.db");
+    let (engine, handle) = Engine::new(
+        Arc::new(client),
+        notifications,
+        EngineConfig {
+            root: root.clone(),
+            db_path,
+            retry_base: pds_core::RETRY_BASE_DEFAULT,
+            placeholders: false,
+            eviction_cap: None,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    // Subscribe BEFORE run() so the initial scan's warnings are captured.
+    let mut activity = handle.subscribe_activity();
+    let engine = tokio::spawn(engine.run());
+    assert!(
+        handle.wait_for_watcher(Duration::from_secs(10)).await,
+        "watcher never attached"
+    );
+
+    wait_for(|| root.join("hello.txt").is_file()).await;
+    wait_for(|| mock.uploaded_names().iter().any(|n| n == "hard.txt")).await;
+    wait_for(|| {
+        mock.uploaded_names()
+            .iter()
+            .any(|n| n == "hard-link.txt")
+    })
+    .await;
+
+    // Hardlinks upload as two independent nodes with the same bytes.
+    let hard_uid = mock.find_uid("root", "hard.txt").expect("hard.txt uid");
+    let link_uid = mock
+        .find_uid("root", "hard-link.txt")
+        .expect("hard-link.txt uid");
+    assert_ne!(hard_uid, link_uid);
+    assert_eq!(mock.file_content(&hard_uid).unwrap(), b"hard data");
+    assert_eq!(mock.file_content(&link_uid).unwrap(), b"hard data");
+
+    // Nothing special was uploaded (and the outside target was not read).
+    for name in ["link-inside", "link-outside", "pipe", "sock"] {
+        assert!(
+            !mock.child_names("root").iter().any(|n| n == name),
+            "{name} must never be uploaded: {:?}",
+            mock.child_names("root")
+        );
+    }
+    assert_eq!(
+        std::fs::read("/etc/passwd").unwrap(),
+        passwd_before,
+        "symlink target outside the root must stay untouched"
+    );
+
+    // One Skipped warning per special path.
+    let specials = ["link-inside", "link-outside", "pipe", "sock"];
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut warnings: Vec<String> = Vec::new();
+    while Instant::now() < deadline {
+        for item in drain_activity(&mut activity) {
+            if item.kind == ActivityKind::Skipped {
+                warnings.push(item.path);
+            }
+        }
+        if specials.iter().all(|p| warnings.iter().any(|w| w == p)) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    for path in specials {
+        assert_eq!(
+            warnings.iter().filter(|w| *w == path).count(),
+            1,
+            "{path} must warn exactly once, got {warnings:?}"
+        );
+    }
+
+    // Responsive: a normal file added afterwards still syncs.
+    std::fs::write(root.join("after.txt"), b"after specials").unwrap();
+    wait_for(|| mock.uploaded_names().iter().any(|n| n == "after.txt")).await;
+    assert_eq!(
+        handle.status().await.unwrap().state,
+        EngineState::Running
+    );
+
+    // No special path ever entered the DB as a file row.
+    for name in ["link-inside", "link-outside", "pipe", "sock"] {
+        assert!(
+            !mock.child_names("root").iter().any(|n| n == name),
+            "{name} appeared remotely"
+        );
+    }
+
+    handle.shutdown().await.unwrap();
+    let _ = engine.await;
+}
+
 /// TG-15: a user file whose *name contains* a transfer-temp marker is real
 /// content. Only the generated shapes (`*.pds-part` suffix, sidecar
 /// `*.pdstmp-<uuid>`) are ignored; these must upload instead of being
@@ -2081,7 +2211,6 @@ async fn reserved_internal_names_are_skipped_and_reported_once() {
 // Wave 1a — local path lifecycle: delete/re-create, folder rename/move,
 // folder delete, remote trash→restore, and event-ordering regressions.
 // ---------------------------------------------------------------------------
-
 /// Seed `n` remote filler files and wait until each is tracked and synced.
 /// Keeps a delete under the mass-deletion guard's 25% ratio limb in small
 /// fixtures (a single delete on a tiny tree would otherwise trip it).

@@ -24,7 +24,7 @@ use std::time::{Duration, Instant};
 
 use fuser::{Config, MountOption};
 use pds_core::{Engine, EngineConfig, STATE_DIR, store::VNode};
-use pds_sidecar_client::MockSidecar;
+use pds_sidecar_client::{MockHandle, MockSidecar};
 use pds_vfs_linux::PdsFs;
 use pds_vfs_linux::mount::{
     MountState, MountpointError, ensure_placeholder_mountpoint, mountpoint_state,
@@ -1208,4 +1208,532 @@ async fn stale_mount_after_crashed_session_is_detected_and_refused() {
 
     lazy_unmount(&root);
     wait_for_mount_state(&root, |s| matches!(s, MountState::Free), Duration::from_secs(10));
+}
+
+// ---------------------------------------------------------------------------
+// Wave 5a — FUSE POSIX semantics (TG-25, TG-26, TG-28, TG-29)
+// ---------------------------------------------------------------------------
+
+/// Engine + real-kernel mount with a few seeded remote files, shared by the
+/// Wave 5a tests. `None` means this host cannot run real FUSE.
+struct Mounted {
+    _dir: tempfile::TempDir,
+    mnt: std::path::PathBuf,
+    mock: MockHandle,
+    store: pds_core::Store,
+    handle: pds_core::EngineHandle,
+    engine: tokio::task::JoinHandle<()>,
+    session: Option<fuser::BackgroundSession>,
+}
+
+impl Mounted {
+    async fn shutdown(mut self) {
+        self.handle.shutdown().await.ok();
+        drop(self.session.take());
+        let _ = self.engine.await;
+    }
+}
+
+async fn mount_with(files: &[(&str, &[u8])]) -> Option<Mounted> {
+    if let Some(reason) = fuse_unavailable_reason() {
+        println!("skipping Wave 5a FUSE test: {reason}");
+        return None;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("sync");
+    std::fs::create_dir_all(&root).unwrap();
+    let mnt = dir.path().join("mnt");
+    std::fs::create_dir_all(&mnt).unwrap();
+
+    let (mut client, mock) = MockSidecar::new().connect();
+    for (name, content) in files {
+        mock.remote_create_file("root", name, content);
+    }
+    let notifications = client.take_notifications();
+
+    let (engine, handle) = Engine::new(
+        Arc::new(client),
+        notifications,
+        EngineConfig {
+            root: root.clone(),
+            db_path: root.join(STATE_DIR).join("state.db"),
+            retry_base: pds_core::RETRY_BASE_DEFAULT,
+            placeholders: true,
+            eviction_cap: None,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let store = handle.store().cloned().expect("placeholder store");
+    let engine = tokio::spawn(async move {
+        let _ = engine.run().await;
+    });
+
+    let fs = PdsFs::new(
+        store.clone(),
+        root.join(STATE_DIR),
+        root.join(".pds-vfs-backing"),
+    );
+    let mut cfg = Config::default();
+    cfg.mount_options = vec![
+        MountOption::FSName("pds-e2e-wave5".into()),
+        MountOption::Subtype("pds".into()),
+    ];
+    let mnt_for_thread = mnt.clone();
+    let session = tokio::task::spawn_blocking(move || {
+        fuser::spawn_mount(fs, &mnt_for_thread, &cfg).expect("FUSE mount")
+    })
+    .await
+    .unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !files
+        .iter()
+        .all(|(name, _)| store.snapshot().by_path.contains_key(*name))
+    {
+        assert!(
+            Instant::now() < deadline,
+            "seeded files never appeared in the snapshot: {:?}",
+            store.snapshot().by_path.keys().collect::<Vec<_>>()
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    Some(Mounted {
+        _dir: dir,
+        mnt,
+        mock,
+        store,
+        handle,
+        engine,
+        session: Some(session),
+    })
+}
+
+/// Poll until `cond` holds, failing the test (not hanging) on timeout.
+async fn wait_until(what: &str, cond: impl Fn() -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !cond() {
+        assert!(Instant::now() < deadline, "timed out waiting for {what}");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+async fn wait_for_remote(fx: &Mounted, name: &str, expect: &[u8]) {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let got = fx
+            .mock
+            .find_uid("root", name)
+            .and_then(|uid| fx.mock.file_content(&uid));
+        if got.as_deref() == Some(expect) {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "remote {name} never became {:?} (got {:?})",
+            String::from_utf8_lossy(expect),
+            got.as_deref().map(String::from_utf8_lossy),
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// The mass-deletion guard can pause on these tiny trees; resume only
+/// approves tombstones already received, so keep resuming until it lands.
+async fn wait_for_trash(fx: &Mounted, uid: &str) {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !fx.mock.trashed_uids().iter().any(|u| u == uid) {
+        assert!(
+            Instant::now() < deadline,
+            "uid {uid} never trashed: {:?}",
+            fx.mock.trashed_uids()
+        );
+        fx.handle.resume().await.ok();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+fn pattern(len: usize, seed: u8) -> Vec<u8> {
+    (0..len)
+        .map(|i| (i as u8).wrapping_mul(31).wrapping_add(seed))
+        .collect()
+}
+
+/// Map `path` read-only and compare every byte (direct libc, no dependency).
+fn assert_mmap_bytes(path: &std::path::Path, expect: &[u8]) {
+    let file = std::fs::File::open(path).expect("open for mmap");
+    let len = file.metadata().unwrap().len() as usize;
+    assert_eq!(len, expect.len(), "mmap length");
+    let ptr = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            len,
+            libc::PROT_READ,
+            libc::MAP_SHARED,
+            file.as_raw_fd(),
+            0,
+        )
+    };
+    assert_ne!(
+        ptr,
+        libc::MAP_FAILED,
+        "mmap failed: {}",
+        std::io::Error::last_os_error()
+    );
+    let got = unsafe { std::slice::from_raw_parts(ptr.cast::<u8>(), len) };
+    assert_eq!(got, expect, "mmap bytes differ");
+    assert_eq!(unsafe { libc::munmap(ptr, len) }, 0, "munmap");
+}
+
+/// TG-25: mmap reads a hydrated file, and mmap on an un-hydrated placeholder
+/// hydrates on the faulting read — correct bytes, no EIO, no zero-fill.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial_test::serial]
+async fn fuse_mmap_reads_hydrated_and_placeholder_files() {
+    let _watchdog = Watchdog::arm(180);
+    let hydrated = pattern(256 * 1024, 3);
+    let placeholder = pattern(96 * 1024, 11);
+    let Some(fx) = mount_with(&[
+        ("mmap.bin", hydrated.as_slice()),
+        ("mmap-ph.bin", placeholder.as_slice()),
+    ])
+    .await
+    else {
+        return;
+    };
+
+    // Ordinary read first: the file is hydrated before mmap.
+    assert_eq!(std::fs::read(fx.mnt.join("mmap.bin")).unwrap(), hydrated);
+    assert!(fx.store.snapshot().by_path["mmap.bin"].content_ready);
+    assert_mmap_bytes(&fx.mnt.join("mmap.bin"), &hydrated);
+
+    // Placeholder: never read before the mmap, so the page faults must
+    // trigger hydration and serve the real bytes.
+    assert!(
+        !fx.store.snapshot().by_path["mmap-ph.bin"].content_ready,
+        "mmap-ph.bin must still be a placeholder"
+    );
+    assert_mmap_bytes(&fx.mnt.join("mmap-ph.bin"), &placeholder);
+    wait_until("placeholder hydration", || {
+        fx.store.snapshot().by_path["mmap-ph.bin"].content_ready
+    })
+    .await;
+    let backing = fx.store.backing_path("mmap-ph.bin").expect("backing entry");
+    assert_eq!(std::fs::read(&backing).unwrap(), placeholder);
+
+    fx.shutdown().await;
+}
+
+/// TG-26.1: O_APPEND writes concatenate and release uploads exactly once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial_test::serial]
+async fn fuse_append_writes_concatenate_with_one_upload() {
+    let _watchdog = Watchdog::arm(180);
+    let Some(fx) = mount_with(&[("append.txt", b"base")]).await else {
+        return;
+    };
+
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(fx.mnt.join("append.txt"))
+        .expect("append open");
+    file.write_all(b"-one").unwrap();
+    file.write_all(b"-two").unwrap();
+    file.flush().unwrap();
+    assert_eq!(
+        std::fs::read(fx.mnt.join("append.txt")).unwrap(),
+        b"base-one-two"
+    );
+    drop(file);
+
+    wait_for_remote(&fx, "append.txt", b"base-one-two").await;
+    assert_eq!(
+        fx.mock.upload_attempts("append.txt"),
+        1,
+        "O_APPEND write sequence must upload once"
+    );
+    fx.shutdown().await;
+}
+
+/// TG-26.2: pwrite-style partial writes at non-zero offsets preserve the
+/// bytes and the tail, with one upload.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial_test::serial]
+async fn fuse_partial_writes_at_offsets_preserve_tail() {
+    let _watchdog = Watchdog::arm(180);
+    let Some(fx) = mount_with(&[("partial.txt", b"0123456789")]).await else {
+        return;
+    };
+
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(fx.mnt.join("partial.txt"))
+        .expect("rw open");
+    file.seek(SeekFrom::Start(2)).unwrap();
+    file.write_all(b"AB").unwrap();
+    file.seek(SeekFrom::Start(7)).unwrap();
+    file.write_all(b"XY").unwrap();
+    drop(file);
+
+    assert_eq!(
+        std::fs::read(fx.mnt.join("partial.txt")).unwrap(),
+        b"01AB456XY9"
+    );
+    wait_for_remote(&fx, "partial.txt", b"01AB456XY9").await;
+    assert_eq!(fx.mock.upload_attempts("partial.txt"), 1);
+    fx.shutdown().await;
+}
+
+/// TG-26.3: rename() over an open destination — the fd keeps the old
+/// content (POSIX), the path serves the new content on the destination's
+/// node identity, only the merged source node is trashed, and the source
+/// is moved (not re-uploaded).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial_test::serial]
+async fn fuse_rename_over_open_destination_keeps_fd_and_path_consistent() {
+    let _watchdog = Watchdog::arm(180);
+    let Some(fx) = mount_with(&[
+        ("src.txt", b"new content"),
+        ("dst.txt", b"old content"),
+    ])
+    .await
+    else {
+        return;
+    };
+
+    let dst_uid = fx.mock.find_uid("root", "dst.txt").expect("dst uid");
+    let src_uid = fx.mock.find_uid("root", "src.txt").expect("src uid");
+    let mut open_dst = std::fs::File::open(fx.mnt.join("dst.txt")).expect("open dst");
+
+    std::fs::rename(fx.mnt.join("src.txt"), fx.mnt.join("dst.txt"))
+        .expect("rename over open destination");
+
+    // The fd still names the old inode, even after its path was replaced.
+    let mut old_bytes = Vec::new();
+    open_dst.read_to_end(&mut old_bytes).unwrap();
+    assert_eq!(
+        old_bytes, b"old content",
+        "an open fd must keep reading the replaced file (POSIX)"
+    );
+
+    // The path converges on the moved source content. The engine keeps the
+    // destination node's identity (its revision history) and trashes the
+    // now-redundant source node — exactly one trash, never both.
+    wait_until("dst path to serve new content", || {
+        std::fs::read(fx.mnt.join("dst.txt")).ok().as_deref() == Some(b"new content")
+    })
+    .await;
+    wait_for_remote(&fx, "dst.txt", b"new content").await;
+    wait_until("source node to be trashed", || {
+        fx.mock.trashed_uids().iter().any(|u| u == &src_uid)
+    })
+    .await;
+    assert_eq!(
+        fx.mock.file_content(&dst_uid).unwrap(),
+        b"new content",
+        "the destination node receives the moved content"
+    );
+    assert!(
+        !fx.mock.trashed_uids().iter().any(|u| u == &dst_uid),
+        "the surviving destination node must not be trashed: {:?}",
+        fx.mock.trashed_uids()
+    );
+    assert_eq!(
+        fx.mock.trashed_uids().len(),
+        1,
+        "exactly one node (the merged source) is trashed: {:?}",
+        fx.mock.trashed_uids()
+    );
+    assert_eq!(
+        fx.mock.upload_attempts("src.txt"),
+        0,
+        "rename must move, never re-upload the source"
+    );
+    assert_eq!(
+        fx.mock.upload_attempts("dst.txt"),
+        1,
+        "the merged content uploads once as a destination revision"
+    );
+
+    drop(open_dst);
+    fx.shutdown().await;
+}
+
+/// TG-26.4: unlink() while open — the fd stays readable, the remote node is
+/// trashed, and recreating the path creates a new node that the old close
+/// cannot clobber.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial_test::serial]
+async fn fuse_unlink_while_open_keeps_fd_and_recreate_is_a_new_node() {
+    let _watchdog = Watchdog::arm(180);
+    let Some(fx) = mount_with(&[("unlink.txt", b"keep me")]).await else {
+        return;
+    };
+
+    let old_uid = fx
+        .mock
+        .find_uid("root", "unlink.txt")
+        .expect("unlink uid");
+    let mut old_fd = std::fs::File::open(fx.mnt.join("unlink.txt")).expect("open unlink.txt");
+
+    std::fs::remove_file(fx.mnt.join("unlink.txt")).expect("unlink through the mount");
+    let mut bytes = Vec::new();
+    old_fd.read_to_end(&mut bytes).unwrap();
+    assert_eq!(
+        bytes, b"keep me",
+        "an open fd stays readable after unlink (POSIX)"
+    );
+
+    wait_for_trash(&fx, &old_uid).await;
+    // Wait for the tombstone to republish before recreating the path, then
+    // outlast the kernel's negative-dentry TTL.
+    wait_until("unlink path to disappear", || {
+        !fx.mnt.join("unlink.txt").exists()
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+
+    std::fs::write(fx.mnt.join("unlink.txt"), b"new file").expect("recreate unlink.txt");
+    wait_for_remote(&fx, "unlink.txt", b"new file").await;
+    let new_uid = fx
+        .mock
+        .find_uid("root", "unlink.txt")
+        .expect("new unlink uid");
+    assert_ne!(new_uid, old_uid, "recreate must be a new remote node");
+
+    // Closing the old fd must not upload its stale bytes over the new node.
+    drop(old_fd);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(
+        fx.mock.file_content(&new_uid).unwrap(),
+        b"new file",
+        "old handle close clobbered the recreated file"
+    );
+    assert_eq!(fx.mock.upload_attempts("unlink.txt"), 1);
+    fx.shutdown().await;
+}
+
+/// TG-26.5: truncate() larger (sparse grow) reads as zeros, a later write
+/// lands, the upload reflects the new size, and nothing is re-downloaded.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial_test::serial]
+async fn fuse_truncate_grow_is_sparse_and_uploads_new_size() {
+    let _watchdog = Watchdog::arm(180);
+    let Some(fx) = mount_with(&[("grow.txt", b"start")]).await else {
+        return;
+    };
+    let uid = fx.mock.find_uid("root", "grow.txt").expect("grow uid");
+
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .open(fx.mnt.join("grow.txt"))
+        .expect("write open grow.txt");
+    wait_until("grow hydration", || {
+        fx.store.snapshot().by_path["grow.txt"].content_ready
+    })
+    .await;
+    let downloads_before = fx
+        .mock
+        .downloaded_uids()
+        .iter()
+        .filter(|u| *u == &uid)
+        .count();
+
+    const SIZE: u64 = 64 * 1024;
+    file.set_len(SIZE).expect("truncate grow");
+    file.seek(SeekFrom::Start(SIZE - 3)).unwrap();
+    file.write_all(b"END").unwrap();
+    drop(file);
+
+    let content = std::fs::read(fx.mnt.join("grow.txt")).unwrap();
+    assert_eq!(content.len() as u64, SIZE);
+    assert_eq!(&content[..5], b"start");
+    assert!(
+        content[5..SIZE as usize - 3].iter().all(|b| *b == 0),
+        "the grown range must read as zeros"
+    );
+    assert_eq!(&content[SIZE as usize - 3..], b"END");
+
+    wait_for_remote(&fx, "grow.txt", &content).await;
+    assert_eq!(
+        fx.mock.upload_attempts("grow.txt"),
+        1,
+        "sparse grow + write must upload once"
+    );
+    let downloads_after = fx
+        .mock
+        .downloaded_uids()
+        .iter()
+        .filter(|u| *u == &uid)
+        .count();
+    assert_eq!(
+        downloads_after, downloads_before,
+        "growing a hydrated file must not re-download zeros"
+    );
+    fx.shutdown().await;
+}
+
+/// TG-28: statvfs() on the mount reports a non-zero filesystem, with a
+/// finite cap (here Unlimited → the real backing filesystem).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial_test::serial]
+async fn fuse_statfs_reports_real_nonzero_capacity() {
+    let _watchdog = Watchdog::arm(120);
+    let Some(fx) = mount_with(&[("hello.bin", b"x")]).await else {
+        return;
+    };
+
+    let c_path = std::ffi::CString::new(fx.mnt.as_os_str().as_encoded_bytes())
+        .expect("mount path has no NUL");
+    let mut stats = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+    let rc = unsafe { libc::statvfs(c_path.as_ptr(), stats.as_mut_ptr()) };
+    assert_eq!(
+        rc,
+        0,
+        "statvfs on the mount failed: {}",
+        std::io::Error::last_os_error()
+    );
+    let stats = unsafe { stats.assume_init() };
+    assert!(stats.f_blocks > 0, "total blocks must not be zero");
+    assert!(
+        stats.f_bavail > 0,
+        "available blocks must not be zero (df would show a 0-byte fs)"
+    );
+    assert!(stats.f_bsize > 0, "block size must not be zero");
+    println!(
+        "statvfs: {} blocks × {} B = {} GiB, {} available",
+        stats.f_blocks,
+        stats.f_bsize,
+        (stats.f_blocks as u128 * stats.f_bsize as u128) / (1u128 << 30),
+        stats.f_bavail
+    );
+
+    fx.shutdown().await;
+}
+
+/// TG-29.4: creating a symlink through the mount fails cleanly (EPERM),
+/// never hangs, and the engine keeps serving writes afterwards.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial_test::serial]
+async fn fuse_symlink_create_is_refused_cleanly() {
+    let _watchdog = Watchdog::arm(120);
+    let Some(fx) = mount_with(&[("target.txt", b"target")]).await else {
+        return;
+    };
+
+    let err = std::os::unix::fs::symlink("target.txt", fx.mnt.join("link"))
+        .expect_err("symlink creation through the mount must fail");
+    let code = err.raw_os_error().unwrap_or(0);
+    assert!(
+        code == libc::EPERM || code == libc::ENOSYS,
+        "expected EPERM/ENOSYS, got {err:?} (errno {code})"
+    );
+    assert!(!fx.mnt.join("link").exists(), "no symlink may be created");
+
+    // Still responsive.
+    std::fs::write(fx.mnt.join("normal.txt"), b"still alive").unwrap();
+    wait_for_remote(&fx, "normal.txt", b"still alive").await;
+    fx.shutdown().await;
 }
