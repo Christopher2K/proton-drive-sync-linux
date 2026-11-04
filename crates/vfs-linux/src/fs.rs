@@ -17,6 +17,7 @@ use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
+use std::os::unix::fs::FileExt as _;
 use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::Duration;
@@ -63,6 +64,15 @@ pub struct PdsFs {
     overlay: Mutex<Overlay>,
     /// Open write handles: fh → file + dirty flag.
     handles: Mutex<HashMap<u64, WriteHandle>>,
+    /// Open read handles: fh → backing file. Holding the file (not just
+    /// the path) keeps the descriptor's bytes alive across rename(2) and
+    /// unlink(2), as POSIX requires.
+    read_handles: Mutex<HashMap<u64, ReadHandle>>,
+    /// Local size of revision files whose upload has not republished the
+    /// snapshot yet. Without it, getattr would report the old remote size
+    /// right after close/truncate and the kernel would clip reads at the
+    /// stale EOF even though the backing file already grew.
+    pending_sizes: Mutex<HashMap<String, u64>>,
     next_fh: std::sync::atomic::AtomicU64,
     uid: u32,
     gid: u32,
@@ -115,6 +125,21 @@ struct WriteHandle {
     file: File,
     dirty: bool,
     overlay: bool,
+    /// The path was unlinked (or replaced by a rename) while this handle
+    /// was open: the descriptor still points at the unlinked inode, so its
+    /// writes must be discarded rather than uploaded to a recycled path.
+    discarded: bool,
+}
+
+/// Per-open state of a read handle (fh ≥ 1). The open file is retained so
+/// the descriptor keeps serving the inode it was opened on even after the
+/// path is renamed over or unlinked.
+struct ReadHandle {
+    rel: String,
+    file: File,
+    /// Whether this handle registered with the store's open-handle guard
+    /// (snapshot-backed files only; overlay files are not evictable).
+    tracked: bool,
 }
 
 impl PdsFs {
@@ -128,6 +153,8 @@ impl PdsFs {
             backing_dir,
             overlay: Mutex::new(Overlay::default()),
             handles: Mutex::new(HashMap::new()),
+            read_handles: Mutex::new(HashMap::new()),
+            pending_sizes: Mutex::new(HashMap::new()),
             next_fh: std::sync::atomic::AtomicU64::new(1),
             uid,
             gid,
@@ -272,6 +299,20 @@ impl PdsFs {
             .cloned()
     }
 
+    /// Live size of a file with an open write handle (max across handles).
+    /// Revision writes otherwise keep reporting the snapshot size until the
+    /// upload republishes it — which would make `O_APPEND` compute its next
+    /// offset from a stale length and let readers stop at the old EOF.
+    fn open_write_size(&self, rel: &str) -> Option<u64> {
+        self.handles
+            .lock()
+            .expect("handles mutex")
+            .values()
+            .filter(|h| h.rel == rel)
+            .filter_map(|h| h.file.metadata().ok().map(|m| m.len()))
+            .max()
+    }
+
     /// Inode → path, consulting the write overlay first (overlay inos are
     /// not in the tree), then the snapshot tree. `""` is the root.
     fn rel_of_any(&self, ino: INodeNo) -> Option<String> {
@@ -317,9 +358,36 @@ impl PdsFs {
         if rel.is_empty() {
             return Some((true, 0, 0, true));
         }
-        self.tree
-            .node(rel)
-            .map(|n| (n.is_dir, n.size, n.mtime, n.content_ready))
+        let node = self.tree.node(rel)?;
+        let size = self.pending_size(rel).unwrap_or(node.size);
+        Some((node.is_dir, size, node.mtime, node.content_ready))
+    }
+
+    /// Size of a locally modified revision file that the snapshot does not
+    /// reflect yet. Entries clear themselves once the upload publishes the
+    /// matching size (or the path disappears from the snapshot).
+    fn pending_size(&self, rel: &str) -> Option<u64> {
+        let mut pending = self.pending_sizes.lock().expect("pending sizes mutex");
+        let size = *pending.get(rel)?;
+        if self.tree.node(rel).is_none_or(|n| n.size == size) {
+            pending.remove(rel);
+            return None;
+        }
+        Some(size)
+    }
+
+    fn set_pending_size(&self, rel: &str, size: u64) {
+        self.pending_sizes
+            .lock()
+            .expect("pending sizes mutex")
+            .insert(rel.to_string(), size);
+    }
+
+    fn clear_pending_size(&self, rel: &str) {
+        self.pending_sizes
+            .lock()
+            .expect("pending sizes mutex")
+            .remove(rel);
     }
 
     /// A finished write (release with dirty data, or fsync): fix up the
@@ -329,7 +397,7 @@ impl PdsFs {
         if rel.is_empty() {
             return;
         }
-        if let Some(entry) = self
+        let overlay = if let Some(entry) = self
             .overlay
             .lock()
             .expect("overlay mutex")
@@ -338,8 +406,57 @@ impl PdsFs {
         {
             entry.size = size;
             entry.mtime = self.now_secs();
+            true
+        } else {
+            false
+        };
+        if !overlay {
+            // Keep getattr/read at the real local size until the upload
+            // republishes the snapshot (truncate-grow and append both
+            // outrun it).
+            self.set_pending_size(rel, size);
         }
         self.store.record_write(rel);
+    }
+
+    /// Re-key open handles after a rename/move: an fd stays valid across
+    /// `rename(2)` and its writes belong to the new path on release.
+    fn rekey_handles(&self, old_rel: &str, new_rel: &str, is_dir: bool) {
+        let rekey = |rel: &str| -> Option<String> {
+            if rel == old_rel {
+                Some(new_rel.to_string())
+            } else if is_dir && rel.starts_with(&format!("{old_rel}/")) {
+                Some(format!("{new_rel}/{}", &rel[old_rel.len() + 1..]))
+            } else {
+                None
+            }
+        };
+        for handle in self.handles.lock().expect("handles mutex").values_mut() {
+            if let Some(rel) = rekey(&handle.rel) {
+                handle.rel = rel;
+            }
+        }
+        for handle in self
+            .read_handles
+            .lock()
+            .expect("read handles mutex")
+            .values_mut()
+        {
+            if let Some(rel) = rekey(&handle.rel) {
+                handle.rel = rel;
+            }
+        }
+    }
+
+    /// A path was unlinked/replaced while handles were open: the kernel
+    /// keeps the old inode readable through those fds, but writes to it
+    /// must never be uploaded to the path's new occupant.
+    fn discard_write_handles(&self, rel: &str) {
+        for handle in self.handles.lock().expect("handles mutex").values_mut() {
+            if handle.rel == rel {
+                handle.discarded = true;
+            }
+        }
     }
 }
 
@@ -348,6 +465,18 @@ fn unix_time(secs: i64) -> std::time::SystemTime {
         std::time::UNIX_EPOCH + Duration::from_secs(secs as u64)
     } else {
         std::time::UNIX_EPOCH
+    }
+}
+
+/// `statvfs(2)` for a path, `None` if it does not exist or fails.
+fn statvfs(path: &std::path::Path) -> Option<libc::statvfs> {
+    use std::os::unix::ffi::OsStrExt as _;
+    let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+    let mut out = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+    if unsafe { libc::statvfs(c_path.as_ptr(), out.as_mut_ptr()) } == 0 {
+        Some(unsafe { out.assume_init() })
+    } else {
+        None
     }
 }
 
@@ -410,6 +539,11 @@ impl fuser::Filesystem for PdsFs {
         let Some((is_dir, size, mtime, _ready)) = self.node_meta(&rel) else {
             return reply.error(Errno::ENOENT);
         };
+        let size = if is_dir {
+            size
+        } else {
+            self.open_write_size(&rel).unwrap_or(size)
+        };
         let ino = if rel == STATE_PROXY {
             // The proxy stands for `state_dir` itself (same target as in
             // `getattr`), not for a child of it. A missing state dir must
@@ -447,6 +581,11 @@ impl fuser::Filesystem for PdsFs {
         }
         match self.node_meta(&rel) {
             Some((is_dir, size, mtime, _ready)) => {
+                let size = if is_dir {
+                    size
+                } else {
+                    self.open_write_size(&rel).unwrap_or(size)
+                };
                 reply.attr(&TTL, &self.attr_for(ino, is_dir, size, mtime))
             }
             None => reply.error(Errno::ENOENT),
@@ -596,6 +735,7 @@ impl fuser::Filesystem for PdsFs {
                     // would serve the stale uploaded head forever).
                     dirty: truncate,
                     overlay: true,
+                    discarded: false,
                 },
             );
             return reply.opened(FileHandle(fh), FopenFlags::empty());
@@ -623,6 +763,7 @@ impl fuser::Filesystem for PdsFs {
                     file,
                     dirty: false,
                     overlay: false,
+                    discarded: false,
                 },
             );
             self.store.record_access(&rel);
@@ -630,19 +771,36 @@ impl fuser::Filesystem for PdsFs {
             self.store.add_open_handle(&rel);
             return reply.opened(FileHandle(fh), FopenFlags::empty());
         }
-        // Read open (or overlay file, which needs no hydration).
-        if !content_ready && self.overlay_entry(&rel).is_none() {
-            self.store.begin_hydrate(&rel);
-        } else {
-            // LRU touch (M3.2 eviction). Open-for-read of hydrated content.
-            self.store.record_access(&rel);
-        }
+        // Read open: hydrate (bounded) and hold the backing file so this
+        // descriptor keeps its bytes across rename(2)/unlink(2), exactly
+        // like a POSIX fd on a local filesystem. A path-based read would
+        // follow a recycled path instead.
+        let Some(file) = self.wait_for_backing(&rel) else {
+            warn!(path = %rel, "open: backing unavailable for read handle");
+            return reply.error(Errno::EIO);
+        };
+        let fh = self
+            .next_fh
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let tracked = self.overlay_entry(&rel).is_none();
+        self.read_handles
+            .lock()
+            .expect("read handles mutex")
+            .insert(
+                fh,
+                ReadHandle {
+                    rel: rel.clone(),
+                    file,
+                    tracked,
+                },
+            );
+        self.store.record_access(&rel);
         // Open files are never evicted; overlay (write-created) files are
         // not tracked (they are never in the hydrated map).
-        if self.overlay_entry(&rel).is_none() {
+        if tracked {
             self.store.add_open_handle(&rel);
         }
-        reply.opened(FileHandle(0), FopenFlags::empty());
+        reply.opened(FileHandle(fh), FopenFlags::empty());
     }
 
 
@@ -650,41 +808,63 @@ impl fuser::Filesystem for PdsFs {
         &self,
         _req: &Request,
         ino: INodeNo,
-        _fh: FileHandle,
+        fh: FileHandle,
         offset: u64,
         size: u32,
         _flags: OpenFlags,
         _lock_owner: Option<fuser::LockOwner>,
         reply: ReplyData,
     ) {
-        let Some(rel) = self.rel_of_any(ino) else {
-            warn!(ino = ino.0, "read: unknown inode");
-            return reply.error(Errno::ENOENT);
+        // A descriptor's open file is authoritative: after rename(2) or
+        // unlink(2) the inode lives on under this fd even though the path
+        // may now name different bytes (POSIX). Fall back to the path only
+        // for legacy fh 0 requests.
+        let held = self
+            .handles
+            .lock()
+            .expect("handles mutex")
+            .get(&fh.0)
+            .and_then(|h| h.file.try_clone().ok().map(|f| (h.rel.clone(), f)))
+            .or_else(|| {
+                self.read_handles
+                    .lock()
+                    .expect("read handles mutex")
+                    .get(&fh.0)
+                    .and_then(|h| h.file.try_clone().ok().map(|f| (h.rel.clone(), f)))
+            });
+        let (rel, node_size, file) = match held {
+            Some((rel, file)) => {
+                let len = file.metadata().map(|m| m.len()).unwrap_or(0);
+                (rel, len, file)
+            }
+            None => {
+                let Some(rel) = self.rel_of_any(ino) else {
+                    warn!(ino = ino.0, "read: unknown inode");
+                    return reply.error(Errno::ENOENT);
+                };
+                let Some((is_dir, node_size, _mtime, _ready)) = self.node_meta(&rel) else {
+                    warn!(ino = ino.0, path = %rel, "read: path vanished from the served tree");
+                    return reply.error(Errno::ENOENT);
+                };
+                if is_dir {
+                    return reply.error(Errno::EISDIR);
+                }
+                let Some(file) = self.wait_for_backing(&rel) else {
+                    warn!(path = %rel, offset, "read: backing unavailable (hydration failed)");
+                    return reply.error(Errno::EIO);
+                };
+                (rel, node_size, file)
+            }
         };
         // LRU touch on every read pass (cheap; open() covers the cold case).
         if self.overlay_entry(&rel).is_none() {
             self.store.record_access(&rel);
         }
-        let Some((is_dir, node_size, _mtime, _ready)) = self.node_meta(&rel) else {
-            warn!(ino = ino.0, path = %rel, "read: path vanished from the served tree");
-            return reply.error(Errno::ENOENT);
-        };
-        if is_dir {
-            return reply.error(Errno::EISDIR);
-        }
-        let Some(mut file) = self.wait_for_backing(&rel) else {
-            warn!(path = %rel, offset, "read: backing unavailable (hydration failed)");
-            return reply.error(Errno::EIO);
-        };
         if offset >= node_size {
             return reply.data(&[]);
         }
-        if file.seek(SeekFrom::Start(offset)).is_err() {
-            warn!(path = %rel, offset, "read: backing seek failed");
-            return reply.error(Errno::EIO);
-        }
         let mut buf = vec![0u8; size as usize];
-        match file.read(&mut buf) {
+        match file.read_at(&mut buf, offset) {
             Ok(n) => reply.data(&buf[..n]),
             Err(e) => {
                 warn!(error = %e, path = %rel, offset, "read: backing read failed");
@@ -902,22 +1082,31 @@ impl fuser::Filesystem for PdsFs {
             return reply.ok();
         }
         let handle = self.handles.lock().expect("handles mutex").remove(&fh.0);
-        let Some(h) = handle else {
+        if let Some(h) = handle {
+            // The handle knows its path authoritatively (ino may already
+            // have been recycled by an unlink during the handle's lifetime).
+            let rel = h.rel.clone();
+            let overlay = h.overlay;
+            if h.dirty && !h.discarded {
+                let size = h.file.metadata().map(|m| m.len()).unwrap_or(0);
+                h.file.sync_all().ok();
+                drop(h);
+                self.finalize_write(&rel, size);
+            }
+            if !overlay {
+                // Revision handles are open-tracked; drop the protection.
+                self.store.remove_open_handle(&rel);
+            }
             return reply.ok();
-        };
-        // The handle knows its path authoritatively (ino may already have
-        // been recycled by an unlink during the handle's lifetime).
-        let rel = h.rel.clone();
-        let overlay = h.overlay;
-        if h.dirty {
-            let size = h.file.metadata().map(|m| m.len()).unwrap_or(0);
-            h.file.sync_all().ok();
-            drop(h);
-            self.finalize_write(&rel, size);
         }
-        if !overlay {
-            // Revision handles are open-tracked; drop the protection.
-            self.store.remove_open_handle(&rel);
+        if let Some(h) = self
+            .read_handles
+            .lock()
+            .expect("read handles mutex")
+            .remove(&fh.0)
+            && h.tracked
+        {
+            self.store.remove_open_handle(&h.rel);
         }
         reply.ok();
     }
@@ -935,7 +1124,13 @@ impl fuser::Filesystem for PdsFs {
             .lock()
             .expect("handles mutex")
             .get(&fh.0)
-            .map(|h| (h.dirty, h.rel.clone(), h.file.metadata().map(|m| m.len()).unwrap_or(0)));
+            .map(|h| {
+                (
+                    h.dirty && !h.discarded,
+                    h.rel.clone(),
+                    h.file.metadata().map(|m| m.len()).unwrap_or(0),
+                )
+            });
         if let Some((dirty, rel, size)) = upload {
             if let Some(handle) = self.handles.lock().expect("handles mutex").get(&fh.0) {
                 handle.file.sync_all().ok();
@@ -951,9 +1146,44 @@ impl fuser::Filesystem for PdsFs {
     }
 
     fn statfs(&self, _req: &Request, _ino: INodeNo, reply: ReplyStatfs) {
-        // Placeholder sizes make free-space math meaningless; report an
-        // effectively unlimited filesystem so tools don't refuse work.
-        reply.statfs(0, 0, 0, 0, 0, 512, 255, 4096);
+        // Report the backing filesystem's real capacity: placeholder sizes
+        // are remote sizes, not local usage, so the cache directory is the
+        // honest answer for `df` and for installers/copy tools that refuse
+        // a 0-byte filesystem. Never answer zeros.
+        let stats = self
+            .backing_dir
+            .ancestors()
+            .find_map(statvfs)
+            .or_else(|| self.state_dir.ancestors().find_map(statvfs));
+        if let Some(v) = stats {
+            let frsize = v.f_frsize.max(1);
+            let bsize = v.f_bsize.max(1);
+            reply.statfs(
+                v.f_blocks.max(1),
+                v.f_bfree,
+                v.f_bavail.max(1),
+                v.f_files.max(1),
+                v.f_ffree,
+                bsize as u32,
+                v.f_namemax.max(255) as u32,
+                frsize as u32,
+            );
+            return;
+        }
+        // No statvfs answer (path on a detached mount): a sane non-zero
+        // synthetic filesystem beats a zero-byte one.
+        const BLOCK: u32 = 4096;
+        const BLOCKS: u64 = (1u64 << 40) / BLOCK as u64;
+        reply.statfs(
+            BLOCKS,
+            BLOCKS,
+            BLOCKS,
+            1_000_000,
+            1_000_000,
+            BLOCK,
+            255,
+            BLOCK,
+        );
     }
 
     fn create(
@@ -1034,6 +1264,7 @@ impl fuser::Filesystem for PdsFs {
                 file,
                 dirty: false,
                 overlay: true,
+                discarded: false,
             },
         );
         let fopen = FopenFlags::empty();
@@ -1180,6 +1411,11 @@ impl fuser::Filesystem for PdsFs {
                 return reply.error(Errno::ENOTEMPTY);
             }
             replaced = true;
+            // Fds open on the replaced destination keep the old inode
+            // readable, but their writes must not land on the incoming
+            // node's path.
+            self.discard_write_handles(&new_rel);
+            self.clear_pending_size(&new_rel);
             self.overlay.lock().expect("overlay mutex").remove(&new_rel);
             let abs = to_abs(&self.backing_dir, &new_rel);
             if dst_is_dir {
@@ -1259,6 +1495,15 @@ impl fuser::Filesystem for PdsFs {
         //    moveNodes remotely, re-registers backing paths). An
         //    overwrite-rename queues the destination delete and the rename
         //    atomically so the engine always sees the pair together.
+        self.rekey_handles(&old_rel, &new_rel, src_is_dir);
+        let moved_size = self
+            .pending_sizes
+            .lock()
+            .expect("pending sizes mutex")
+            .remove(&old_rel);
+        if let Some(size) = moved_size {
+            self.set_pending_size(&new_rel, size);
+        }
         if replaced {
             self.store.record_overwrite(&new_rel, &old_rel, &new_rel);
         } else {
@@ -1286,6 +1531,10 @@ impl fuser::Filesystem for PdsFs {
         }
         // Drop local state; the engine mirrors the delete remotely (harmless
         // no-op for unknown paths — handle_local_delete ignores them).
+        // Open fds keep reading the unlinked inode (read handles hold it);
+        // their writes are discarded so a later recreate is never clobbered.
+        self.discard_write_handles(&rel);
+        self.clear_pending_size(&rel);
         self.overlay.lock().expect("overlay mutex").remove(&rel);
         std::fs::remove_file(to_abs(&self.backing_dir, &rel)).ok();
         self.store.forget(&rel);
@@ -1381,6 +1630,9 @@ impl fuser::Filesystem for PdsFs {
             } else {
                 warn!(path = %rel, "truncate: backing file unopenable");
                 return reply.error(Errno::EIO);
+            }
+            if !overlay {
+                self.set_pending_size(&rel, new_size);
             }
             cur_size = new_size;
             if let Some(fh) = fh

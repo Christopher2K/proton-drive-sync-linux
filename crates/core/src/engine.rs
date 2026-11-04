@@ -455,6 +455,10 @@ pub struct Engine<S: SidecarApi> {
     /// activity feed — the warning is emitted once per path, not once per
     /// watcher batch.
     non_utf8_reported: HashSet<Vec<u8>>,
+    /// Special files (symlinks, FIFOs, sockets, devices) already surfaced
+    /// in the activity feed — never followed, opened, hashed, or uploaded;
+    /// warned once per path.
+    special_reported: HashSet<String>,
     /// `(device, inode)` of every tracked local directory, keyed by relative
     /// path. `notify`'s debounced API only reports paths, so a local folder
     /// rename arrives as "old path gone + new path appeared". The inode is
@@ -549,6 +553,7 @@ impl<S: SidecarApi + 'static> Engine<S> {
             watcher_ready: watcher_ready.clone(),
             activity_tx: activity_tx.clone(),
             non_utf8_reported: HashSet::new(),
+            special_reported: HashSet::new(),
             dir_ids: HashMap::new(),
         };
         Ok((
@@ -876,6 +881,23 @@ impl<S: SidecarApi + 'static> Engine<S> {
         );
     }
 
+    /// Surface a special file (symlink, FIFO, socket, device node) and
+    /// leave it untouched. These are never followed, opened, hashed, or
+    /// uploaded: opening a FIFO for hashing would block the engine forever,
+    /// and following a symlink could read outside the sync root. Emitted
+    /// once per path — watcher batches repeat the same entry otherwise.
+    fn report_special(&mut self, rel: &str, kind: &str) {
+        if !self.special_reported.insert(rel.to_string()) {
+            return;
+        }
+        warn!(path = %rel, kind, "skipping special file");
+        self.emit_activity(
+            ActivityKind::Skipped,
+            rel,
+            Some(format!("{kind}; not followed, not uploaded or deleted")),
+        );
+    }
+
     async fn main_loop(&mut self, fs_rx: &mut mpsc::Receiver<Vec<DebouncedEvent>>) -> Result<()> {
         loop {
             if self.shutting_down {
@@ -1171,10 +1193,15 @@ impl<S: SidecarApi + 'static> Engine<S> {
                 if is_internal_path(&rel) {
                     continue;
                 }
-                if path.is_dir() {
-                    dirs.push((rel, path));
-                } else if path.is_file() && self.db.node_by_path(&rel)?.is_none() {
-                    out.push(rel);
+                match classify_local_entry(&path) {
+                    LocalEntry::Dir => dirs.push((rel, path)),
+                    LocalEntry::File => {
+                        if self.db.node_by_path(&rel)?.is_none() {
+                            out.push(rel);
+                        }
+                    }
+                    LocalEntry::Special(kind) => self.report_special(&rel, kind),
+                    LocalEntry::Missing => {}
                 }
             }
             for (rel, path) in dirs {
@@ -1235,20 +1262,23 @@ impl<S: SidecarApi + 'static> Engine<S> {
             if is_temp_file(&rel) {
                 continue; // our own / the sidecar's transient transfer files
             }
-            if abs.is_dir() {
-                // A directory that is new to the DB may have been created
-                // together with its contents; inotify attached its recursive
-                // watch too late and drops the children's events (FSEvents
-                // replays them, so this only bites Linux). Sweep the live
-                // subtree now; `seen` dedups against the batch's own events.
-                let known = self.db.node_by_path(&rel)?.is_some();
-                queue.push((rel.clone(), true));
-                if !known {
-                    self.sweep_new_dir(&rel, &mut seen, &mut queue);
+            match classify_local_entry(&abs) {
+                LocalEntry::Dir => {
+                    // A directory that is new to the DB may have been created
+                    // together with its contents; inotify attached its recursive
+                    // watch too late and drops the children's events (FSEvents
+                    // replays them, so this only bites Linux). Sweep the live
+                    // subtree now; `seen` dedups against the batch's own events.
+                    let known = self.db.node_by_path(&rel)?.is_some();
+                    queue.push((rel.clone(), true));
+                    if !known {
+                        self.sweep_new_dir(&rel, &mut seen, &mut queue);
+                    }
                 }
-            } else {
-                // File, or already gone (the delete path re-checks liveness).
-                queue.push((rel, false));
+                LocalEntry::File => queue.push((rel, false)),
+                LocalEntry::Special(kind) => self.report_special(&rel, kind),
+                // Already gone: the delete path re-checks liveness.
+                LocalEntry::Missing => queue.push((rel, false)),
             }
         }
         for (rel, is_dir) in queue {
@@ -1256,10 +1286,17 @@ impl<S: SidecarApi + 'static> Engine<S> {
             if is_dir {
                 self.ensure_remote_folder_async(&rel).await?;
                 self.remember_dir_inode(&rel);
-            } else if abs.is_file() {
-                self.upsert_local_file(&rel).await?;
             } else {
-                self.handle_local_delete(&rel).await?;
+                match classify_local_entry(&abs) {
+                    LocalEntry::File => self.upsert_local_file(&rel).await?,
+                    LocalEntry::Special(kind) => self.report_special(&rel, kind),
+                    LocalEntry::Missing => self.handle_local_delete(&rel).await?,
+                    // Appeared as a directory after the event was queued.
+                    LocalEntry::Dir => {
+                        self.ensure_remote_folder_async(&rel).await?;
+                        self.remember_dir_inode(&rel);
+                    }
+                }
             }
         }
         Ok(())
@@ -1483,12 +1520,17 @@ impl<S: SidecarApi + 'static> Engine<S> {
             if is_temp_file(&child_rel) || !seen.insert(child_rel.clone()) {
                 continue;
             }
-            // DirEntry::metadata does not follow symlinks: linked dirs are
-            // not walked (no loops), linked files upload as regular files.
-            let is_dir = entry.metadata().map(|m| m.is_dir()).unwrap_or(false);
-            queue.push((child_rel.clone(), is_dir));
-            if is_dir {
-                self.sweep_new_dir(&child_rel, seen, queue);
+            // Never follow a link: `classify_local_entry` uses
+            // `symlink_metadata`, so linked dirs are not walked (no loops)
+            // and special files are reported instead of hashed.
+            match classify_local_entry(&entry.path()) {
+                LocalEntry::Dir => {
+                    queue.push((child_rel.clone(), true));
+                    self.sweep_new_dir(&child_rel, seen, queue);
+                }
+                LocalEntry::File => queue.push((child_rel.clone(), false)),
+                LocalEntry::Special(kind) => self.report_special(&child_rel, kind),
+                LocalEntry::Missing => {}
             }
         }
     }
@@ -1503,6 +1545,17 @@ impl<S: SidecarApi + 'static> Engine<S> {
     /// revision) or mark dirty while paused (F4 buffering).
     async fn upsert_local_file(&mut self, rel: &str) -> Result<()> {
         let abs = self.content_path(rel);
+        // Defensive: never hash a symlink/FIFO/socket. The scan and watcher
+        // paths already classify, but a rename or race could still hand us
+        // one — `File::open` on a FIFO would block the engine forever.
+        match classify_local_entry(&abs) {
+            LocalEntry::File => {}
+            LocalEntry::Special(kind) => {
+                self.report_special(rel, kind);
+                return Ok(());
+            }
+            LocalEntry::Dir | LocalEntry::Missing => return Ok(()),
+        }
         let meta = match std::fs::metadata(&abs) {
             Ok(m) => m,
             Err(_) => return Ok(()), // vanished again — delete path handles it
@@ -1623,7 +1676,7 @@ impl<S: SidecarApi + 'static> Engine<S> {
             return Ok(());
         }
         let abs = self.content_path(rel);
-        if !abs.is_file() {
+        if !matches!(classify_local_entry(&abs), LocalEntry::File) {
             return Ok(()); // vanished before upload; delete path owns it
         }
         // F7 precondition (e2e-m1 bug #1): before uploading a new revision of
@@ -2021,6 +2074,17 @@ impl<S: SidecarApi + 'static> Engine<S> {
         {
             let source_is_remote = !row.node_uid.starts_with("pending:");
             if source_is_remote {
+                // A placeholder source (never hydrated locally) has no
+                // backing content for the destination write to upload. Pull
+                // its remote content to the destination path before trashing
+                // the source node; otherwise the queued write fails
+                // "backing file vanished" and the overwrite tombstone later
+                // trashes the surviving destination node.
+                let dest_abs = to_abs(&self.backing_dir, new_rel);
+                if store.is_some() && !dest_abs.is_file() {
+                    self.download_to_backing(&row.node_uid, new_rel, row.mtime, row.mode)
+                        .await?;
+                }
                 let results = self
                     .sidecar
                     .trash(std::slice::from_ref(&row.node_uid))
@@ -2445,7 +2509,9 @@ impl<S: SidecarApi + 'static> Engine<S> {
         // doesn't know about (F7): dirty/uploading rows, untracked files, or
         // on-disk content diverging from the last synced hash. Divergence is
         // judged against the CONTENT copy (backing dir in placeholder mode).
-        if abs.is_file() {
+        // Only a regular file counts: a symlink/FIFO here is left alone
+        // (never followed or hashed) — the incoming node takes the path.
+        if matches!(classify_local_entry(&abs), LocalEntry::File) {
             let diverged = match self.db.node_by_path(&rel)? {
                 Some(row) => {
                     row.sync_state != SyncState::Synced
@@ -2498,10 +2564,11 @@ impl<S: SidecarApi + 'static> Engine<S> {
             return Ok(()); // this IS the node: a normal update in place
         }
         let abs = self.content_path(rel);
+        let existing = classify_local_entry(&abs);
         let type_clash = if node.is_folder() {
-            abs.is_file()
+            matches!(existing, LocalEntry::File | LocalEntry::Special(_))
         } else {
-            abs.is_dir()
+            matches!(existing, LocalEntry::Dir)
         };
         // A move/rename must not land on anything already at the
         // destination; an in-place create only conflicts on a different
@@ -3894,6 +3961,46 @@ fn dir_identity(meta: &std::fs::Metadata) -> Option<(u64, u64)> {
     Some((meta.dev(), meta.ino()))
 }
 
+/// What the sync pipeline does with one on-disk entry. Decided from
+/// `symlink_metadata`, so a symbolic link is classified as a link and never
+/// followed — `path.is_file()`/`path.is_dir()` would follow it and could
+/// walk outside the sync root. FIFOs, sockets, and device nodes are
+/// `Special`: opening a FIFO to hash it blocks forever, and none of them
+/// can be represented on Drive.
+enum LocalEntry {
+    Dir,
+    File,
+    Special(&'static str),
+    Missing,
+}
+
+fn classify_local_entry(path: &Path) -> LocalEntry {
+    use std::os::unix::fs::FileTypeExt as _;
+    let Ok(meta) = std::fs::symlink_metadata(path) else {
+        return LocalEntry::Missing;
+    };
+    let ft = meta.file_type();
+    if ft.is_symlink() {
+        LocalEntry::Special("symbolic link")
+    } else if ft.is_dir() {
+        LocalEntry::Dir
+    } else if ft.is_file() {
+        // Hardlinks (nlink > 1) are ordinary files: each link uploads as an
+        // independent node; the link relationship is not preserved (SPEC F5).
+        LocalEntry::File
+    } else if ft.is_fifo() {
+        LocalEntry::Special("FIFO")
+    } else if ft.is_socket() {
+        LocalEntry::Special("socket")
+    } else if ft.is_block_device() {
+        LocalEntry::Special("block device")
+    } else if ft.is_char_device() {
+        LocalEntry::Special("character device")
+    } else {
+        LocalEntry::Special("special file")
+    }
+}
+
 /// Absolute path from a root-relative '/'-separated path.
 pub fn to_abs(root: &Path, rel: &str) -> PathBuf {
     rel.split('/').fold(root.to_path_buf(), |p, c| p.join(c))
@@ -4091,6 +4198,14 @@ mod tests {
             pinned: false,
             synced_sha1: sha1,
         }
+    }
+
+    /// Simulate the VFS having moved a source's backing content onto `rel`
+    /// (the overwrite-rename merge expects content there for its upload).
+    fn seed_backing(root: &Path, rel: &str, bytes: &[u8]) {
+        let path = root.join(VFS_BACKING_DIR).join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, bytes).unwrap();
     }
 
     /// A file row backed by a known remote uid (engine merge tests).
@@ -4391,6 +4506,9 @@ mod tests {
             .upsert_node(&row_at("tmp.plasticity", &src_uid, SyncState::Synced))
             .unwrap();
 
+        // The VFS moved the source's backing content onto the destination.
+        seed_backing(&dir.path().join("root"), "base.plasticity", b"new");
+
         // What the VFS queues for `rename(tmp → base)` over an existing base.
         store.record_overwrite("base.plasticity", "tmp.plasticity", "base.plasticity");
         let Some(WorkRequest::Delete(rel)) = store.next_work_request() else {
@@ -4454,6 +4572,8 @@ mod tests {
             .db
             .upsert_node(&row_at("tmp2.plasticity", &src_uid, SyncState::Synced))
             .unwrap();
+
+        seed_backing(&dir.path().join("root"), "base.plasticity", b"newer");
 
         store.record_overwrite("base.plasticity", "tmp2.plasticity", "base.plasticity");
         let Some(WorkRequest::Delete(rel)) = store.next_work_request() else {
