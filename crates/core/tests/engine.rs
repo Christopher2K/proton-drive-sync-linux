@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use pds_core::{ActivityKind, Db, Engine, EngineConfig, EngineState, STATE_DIR};
-use pds_sidecar_client::{MockHandle, MockSidecar, SidecarClient};
+use pds_sidecar_client::{DriveEvent, EventKind, MockHandle, MockSidecar, SidecarClient};
 use serial_test::serial;
 
 struct Fixture {
@@ -1530,6 +1530,538 @@ async fn non_utf8_filename_is_skipped_and_reported_once() {
         fx.handle.status().await.unwrap().state,
         EngineState::Running
     );
+    fx.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------
+// Wave 1a — local path lifecycle: delete/re-create, folder rename/move,
+// folder delete, remote trash→restore, and event-ordering regressions.
+// ---------------------------------------------------------------------------
+
+/// Seed `n` remote filler files and wait until each is tracked and synced.
+/// Keeps a delete under the mass-deletion guard's 25% ratio limb in small
+/// fixtures (a single delete on a tiny tree would otherwise trip it).
+async fn seed_synced_fillers(fx: &Fixture, n: usize) {
+    for i in 0..n {
+        fx.mock
+            .remote_create_file("root", &format!("filler{i:02}.txt"), b"filler");
+    }
+    for i in 0..n {
+        wait_for_synced(&fx.db, &format!("filler{i:02}.txt")).await;
+    }
+}
+
+// TG-05: a remove followed immediately by a write of new bytes at the same
+// path must converge on the new content — never trash the file.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn local_delete_then_recreate_in_same_debounce_window_keeps_new_content() {
+    let fx = start().await;
+    std::fs::write(fx.root.join("churn.txt"), b"v1").unwrap();
+    wait_for_synced(&fx.db, "churn.txt").await;
+    let uid = fx.mock.find_uid("root", "churn.txt").expect("uploaded");
+    let (expected, _) = pds_core::sha1_file(&fx.root.join("churn.txt")).unwrap();
+    assert_eq!(fx.db.node_by_path("churn.txt").unwrap().unwrap().sha1, Some(expected));
+
+    // Remove and re-create inside one watcher debounce window.
+    std::fs::remove_file(fx.root.join("churn.txt")).unwrap();
+    std::fs::write(fx.root.join("churn.txt"), b"v2 re-created").unwrap();
+
+    wait_for(|| {
+        fx.mock.file_content(&uid).as_deref() == Some(b"v2 re-created".as_slice())
+    })
+    .await;
+    wait_for_synced(&fx.db, "churn.txt").await;
+    // Settle: a stale tombstone would drain after the upload and trash the
+    // very node that just received the new content.
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+
+    assert_eq!(
+        fx.mock
+            .find_uid("root", "churn.txt")
+            .as_deref(),
+        Some(uid.as_str()),
+        "the re-created content must stay on the original node"
+    );
+    assert_eq!(
+        fx.mock
+            .child_names("root")
+            .iter()
+            .filter(|n| *n == "churn.txt")
+            .count(),
+        1,
+        "exactly one remote node at the path: {:?}",
+        fx.mock.child_names("root")
+    );
+    assert!(
+        !fx.mock.trashed_uids().contains(&uid),
+        "stale delete reached the remote: {:?}",
+        fx.mock.trashed_uids()
+    );
+    assert!(conflict_entry(&fx.root, "churn").is_none());
+    assert!(fx.db.tombstones().unwrap().is_empty());
+    let row = fx.db.node_by_path("churn.txt").unwrap().unwrap();
+    assert_eq!(row.sync_state, pds_core::SyncState::Synced);
+    let (expected, _) = pds_core::sha1_file(&fx.root.join("churn.txt")).unwrap();
+    assert_eq!(row.sha1.as_deref(), Some(expected.as_str()));
+    fx.shutdown().await;
+}
+
+// TG-05 (deterministic variant): the delete batch is received and its
+// tombstone is pending while the file is re-created before the next drain.
+// The write must cancel that tombstone; resuming must not trash the node it
+// is about to update.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn recreated_file_cancels_pending_tombstone() {
+    let fx = start().await;
+    seed_synced_fillers(&fx, 10).await;
+    std::fs::write(fx.root.join("churn.txt"), b"v1").unwrap();
+    wait_for_synced(&fx.db, "churn.txt").await;
+    let uid = fx.mock.find_uid("root", "churn.txt").unwrap();
+
+    // Pause so the delete and the re-create land as separate watcher batches
+    // and nothing drains between them.
+    fx.handle.pause().await.unwrap();
+    wait_for(|| {
+        futures::executor::block_on(fx.handle.status())
+            .map(|s| s.state == EngineState::Paused)
+            .unwrap_or(false)
+    })
+    .await;
+
+    std::fs::remove_file(fx.root.join("churn.txt")).unwrap();
+    wait_for(|| {
+        fx.db
+            .tombstones()
+            .map(|t| t.iter().any(|t| t.local_path == "churn.txt"))
+            .unwrap_or(false)
+    })
+    .await;
+    std::fs::write(fx.root.join("churn.txt"), b"v2 re-created").unwrap();
+    wait_for(|| {
+        fx.db
+            .node_by_path("churn.txt")
+            .ok()
+            .flatten()
+            .is_some_and(|r| r.sync_state == pds_core::SyncState::Dirty)
+    })
+    .await;
+
+    fx.handle.resume().await.unwrap();
+    wait_for(|| {
+        fx.mock.file_content(&uid).as_deref() == Some(b"v2 re-created".as_slice())
+    })
+    .await;
+    wait_for_synced(&fx.db, "churn.txt").await;
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+
+    assert!(
+        !fx.mock.trashed_uids().contains(&uid),
+        "pending delete trashed the re-created node: {:?}",
+        fx.mock.trashed_uids()
+    );
+    assert_eq!(fx.mock.find_uid("root", "churn.txt").as_deref(), Some(uid.as_str()));
+    assert_eq!(
+        fx.mock
+            .child_names("root")
+            .iter()
+            .filter(|n| *n == "churn.txt")
+            .count(),
+        1
+    );
+    assert!(fx.db.tombstones().unwrap().is_empty());
+    assert!(conflict_entry(&fx.root, "churn").is_none());
+    let row = fx.db.node_by_path("churn.txt").unwrap().unwrap();
+    assert_eq!(row.sync_state, pds_core::SyncState::Synced);
+    let (expected, _) = pds_core::sha1_file(&fx.root.join("churn.txt")).unwrap();
+    assert_eq!(row.sha1.as_deref(), Some(expected.as_str()));
+    fx.shutdown().await;
+}
+
+// TG-05 variant: the delete has already drained (node trashed, row gone)
+// while the replacement upload has not run yet. The replacement must arrive
+// as a node of its own and the new contents must not be lost.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn recreate_after_delete_drained_uploads_new_node() {
+    let fx = start().await;
+    seed_synced_fillers(&fx, 10).await;
+    std::fs::write(fx.root.join("churn.txt"), b"v1").unwrap();
+    wait_for_synced(&fx.db, "churn.txt").await;
+    let old_uid = fx.mock.find_uid("root", "churn.txt").unwrap();
+
+    // Delete and let the tombstone drain completely.
+    std::fs::remove_file(fx.root.join("churn.txt")).unwrap();
+    wait_for(|| fx.mock.trashed_uids().contains(&old_uid)).await;
+    wait_for(|| fx.db.node_by_path("churn.txt").unwrap().is_none()).await;
+
+    // Re-create while paused so its upload cannot start yet: this is the
+    // "delete drained, upload not completed" window.
+    fx.handle.pause().await.unwrap();
+    std::fs::write(fx.root.join("churn.txt"), b"v2 replacement").unwrap();
+    wait_for(|| {
+        fx.db
+            .node_by_path("churn.txt")
+            .ok()
+            .flatten()
+            .is_some_and(|r| r.sync_state == pds_core::SyncState::Dirty)
+    })
+    .await;
+    assert!(
+        fx.mock.find_uid("root", "churn.txt").is_none(),
+        "the re-created file must not exist remotely until its upload runs"
+    );
+
+    fx.handle.resume().await.unwrap();
+    let new_uid = wait_for_mock(&fx.mock, "churn.txt").await;
+    wait_for(|| {
+        fx.mock.file_content(&new_uid).as_deref() == Some(b"v2 replacement".as_slice())
+    })
+    .await;
+    wait_for_synced(&fx.db, "churn.txt").await;
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+
+    // Exactly one node at the path, carrying the replacement bytes; the old
+    // node was trashed once, not the new one.
+    assert_eq!(
+        fx.mock
+            .child_names("root")
+            .iter()
+            .filter(|n| *n == "churn.txt")
+            .count(),
+        1
+    );
+    assert_eq!(fx.mock.find_uid("root", "churn.txt").as_deref(), Some(new_uid.as_str()));
+    assert_eq!(
+        fx.mock.trashed_uids().iter().filter(|u| **u == old_uid).count(),
+        1
+    );
+    assert!(!fx.mock.trashed_uids().contains(&new_uid));
+    assert!(fx.db.tombstones().unwrap().is_empty());
+    assert!(conflict_entry(&fx.root, "churn").is_none());
+    fx.shutdown().await;
+}
+
+// TG-06: a local folder rename/move in mirror mode mirrors as rename+move —
+// never trash + re-upload — and keeps every descendant uid.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn local_folder_rename_and_move_preserves_uids() {
+    let fx = start().await;
+    std::fs::create_dir_all(fx.root.join("Project/sub")).unwrap();
+    std::fs::write(fx.root.join("Project/a.txt"), b"alpha").unwrap();
+    std::fs::write(fx.root.join("Project/b.txt"), b"beta").unwrap();
+    std::fs::write(fx.root.join("Project/sub/c.txt"), b"gamma").unwrap();
+    for rel in ["Project/a.txt", "Project/b.txt", "Project/sub/c.txt"] {
+        wait_for_synced(&fx.db, rel).await;
+    }
+    wait_for(|| fx.mock.find_uid("root", "Project").is_some()).await;
+    let project_uid = fx.mock.find_uid("root", "Project").unwrap();
+    let sub_uid = fx.mock
+        .find_uid(&project_uid, "sub")
+        .expect("sub remote");
+    let a_uid = fx.mock.find_uid(&project_uid, "a.txt").unwrap();
+    let b_uid = fx.mock.find_uid(&project_uid, "b.txt").unwrap();
+    let c_uid = fx.mock.find_uid(&sub_uid, "c.txt").unwrap();
+    let all_uids = [project_uid.clone(), sub_uid.clone(), a_uid.clone(), b_uid.clone(), c_uid.clone()];
+    let downloads = fx.mock.downloaded_uids().len();
+    let uploads = fx.mock.uploaded_names().len();
+
+    // A real folder elsewhere for the move step.
+    std::fs::create_dir(fx.root.join("Archive")).unwrap();
+    wait_for(|| fx.mock.find_uid("root", "Archive").is_some()).await;
+    let archive_uid = fx.mock.find_uid("root", "Archive").unwrap();
+
+    // 1. Rename at the root.
+    std::fs::rename(fx.root.join("Project"), fx.root.join("Renamed")).unwrap();
+    wait_for(|| {
+        fx.db.node_by_path("Renamed/sub/c.txt").ok().flatten().is_some()
+            && fx.db.node_by_path("Project").ok().flatten().is_none()
+    })
+    .await;
+    wait_for(|| fx.mock.find_uid("root", "Renamed").as_deref() == Some(project_uid.as_str())).await;
+    assert_eq!(fx.mock.find_uid(&project_uid, "sub").as_deref(), Some(sub_uid.as_str()));
+    assert_eq!(fx.mock.find_uid(&project_uid, "a.txt").as_deref(), Some(a_uid.as_str()));
+    assert_eq!(fx.mock.find_uid(&sub_uid, "c.txt").as_deref(), Some(c_uid.as_str()));
+
+    // 2. Move under Archive.
+    std::fs::rename(fx.root.join("Renamed"), fx.root.join("Archive/Renamed")).unwrap();
+    wait_for(|| {
+        fx.db.node_by_path("Archive/Renamed/sub/c.txt").ok().flatten().is_some()
+            && fx.db.node_by_path("Renamed").ok().flatten().is_none()
+    })
+    .await;
+    wait_for(|| {
+        fx.mock
+            .child_names(&archive_uid)
+            .iter()
+            .any(|n| n == "Renamed")
+    })
+    .await;
+    assert_eq!(
+        fx.db
+            .node_by_path("Archive/Renamed")
+            .unwrap()
+            .expect("folder row re-keyed")
+            .parent_uid
+            .as_deref(),
+        Some(archive_uid.as_str())
+    );
+
+    // 3. Move back to the root.
+    std::fs::rename(fx.root.join("Archive/Renamed"), fx.root.join("Renamed")).unwrap();
+    wait_for(|| {
+        fx.db.node_by_path("Renamed/sub/c.txt").ok().flatten().is_some()
+            && fx.db
+                .node_by_path("Archive/Renamed")
+                .ok()
+                .flatten()
+                .is_none()
+    })
+    .await;
+    wait_for(|| fx.mock.child_names("root").iter().any(|n| n == "Renamed")).await;
+
+    // Rename/move only: no trash, no re-upload, same uids throughout.
+    assert!(
+        fx.mock.trashed_uids().is_empty(),
+        "folder rename/move must never trash: {:?}",
+        fx.mock.trashed_uids()
+    );
+    assert_eq!(fx.mock.uploaded_names().len(), uploads, "no re-uploads");
+    assert_eq!(fx.mock.downloaded_uids().len(), downloads, "no re-downloads");
+    for uid in &all_uids {
+        assert_eq!(
+            fx.db
+                .all_nodes()
+                .unwrap()
+                .iter()
+                .filter(|r| &r.node_uid == uid)
+                .count(),
+            1,
+            "uid {uid} must still have exactly one row"
+        );
+    }
+    // Content stays intact and the mock saw the remote rename/move calls.
+    assert_eq!(fx.mock.file_content(&a_uid).as_deref(), Some(b"alpha".as_slice()));
+    assert_eq!(fx.mock.file_content(&b_uid).as_deref(), Some(b"beta".as_slice()));
+    assert_eq!(fx.mock.file_content(&c_uid).as_deref(), Some(b"gamma".as_slice()));
+    assert_eq!(fx.mock.find_uid(&sub_uid, "c.txt").as_deref(), Some(c_uid.as_str()));
+    assert!(
+        fx.mock.renames().iter().any(|(uid, name)| uid == &project_uid && name == "Renamed"),
+        "expected a remote rename of {project_uid}: {:?}",
+        fx.mock.renames()
+    );
+    assert!(
+        fx.mock
+            .moves()
+            .iter()
+            .any(|(uid, parent)| uid == &project_uid && parent == &archive_uid),
+        "expected a remote move of {project_uid} under {archive_uid}: {:?}",
+        fx.mock.moves()
+    );
+    // DB paths re-keyed including the nested descendant.
+    let nested = fx.db.node_by_path("Renamed/sub/c.txt").unwrap().unwrap();
+    assert_eq!(nested.node_uid, c_uid);
+    assert_eq!(nested.parent_uid.as_deref(), Some(sub_uid.as_str()));
+    fx.shutdown().await;
+}
+
+// TG-07: deleting a whole non-empty folder locally trashes every tracked
+// node under it exactly once and removes all rows.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn local_delete_of_nonempty_folder_trashes_each_node_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("sync");
+    std::fs::create_dir_all(&root).unwrap();
+    let (client, mock) = MockSidecar::new().connect();
+    let vault = mock.remote_create_folder("root", "Vault");
+    let a = mock.remote_create_file(&vault, "a.txt", b"a bytes");
+    let b = mock.remote_create_file(&vault, "b.txt", b"b bytes");
+    let sub = mock.remote_create_folder(&vault, "sub");
+    let c = mock.remote_create_file(&sub, "c.txt", b"c bytes");
+    // Filler nodes keep five deletes comfortably under the >25% guard limb.
+    for i in 0..20 {
+        mock.remote_create_file("root", &format!("filler{i:02}.txt"), b"filler");
+    }
+    let fx = start_with_client(
+        dir,
+        root.clone(),
+        client,
+        mock,
+        pds_core::RETRY_BASE_DEFAULT,
+    )
+    .await;
+    for rel in ["Vault/a.txt", "Vault/b.txt", "Vault/sub/c.txt"] {
+        wait_for_synced(&fx.db, rel).await;
+    }
+    assert_eq!(
+        fx.db.node_by_path("Vault").unwrap().unwrap().node_uid,
+        vault
+    );
+
+    // Pause so every remove in the burst is recorded as a tombstone before
+    // the first one drains (the watcher can split bursts into batches under
+    // load; a mid-drain folder trash would hide its children's tombstones).
+    fx.handle.pause().await.unwrap();
+    wait_for(|| {
+        futures::executor::block_on(fx.handle.status())
+            .map(|s| s.state == EngineState::Paused)
+            .unwrap_or(false)
+    })
+    .await;
+    std::fs::remove_dir_all(root.join("Vault")).unwrap();
+    wait_for(|| fx.db.tombstones().map(|t| t.len() == 5).unwrap_or(false)).await;
+
+    fx.handle.resume().await.unwrap();
+    wait_for(|| {
+        fx.db.tombstones().map(|t| t.is_empty()).unwrap_or(false)
+            && fx.db.node_by_path("Vault").unwrap().is_none()
+            && fx
+                .db
+                .node_by_path("Vault/sub/c.txt")
+                .unwrap()
+                .is_none()
+    })
+    .await;
+    wait_for(|| fx.mock.child_names("root").iter().all(|n| n != "Vault")).await;
+
+    assert!(!root.join("Vault").exists(), "local tree must be gone");
+    let trashed = fx.mock.trashed_uids();
+    for uid in [&vault, &a, &b, &sub, &c] {
+        assert_eq!(
+            trashed.iter().filter(|u| *u == uid).count(),
+            1,
+            "uid {uid} must be trashed exactly once: {trashed:?}"
+        );
+    }
+    fx.shutdown().await;
+}
+
+// TG-08: a remote trash event removes the local file; the restore event
+// brings it back at its original path, uid, and content — cursor advances
+// for both events.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn remote_trash_then_restore_round_trips_mirror() {
+    let fx = start().await;
+    assert_eq!(
+        std::fs::read(fx.root.join("hello.txt")).unwrap(),
+        b"hello drive"
+    );
+    let downloads = fx.mock.downloaded_uids().len();
+    let cursor_before = fx.db.event_cursor("scope-1").unwrap();
+
+    fx.mock.remote_trash("node-hello");
+    wait_for(|| {
+        !fx.root.join("hello.txt").exists()
+            && fx.db.node_by_path("hello.txt").unwrap().is_none()
+    })
+    .await;
+    let cursor_trashed = fx.db.event_cursor("scope-1").unwrap();
+    assert!(
+        cursor_trashed.is_some() && cursor_trashed != cursor_before,
+        "trash event must advance the cursor ({cursor_before:?} → {cursor_trashed:?})"
+    );
+
+    fx.mock.remote_restore("node-hello");
+    wait_for(|| {
+        std::fs::read(fx.root.join("hello.txt")).ok().as_deref() == Some(b"hello drive".as_slice())
+            && fx
+                .db
+                .node_by_path("hello.txt")
+                .ok()
+                .flatten()
+                .is_some_and(|r| r.node_uid == "node-hello")
+    })
+    .await;
+    let cursor_restored = fx.db.event_cursor("scope-1").unwrap();
+    assert!(
+        cursor_restored.is_some() && cursor_restored != cursor_trashed,
+        "restore event must advance the cursor ({cursor_trashed:?} → {cursor_restored:?})"
+    );
+
+    assert!(
+        fx.mock.downloaded_uids().len() > downloads,
+        "restore must fetch the content again"
+    );
+    assert!(conflict_entry(&fx.root, "hello").is_none());
+    assert!(fx.mock.trashed_uids().is_empty(), "remote-originated trash never calls back");
+    fx.shutdown().await;
+}
+
+// TG-02 follow-up: the child's update event arrives BEFORE its moved parent
+// folder's update. The child must still end up under the parent's final path
+// once both events are applied — no duplicate row, no stray local copy.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn child_update_before_moved_parent_lands_at_final_path() {
+    let fx = start().await;
+    fx.mock
+        .remote_create_file("node-docs", "nested.txt", b"before move");
+    wait_for(|| fx.root.join("Documents/nested.txt").is_file()).await;
+    let nested_uid = fx
+        .mock
+        .find_uid("node-docs", "nested.txt")
+        .expect("nested remote");
+
+    // Remote state: a new Outer folder holds Documents, but the engine has
+    // not seen Outer yet (its event is still queued behind the child's).
+    let outer = fx.mock.remote_create_folder_silent("root", "Outer");
+    fx.mock.remote_move_silent("node-docs", &outer);
+
+    // Child update first: its parent row still points at the old root path.
+    fx.mock
+        .remote_update_file(&nested_uid, b"changed before parent event");
+    wait_for(|| {
+        std::fs::read(fx.root.join("Documents/nested.txt"))
+            .ok()
+            .as_deref()
+            == Some(b"changed before parent event".as_slice())
+    })
+    .await;
+
+    // Now the parent folder's move update, without an Outer creation event.
+    fx.mock.emit_event(&DriveEvent {
+        scope_id: "scope-1".into(),
+        event_id: "evt-parent-move".into(),
+        kind: EventKind::NodeUpdated,
+        node_uid: Some("node-docs".into()),
+        parent_node_uid: Some(outer.clone()),
+        is_trashed: None,
+    });
+
+    wait_for(|| {
+        std::fs::read(fx.root.join("Outer/Documents/nested.txt"))
+            .ok()
+            .as_deref()
+            == Some(b"changed before parent event".as_slice())
+            && fx
+                .db
+                .node_by_path("Outer/Documents/nested.txt")
+                .ok()
+                .flatten()
+                .is_some_and(|r| r.node_uid == nested_uid)
+    })
+    .await;
+    assert!(
+        !fx.root.join("Documents").exists(),
+        "the old root-level folder must not linger"
+    );
+    assert!(fx.db.node_by_path("Documents").unwrap().is_none());
+    assert!(fx.db.node_by_path("Documents/nested.txt").unwrap().is_none());
+    assert_eq!(
+        fx.db
+            .all_nodes()
+            .unwrap()
+            .iter()
+            .filter(|r| r.node_uid == nested_uid)
+            .count(),
+        1,
+        "child must have exactly one row"
+    );
+    assert!(fx.mock.trashed_uids().is_empty());
     fx.shutdown().await;
 }
 

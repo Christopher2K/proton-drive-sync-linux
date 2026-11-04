@@ -449,6 +449,12 @@ pub struct Engine<S: SidecarApi> {
     /// activity feed — the warning is emitted once per path, not once per
     /// watcher batch.
     non_utf8_reported: HashSet<Vec<u8>>,
+    /// `(device, inode)` of every tracked local directory, keyed by relative
+    /// path. `notify`'s debounced API only reports paths, so a local folder
+    /// rename arrives as "old path gone + new path appeared". The inode is
+    /// stable across the rename and lets [`Engine::detect_dir_renames`] pair
+    /// the two without guessing from names/content.
+    dir_ids: HashMap<String, (u64, u64)>,
 }
 
 impl<S: SidecarApi + 'static> Engine<S> {
@@ -532,6 +538,7 @@ impl<S: SidecarApi + 'static> Engine<S> {
             watcher_ready: watcher_ready.clone(),
             activity_tx: activity_tx.clone(),
             non_utf8_reported: HashSet::new(),
+            dir_ids: HashMap::new(),
         };
         Ok((
             engine,
@@ -580,6 +587,12 @@ impl<S: SidecarApi + 'static> Engine<S> {
             }
         }
         self.db.set_meta(META_MATERIALIZED_FOR_MODE, if self.placeholders { "0" } else { "1" })?;
+        // Remember every existing directory's inode so a later local rename
+        // (reported by the watcher as "old gone + new appeared") can be
+        // paired without guessing from names or content (TG-06).
+        if !self.placeholders {
+            self.index_dir_inodes();
+        }
 
         // 2. Resume the event stream from the persisted cursor (F6).
         let cursor = self.db.event_cursor(&root_node.tree_event_scope_id)?;
@@ -817,7 +830,7 @@ impl<S: SidecarApi + 'static> Engine<S> {
                         continue;
                     }
                     Some(WorkRequest::Rename(old, new)) => {
-                        match self.apply_local_rename(&store, &old, &new).await {
+                        match self.apply_local_rename(Some(&store), &old, &new).await {
                             Ok(()) => {
                                 store.finish_rename(&old, &new, true, false);
                             }
@@ -1062,6 +1075,25 @@ impl<S: SidecarApi + 'static> Engine<S> {
     // ------------------------------------------------------------------
 
     async fn handle_fs_batch(&mut self, events: Vec<DebouncedEvent>) -> Result<()> {
+        let mut events = events;
+        // A local folder rename/move is not a delete + create (TG-06): pair
+        // the inode of a vanished tracked directory with a newly appeared
+        // one and re-key the subtree remotely before the delete path can
+        // trash it. Replays the rename through the same machinery as a
+        // write-through rename.
+        for (old, new) in self.detect_dir_renames() {
+            match self.apply_local_rename(None, &old, &new).await {
+                Ok(()) => {
+                    // Events for the old subtree are stale: the rows moved.
+                    let prefix = format!("{old}/");
+                    events.retain(|ev| match to_rel_checked(&self.root, &ev.path) {
+                        RelCheck::Valid(rel) => rel != old && !rel.starts_with(&prefix),
+                        _ => true,
+                    });
+                }
+                Err(e) => warn!(from = %old, to = %new, error = %e, "local folder rename failed"),
+            }
+        }
         // Queue of (rel, is_dir) to process, parent dirs before their
         // children so uploads can rely on the remote folder chain.
         let mut queue: Vec<(String, bool)> = Vec::new();
@@ -1106,6 +1138,7 @@ impl<S: SidecarApi + 'static> Engine<S> {
             let abs = to_abs(&self.root, &rel);
             if is_dir {
                 self.ensure_remote_folder_async(&rel).await?;
+                self.remember_dir_inode(&rel);
             } else if abs.is_file() {
                 self.upsert_local_file(&rel).await?;
             } else {
@@ -1113,6 +1146,195 @@ impl<S: SidecarApi + 'static> Engine<S> {
             }
         }
         Ok(())
+    }
+
+    /// Remember the identity of every directory currently on disk, so later
+    /// watcher batches can tell a rename from a delete + create.
+    fn index_dir_inodes(&mut self) {
+        self.dir_ids.clear();
+        let mut stack = vec![String::new()];
+        while let Some(rel) = stack.pop() {
+            let abs = if rel.is_empty() {
+                self.root.clone()
+            } else {
+                to_abs(&self.root, &rel)
+            };
+            let Ok(entries) = std::fs::read_dir(&abs) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let child = match to_rel_checked(&self.root, &entry.path()) {
+                    RelCheck::Valid(child) => child,
+                    RelCheck::NotUtf8(_) | RelCheck::Outside => continue,
+                };
+                if is_internal_path(&child) {
+                    continue;
+                }
+                // `DirEntry::metadata` does not follow symlinks, so a linked
+                // directory is never indexed (and never walked).
+                let Ok(meta) = entry.metadata() else {
+                    continue;
+                };
+                if !meta.is_dir() {
+                    continue;
+                }
+                if let Some(id) = dir_identity(&meta) {
+                    self.dir_ids.insert(child.clone(), id);
+                }
+                stack.push(child);
+            }
+        }
+    }
+
+    fn remember_dir_inode(&mut self, rel: &str) {
+        if let Ok(meta) = std::fs::metadata(to_abs(&self.root, rel))
+            && meta.is_dir()
+            && let Some(id) = dir_identity(&meta)
+        {
+            self.dir_ids.insert(rel.to_string(), id);
+        }
+    }
+
+    /// Pair tracked directories that vanished from disk with newly appeared,
+    /// still-untracked directories carrying the same filesystem identity.
+    /// Returns `(old_rel, new_rel)` pairs to replay as renames.
+    ///
+    /// The debouncer can deliver the old path's events one batch BEFORE the
+    /// destination's, so this inspects the live filesystem rather than only
+    /// the current batch: the rename syscall has already completed by the
+    /// time any of its events are delivered.
+    fn detect_dir_renames(&mut self) -> Vec<(String, String)> {
+        let mut vanished: Vec<(String, (u64, u64))> = self
+            .dir_ids
+            .iter()
+            .filter(|(rel, _)| !to_abs(&self.root, rel).is_dir())
+            .filter(|(rel, _)| {
+                // Still tracked as a folder: a real user delete leaves the
+                // row in place until its tombstone drains.
+                self.db
+                    .node_by_path(rel)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|row| !row.is_file())
+            })
+            .map(|(rel, id)| (rel.clone(), *id))
+            .collect();
+        if vanished.is_empty() {
+            return Vec::new();
+        }
+        // Parents before children: re-keying a parent already moves the
+        // whole tracked subtree (rows and directory identities).
+        vanished.sort_by_key(|(rel, _)| rel.matches('/').count());
+
+        let appeared = self.scan_untracked_dirs();
+        let mut used = HashSet::new();
+        let mut matched_old = Vec::new();
+        let mut pairs = Vec::new();
+        let mut unmatched = Vec::new();
+        for (old, id) in vanished {
+            if matched_old
+                .iter()
+                .any(|prefix: &String| old.starts_with(&format!("{prefix}/")))
+            {
+                continue;
+            }
+            let candidate = appeared
+                .iter()
+                .find(|(new, other)| *other == id && !used.contains(new));
+            let Some((new, _)) = candidate else {
+                unmatched.push(old);
+                continue;
+            };
+            // Inode numbers can be reused after a deletion. Only pair when
+            // the directory's direct children still look like the tracked
+            // subtree, so an unrelated new folder never adopts the old
+            // node's identity.
+            if !self.rename_shape_matches(&old, new) {
+                unmatched.push(old);
+                continue;
+            }
+            used.insert(new.clone());
+            matched_old.push(old.clone());
+            pairs.push((old, new.clone()));
+        }
+        // Nothing new carries these identities: they are real deletions.
+        // Drop their stale index entries so a later inode reuse cannot pair
+        // an unrelated folder with them.
+        for old in unmatched {
+            let prefix = format!("{old}/");
+            self.dir_ids
+                .retain(|rel, _| rel != &old && !rel.starts_with(&prefix));
+        }
+        pairs
+    }
+
+    /// Every existing directory that is not already tracked at that exact
+    /// path, with its filesystem identity. Used to locate a rename's
+    /// destination even when its watcher event has not arrived yet.
+    fn scan_untracked_dirs(&self) -> Vec<(String, (u64, u64))> {
+        let mut out = Vec::new();
+        let mut stack = vec![String::new()];
+        while let Some(rel) = stack.pop() {
+            let abs = if rel.is_empty() {
+                self.root.clone()
+            } else {
+                to_abs(&self.root, &rel)
+            };
+            let Ok(entries) = std::fs::read_dir(&abs) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let child = match to_rel_checked(&self.root, &entry.path()) {
+                    RelCheck::Valid(child) => child,
+                    RelCheck::NotUtf8(_) | RelCheck::Outside => continue,
+                };
+                if is_internal_path(&child) {
+                    continue;
+                }
+                let Ok(meta) = entry.metadata() else {
+                    continue;
+                };
+                if !meta.is_dir() {
+                    continue;
+                }
+                if let Some(id) = dir_identity(&meta)
+                    && self.dir_ids.get(&child).copied() != Some(id)
+                    && self.db.node_by_path(&child).ok().flatten().is_none()
+                {
+                    out.push((child.clone(), id));
+                }
+                // Keep descending: a rename destination may sit inside an
+                // already-tracked folder.
+                stack.push(child);
+            }
+        }
+        out
+    }
+
+    /// True when every tracked direct child of `old_rel` is present in the
+    /// directory now living at `new_rel`.
+    fn rename_shape_matches(&self, old_rel: &str, new_rel: &str) -> bool {
+        let Ok(rows) = self.db.nodes_under(&format!("{old_rel}/%")) else {
+            return false;
+        };
+        let mut disk = HashSet::new();
+        if let Ok(entries) = std::fs::read_dir(to_abs(&self.root, new_rel)) {
+            for entry in entries.flatten() {
+                if let Some(name) = entry.file_name().to_str() {
+                    disk.insert(name.to_string());
+                }
+            }
+        }
+        rows.iter().all(|row| {
+            match row
+                .local_path
+                .strip_prefix(old_rel)
+                .and_then(|rest| rest.strip_prefix('/'))
+            {
+                Some(child) if !child.contains('/') => disk.contains(child),
+                _ => true,
+            }
+        })
     }
 
     /// Collect the live children of `rel` (recursively, parent-first) that
@@ -1178,6 +1400,13 @@ impl<S: SidecarApi + 'static> Engine<S> {
 
         let (parent_uid, node_uid, synced_sha1, fresh_content) = match self.db.node_by_path(rel)? {
             Some(row) => {
+                // A write that reaches an existing node proves the local file
+                // is back: cancel any tombstone queued by a delete that lost
+                // the race with this re-create (TG-05). Trashing the node now
+                // would destroy the content this write is about to deliver.
+                if !row.node_uid.starts_with("pending:") {
+                    self.cancel_stale_tombstone(rel, &row.node_uid);
+                }
                 if row.sync_state == SyncState::Synced && row.sha1.as_deref() == Some(&sha1) {
                     return Ok(()); // content unchanged
                 }
@@ -1590,7 +1819,12 @@ impl<S: SidecarApi + 'static> Engine<S> {
     /// when the parent changed) — never a trash + re-upload, so content
     /// and revision history survive. Rows that never synced (no remote
     /// uid) just re-key; their queued upload picks up the new path.
-    async fn apply_local_rename(&mut self, store: &Store, old_rel: &str, new_rel: &str) -> Result<()> {
+    async fn apply_local_rename(
+        &mut self,
+        store: Option<&Store>,
+        old_rel: &str,
+        new_rel: &str,
+    ) -> Result<()> {
         // Guard against cycles: renaming a folder into itself is invalid.
         if new_rel.starts_with(&format!("{old_rel}/")) || old_rel == new_rel {
             warn!(from = %old_rel, to = %new_rel, "invalid rename target (into itself)");
@@ -1658,7 +1892,9 @@ impl<S: SidecarApi + 'static> Engine<S> {
             // overwrite pair; record_write is a dedup'ing no-op in
             // that case and the sole queue source when the racing
             // tmp upload already drained (and dropped its request).
-            store.record_write(new_rel);
+            if let Some(store) = store {
+                store.record_write(new_rel);
+            }
             info!(
                 from = %old_rel,
                 to = %new_rel,
@@ -1743,20 +1979,50 @@ impl<S: SidecarApi + 'static> Engine<S> {
             }
             std::fs::rename(&from, &to)?;
         }
-        store.forget_tree(old_rel);
-        let like = format!("{new_rel}/%");
-        for child in self.db.nodes_under(&like)? {
-            let abs = to_abs(&self.backing_dir, &child.local_path);
-            if abs.is_file() && store.backing_path(&child.local_path).is_none() {
-                store.set_backing(&child.local_path, abs);
+        if let Some(store) = store {
+            store.forget_tree(old_rel);
+            let like = format!("{new_rel}/%");
+            for child in self.db.nodes_under(&like)? {
+                let abs = to_abs(&self.backing_dir, &child.local_path);
+                if abs.is_file() && store.backing_path(&child.local_path).is_none() {
+                    store.set_backing(&child.local_path, abs);
+                }
+            }
+            let own = to_abs(&self.backing_dir, new_rel);
+            if own.is_file() && store.backing_path(new_rel).is_none() {
+                store.set_backing(new_rel, own);
             }
         }
-        let own = to_abs(&self.backing_dir, new_rel);
-        if own.is_file() && store.backing_path(new_rel).is_none() {
-            store.set_backing(new_rel, own);
+        // Directory identities follow the rows, so the next rename inside
+        // the moved subtree is recognized without re-indexing the root.
+        if !row.is_file() {
+            self.rekey_dir_inodes(old_rel, new_rel);
         }
         info!(from = %old_rel, to = %new_rel, "rename applied");
         Ok(())
+    }
+
+    /// Move tracked `(device, inode)` entries from the old path prefix to
+    /// the new one after a local (or mirrored remote) rename.
+    fn rekey_dir_inodes(&mut self, old_rel: &str, new_rel: &str) {
+        let old_prefix = format!("{old_rel}/");
+        let moved: Vec<(String, (u64, u64))> = self
+            .dir_ids
+            .iter()
+            .filter(|(path, _)| *path == old_rel || path.starts_with(&old_prefix))
+            .map(|(path, id)| (path.clone(), *id))
+            .collect();
+        for (path, _) in &moved {
+            self.dir_ids.remove(path);
+        }
+        for (path, id) in moved {
+            let moved_path = if path == old_rel {
+                new_rel.to_string()
+            } else {
+                format!("{new_rel}/{}", &path[old_rel.len() + 1..])
+            };
+            self.dir_ids.insert(moved_path, id);
+        }
     }
 
     async fn handle_local_delete(&mut self, rel: &str) -> Result<()> {
@@ -1934,6 +2200,48 @@ impl<S: SidecarApi + 'static> Engine<S> {
         Ok(())
     }
 
+    /// Ensure every ancestor of `node` has a DB row, fetching the unknown
+    /// ones from the sidecar. Events can arrive child-first, so a moved
+    /// parent may reference a grandparent row the engine has never seen.
+    /// Rows are inserted farthest-first so each path resolves.
+    async fn resolve_unknown_ancestors(&mut self, node: &Node) -> Result<()> {
+        let root_uid = self.db_root_uid()?;
+        let mut chain = Vec::new();
+        let mut parent = node.parent_uid.clone();
+        let mut depth = 0;
+        while let Some(uid) = parent {
+            depth += 1;
+            // The root is a path boundary, not a node row: never fetch or
+            // insert it (its empty name would corrupt every derived path).
+            if depth > 64
+                || Some(uid.as_str()) == root_uid.as_deref()
+                || self.db.node_by_uid(&uid)?.is_some()
+            {
+                break;
+            }
+            let ancestor = match self.sidecar.get_node(&uid).await {
+                Ok(n) => n,
+                Err(e) => {
+                    debug!(uid = %uid, error = %e, "unknown ancestor vanished; anchoring at root");
+                    break;
+                }
+            };
+            parent = ancestor.parent_uid.clone();
+            chain.push(ancestor);
+        }
+        // `chain` is nearest-first; the farthest ancestor must land first.
+        for ancestor in chain.into_iter().rev() {
+            let rel = self.local_path_for(&ancestor)?;
+            self.upsert_from_node(&ancestor, &rel, SyncState::Synced)?;
+            if self.placeholders || !ancestor.is_folder() {
+                continue;
+            }
+            std::fs::create_dir_all(to_abs(&self.root, &rel))?;
+            self.remember_dir_inode(&rel);
+        }
+        Ok(())
+    }
+
     /// Fetch a node and reconcile it locally (download/create).
     async fn apply_node_upsert(&mut self, uid: &str) -> Result<()> {
         let node = match self.sidecar.get_node(uid).await {
@@ -1943,6 +2251,11 @@ impl<S: SidecarApi + 'static> Engine<S> {
                 return Ok(());
             }
         };
+        // A moved parent's OWN parent may still be unknown (its creation
+        // event can arrive after the child's update). Without its row,
+        // `local_path_for` anchors the parent at the root and the move is
+        // lost (TG-02 event ordering).
+        self.resolve_unknown_ancestors(&node).await?;
         let rel = self.local_path_for(&node)?;
         // Resolve by node uid FIRST: a remote rename/move changes the path
         // derived from the node's current name/parent, while the DB row (and
@@ -1968,6 +2281,9 @@ impl<S: SidecarApi + 'static> Engine<S> {
                 std::fs::create_dir_all(&abs)?;
             }
             self.upsert_from_node(&node, &rel, SyncState::Synced)?;
+            if !self.placeholders {
+                self.remember_dir_inode(&rel);
+            }
             return Ok(());
         }
 
@@ -2148,6 +2464,7 @@ impl<S: SidecarApi + 'static> Engine<S> {
                 store.set_backing(&new_rel, to);
             }
         }
+        self.rekey_dir_inodes(rel, &new_rel);
         info!(from = %rel, to = %new_rel, "local item renamed aside for conflict");
         Ok(new_rel)
     }
@@ -2218,6 +2535,9 @@ impl<S: SidecarApi + 'static> Engine<S> {
                 store.set_backing(new_rel, to);
             }
         }
+        if !old.is_file() {
+            self.rekey_dir_inodes(&old_rel, new_rel);
+        }
         info!(from = %old_rel, to = %new_rel, uid = %node.uid, "remote rename/move applied");
         Ok(())
     }
@@ -2249,6 +2569,11 @@ impl<S: SidecarApi + 'static> Engine<S> {
         let Some(row) = self.db.node_by_uid(uid)? else {
             return Ok(());
         };
+        if !row.is_file() {
+            let prefix = format!("{}/", row.local_path);
+            self.dir_ids
+                .retain(|rel, _| rel != &row.local_path && !rel.starts_with(&prefix));
+        }
         let content_abs = self.content_path(&row.local_path);
         // F7 (M4 soak find): the row's state alone can LIE — a local write
         // still inside the watcher's debounce window has not marked the row
@@ -3182,6 +3507,14 @@ fn retry_backoff(base: Duration, count: i64) -> Duration {
     (base * 2u32.pow(shift)).min(RETRY_BACKOFF_MAX)
 }
 
+/// Stable filesystem identity of a directory: `(device, inode)`. Both are
+/// unchanged by a rename or move, which is what makes rename detection
+/// possible with a debounced watcher that only reports paths.
+fn dir_identity(meta: &std::fs::Metadata) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    Some((meta.dev(), meta.ino()))
+}
+
 /// Absolute path from a root-relative '/'-separated path.
 pub fn to_abs(root: &Path, rel: &str) -> PathBuf {
     rel.split('/').fold(root.to_path_buf(), |p, c| p.join(c))
@@ -3686,7 +4019,7 @@ mod tests {
         let Some(WorkRequest::Rename(old, new)) = store.next_work_request() else {
             panic!("rename must follow the delete");
         };
-        engine.apply_local_rename(&store, &old, &new).await.unwrap();
+        engine.apply_local_rename(Some(&store), &old, &new).await.unwrap();
 
         // The tmp's node is dropped; the destination's node survives; no
         // remote rename was attempted (its name was never free).
@@ -3753,7 +4086,7 @@ mod tests {
         let Some(WorkRequest::Rename(old, new)) = store.next_work_request() else {
             panic!("rename must follow the delete");
         };
-        engine.apply_local_rename(&store, &old, &new).await.unwrap();
+        engine.apply_local_rename(Some(&store), &old, &new).await.unwrap();
 
         assert!(mock.trashed_uids().contains(&src_uid));
         let dest = engine.db.node_by_path("base.plasticity").unwrap().unwrap();
@@ -3791,7 +4124,7 @@ mod tests {
         let Some(WorkRequest::Rename(old, new)) = store.next_work_request() else {
             panic!("rename queued");
         };
-        engine.apply_local_rename(&store, &old, &new).await.unwrap();
+        engine.apply_local_rename(Some(&store), &old, &new).await.unwrap();
 
         assert_eq!(
             mock.renames(),
