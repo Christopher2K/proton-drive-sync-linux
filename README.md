@@ -117,7 +117,9 @@ transfer.
   writes the standard XDG entry
   `~/.config/autostart/proton-drive-sync.desktop`, launching
   `proton-drive-sync --minimized` a few seconds after you sign in to your
-  desktop session. Your choice is remembered in
+  desktop session. The app starts in the background with just its tray icon —
+  the dashboard window opens only when you ask for it. Your choice is
+  remembered in
   `~/.config/proton-drive-sync/app.conf`; toggling it off removes the entry
   and a later launch will not re-enable it.
 - **Tray icon** (StatusNotifierItem): a coloured dot shows syncing, paused,

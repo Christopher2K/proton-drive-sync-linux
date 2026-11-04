@@ -20,15 +20,17 @@ window with sidebar navigation (upstream `gpui 0.2`, Wayland/X11).
   `session.json`), then returns to the login view. Files on disk and the
   local state DB are kept.
 - **Background service**: the process is the sync service. It can start at
-  login (`--minimized`, installed as an XDG autostart entry) and keeps a
-  StatusNotifierItem tray icon with live state + actions. Closing the window
-  minimizes it (when a tray host exists) so sync continues; Quit stops the
-  engine gracefully. Only one instance runs per user — a second launch asks
-  the primary to show its dashboard.
+  login (`--minimized`, installed as an XDG autostart entry) in the tray
+  only — no dashboard window — and keeps a StatusNotifierItem tray icon with
+  live state + actions. Closing the window minimizes it (when a tray host
+  exists) so sync continues; Quit stops the engine gracefully. Only one
+  instance runs per user — a second launch asks the primary to show its
+  dashboard.
 
-Layout: `main.rs` (window + CLI + tray wiring) · `ui/` (pages + shell) ·
+Layout: `main.rs` (CLI + startup wiring) · `ui/` (pages + shell) ·
 `state.rs` (pure state + reducer, tested) · `engine.rs` (tokio engine thread) ·
-`tray.rs` (StatusNotifierItem, status icon, menu actions) ·
+`tray.rs` (StatusNotifierItem, status icon, menu actions, lazy dashboard
+window) ·
 `autostart.rs` (XDG login entry + persisted choice) · `instance.rs`
 (single-instance socket) · `components.rs`/`theme.rs` (design system) ·
 `actions.rs` (key bindings) · `platform.rs` (XDG paths, `xdg-open`).

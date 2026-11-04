@@ -83,10 +83,12 @@ The desktop app is the long-running sync service; there is no separate daemon.
 
 - **Start at login:** an XDG autostart entry
   (`$XDG_CONFIG_HOME/autostart/proton-drive-sync.desktop`) launches
-  `proton-drive-sync --minimized` after the graphical session comes up
-  (systemd user units are not used: the tray needs the session and the FUSE
-  mount must share the process lifetime). Installed builds enable it on
-  first run; `Settings → Startup` toggles it, and the decision is persisted
+  `proton-drive-sync --minimized` after the graphical session comes up. The
+  dashboard window is not opened: the process runs with only its tray icon
+  and creates the window on first use (tray click, menu action, or a second
+  launch). Systemd user units are not used: the tray needs the session and
+  the FUSE mount must share the process lifetime. Installed builds enable it
+  on first run; `Settings → Startup` toggles it, and the decision is persisted
   in `$XDG_CONFIG_HOME/proton-drive-sync/app.conf` so a manual removal is
   never silently undone. The `Exec=` path preserves distribution wrappers
   (`argv[0]`) so Nix/Node environment injection survives.
@@ -95,11 +97,12 @@ The desktop app is the long-running sync service; there is no separate daemon.
   paused, delete-guard, sign-in required, stopped. Menu: Open Dashboard,
   Pause/Resume, Open Sync Folder, Preferences…, Quit; primary activation
   opens the dashboard.
-- **Window lifecycle:** closing the dashboard minimizes it while the tray is
+- **Window lifecycle:** a login start (`--minimized`) opens no dashboard
+  window; it is created on first use. Closing it minimizes while the tray is
   usable (GPUI 0.2's Linux backend stops the event loop when the last window
   is destroyed, and exposes no unminimize); with no tray host the close
-  quits and login start opens the dashboard instead of hiding it. `Quit`
-  lives in the tray and in Settings.
+  quits and login start opens the dashboard instead of running windowless.
+  `Quit` lives in the tray and in Settings.
 - **Single instance:** a later launch sends `show` over
   `$XDG_RUNTIME_DIR/proton-drive-sync.sock` and exits, so two engines can
   never share one SQLite DB / FUSE mount.
