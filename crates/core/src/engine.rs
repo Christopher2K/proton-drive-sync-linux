@@ -1369,6 +1369,27 @@ impl<S: SidecarApi + 'static> Engine<S> {
         }
     }
 
+    /// Index the inode of every ancestor of `rel`. A folder created together
+    /// with its contents can miss its own watcher event (the recursive watch
+    /// is attached after the fact) while the children still arrive; without
+    /// this, a later rename of that folder looks like a delete + create and
+    /// can trip the mass-deletion guard before the destination event lands.
+    fn remember_ancestor_dir_inodes(&mut self, rel: &str) {
+        let Some((parent, _)) = rel.rsplit_once('/') else {
+            return;
+        };
+        let mut prefix = String::new();
+        for part in parent.split('/') {
+            if !prefix.is_empty() {
+                prefix.push('/');
+            }
+            prefix.push_str(part);
+            if !self.dir_ids.contains_key(&prefix) {
+                self.remember_dir_inode(&prefix);
+            }
+        }
+    }
+
     fn remember_file_inode(&mut self, rel: &str) {
         if let Ok(meta) = std::fs::metadata(to_abs(&self.root, rel))
             && meta.is_file()
@@ -1637,6 +1658,7 @@ impl<S: SidecarApi + 'static> Engine<S> {
     /// Create/write-close on a file: hash, then upload (new node or new
     /// revision) or mark dirty while paused (F4 buffering).
     async fn upsert_local_file(&mut self, rel: &str) -> Result<()> {
+        self.remember_ancestor_dir_inodes(rel);
         let abs = self.content_path(rel);
         let meta = match std::fs::metadata(&abs) {
             Ok(m) => m,
