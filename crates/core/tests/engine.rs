@@ -4,7 +4,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use pds_core::{Db, Engine, EngineConfig, EngineState, STATE_DIR};
+use pds_core::{ActivityKind, Db, Engine, EngineConfig, EngineState, STATE_DIR};
 use pds_sidecar_client::{MockHandle, MockSidecar, SidecarClient};
 use serial_test::serial;
 
@@ -1122,6 +1122,414 @@ async fn fresh_edit_heals_errored_node() {
     let row = fx.db.node_by_path("hello.txt").unwrap().unwrap();
     assert_eq!(row.sync_state, pds_core::SyncState::Synced);
     assert_eq!(fx.db.upload_error("hello.txt").unwrap(), None);
+    fx.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------
+// Remote renames / moves (TG-01, TG-02) and file <-> folder collisions
+// (TG-03), plus non-UTF-8 local names (TG-04).
+// ---------------------------------------------------------------------------
+
+/// First entry in `dir` whose name starts with `prefix` (conflict copies).
+fn entry_with_prefix(dir: &std::path::Path, prefix: &str) -> Option<std::path::PathBuf> {
+    std::fs::read_dir(dir)
+        .ok()?
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .find(|p| {
+            p.file_name()
+                .is_some_and(|n| n.to_string_lossy().starts_with(prefix))
+        })
+}
+
+/// Drain the activity receiver and return every item collected so far.
+fn drain_activity(rx: &mut tokio::sync::broadcast::Receiver<pds_core::ActivityItem>) -> Vec<pds_core::ActivityItem> {
+    let mut out = Vec::new();
+    while let Ok(item) = rx.try_recv() {
+        out.push(item);
+    }
+    out
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn remote_file_rename_rekeys_row_and_preserves_content() {
+    let fx = start().await;
+    let downloads = fx.mock.downloaded_uids().len();
+
+    fx.mock.remote_rename("node-hello", "renamed.txt");
+
+    // The row is resolved by uid and re-keyed; the old path is gone.
+    wait_for(|| {
+        fx.db
+            .node_by_path("renamed.txt")
+            .ok()
+            .flatten()
+            .is_some_and(|r| r.node_uid == "node-hello")
+            && fx.db.node_by_path("hello.txt").ok().flatten().is_none()
+    })
+    .await;
+    assert_eq!(
+        std::fs::read(fx.root.join("renamed.txt")).unwrap(),
+        b"hello drive"
+    );
+    assert!(!fx.root.join("hello.txt").exists());
+    // Hydrated content moved with the row: no re-download, no upload, no trash.
+    assert_eq!(fx.mock.downloaded_uids().len(), downloads);
+    assert_eq!(
+        fx.db
+            .all_nodes()
+            .unwrap()
+            .iter()
+            .filter(|r| r.node_uid == "node-hello")
+            .count(),
+        1,
+        "no duplicate rows for the renamed node"
+    );
+    assert!(fx.mock.trashed_uids().is_empty());
+    fx.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn remote_file_move_updates_parent_and_materializes_destination() {
+    let fx = start().await;
+    let downloads = fx.mock.downloaded_uids().len();
+
+    fx.mock.remote_move("node-hello", "node-docs");
+
+    wait_for(|| {
+        fx.db
+            .node_by_path("Documents/hello.txt")
+            .ok()
+            .flatten()
+            .is_some_and(|r| r.node_uid == "node-hello")
+            && fx.db.node_by_path("hello.txt").ok().flatten().is_none()
+    })
+    .await;
+    let row = fx.db.node_by_path("Documents/hello.txt").unwrap().unwrap();
+    assert_eq!(row.parent_uid.as_deref(), Some("node-docs"));
+    assert_eq!(
+        std::fs::read(fx.root.join("Documents/hello.txt")).unwrap(),
+        b"hello drive"
+    );
+    assert!(!fx.root.join("hello.txt").exists());
+    assert_eq!(fx.mock.downloaded_uids().len(), downloads);
+    assert!(fx.mock.trashed_uids().is_empty());
+    fx.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn remote_folder_rename_rekeys_subtree_and_preserves_nested_content() {
+    let fx = start().await;
+    fx.mock
+        .remote_create_file("node-docs", "nested.txt", b"nested bytes");
+    wait_for(|| fx.root.join("Documents/nested.txt").is_file()).await;
+    let nested_uid = fx.mock.find_uid("node-docs", "nested.txt").unwrap();
+    let downloads = fx.mock.downloaded_uids().len();
+
+    fx.mock.remote_rename("node-docs", "Docs");
+
+    wait_for(|| {
+        fx.db
+            .node_by_path("Docs/nested.txt")
+            .ok()
+            .flatten()
+            .is_some_and(|r| r.node_uid == nested_uid)
+            && fx.db.node_by_path("Documents/nested.txt").ok().flatten().is_none()
+    })
+    .await;
+    assert_eq!(
+        fx.db.node_by_path("Docs").unwrap().unwrap().node_uid,
+        "node-docs"
+    );
+    assert_eq!(
+        std::fs::read(fx.root.join("Docs/nested.txt")).unwrap(),
+        b"nested bytes"
+    );
+    assert!(!fx.root.join("Documents").exists());
+    assert_eq!(fx.mock.downloaded_uids().len(), downloads);
+    assert_eq!(
+        fx.db
+            .node_by_path("Docs/nested.txt")
+            .unwrap()
+            .unwrap()
+            .parent_uid
+            .as_deref(),
+        Some("node-docs")
+    );
+    assert!(fx.mock.trashed_uids().is_empty());
+    fx.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn remote_folder_move_rekeys_subtree_and_back_to_root() {
+    let fx = start().await;
+    fx.mock
+        .remote_create_file("node-docs", "nested.txt", b"nested bytes");
+    wait_for(|| fx.root.join("Documents/nested.txt").is_file()).await;
+    std::fs::create_dir(fx.root.join("Archive")).unwrap();
+    wait_for(|| fx.mock.find_uid("root", "Archive").is_some()).await;
+    let archive = fx.mock.find_uid("root", "Archive").unwrap();
+    let downloads = fx.mock.downloaded_uids().len();
+
+    fx.mock.remote_move("node-docs", &archive);
+    wait_for(|| {
+        fx.root.join("Archive/Documents/nested.txt").is_file()
+            && fx.db
+                .node_by_path("Archive/Documents/nested.txt")
+                .ok()
+                .flatten()
+                .is_some()
+    })
+    .await;
+    assert!(fx.db.node_by_path("Documents").unwrap().is_none());
+    assert_eq!(
+        std::fs::read(fx.root.join("Archive/Documents/nested.txt")).unwrap(),
+        b"nested bytes"
+    );
+    assert_eq!(
+        fx.db
+            .node_by_path("Archive/Documents")
+            .unwrap()
+            .unwrap()
+            .parent_uid
+            .as_deref(),
+        Some(archive.as_str())
+    );
+
+    // Moving the folder back to the root rebuilds the parent chain.
+    fx.mock.remote_move("node-docs", "root");
+    wait_for(|| {
+        fx.root.join("Documents/nested.txt").is_file()
+            && fx.db
+                .node_by_path("Documents/nested.txt")
+                .ok()
+                .flatten()
+                .is_some()
+    })
+    .await;
+    assert!(fx.db.node_by_path("Archive/Documents").unwrap().is_none());
+    assert_eq!(
+        std::fs::read(fx.root.join("Documents/nested.txt")).unwrap(),
+        b"nested bytes"
+    );
+    assert_eq!(
+        fx.db
+            .node_by_path("Documents")
+            .unwrap()
+            .unwrap()
+            .parent_uid
+            .as_deref(),
+        Some("root")
+    );
+    assert_eq!(fx.mock.downloaded_uids().len(), downloads);
+    assert!(fx.mock.trashed_uids().is_empty());
+    fx.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn remote_folder_over_local_file_keeps_both() {
+    let fx = start().await;
+    fx.handle.pause().await.unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    std::fs::write(fx.root.join("clash"), b"local file").unwrap();
+    // The watcher indexes it while paused (buffered as a dirty upload).
+    wait_for(|| fx.db.node_by_path("clash").ok().flatten().is_some()).await;
+    let mut activity = fx.handle.subscribe_activity();
+
+    fx.mock.remote_create_folder("root", "clash");
+    fx.handle.resume().await.unwrap();
+
+    wait_for(|| {
+        fx.db
+            .node_by_path("clash")
+            .ok()
+            .flatten()
+            .is_some_and(|r| !r.is_file())
+            && fx.root.join("clash").is_dir()
+            && entry_with_prefix(&fx.root, "clash (conflict ")
+                .is_some_and(|p| std::fs::read(&p).ok().as_deref() == Some(b"local file".as_slice()))
+    })
+    .await;
+    assert!(fx.mock.trashed_uids().is_empty());
+    let items = drain_activity(&mut activity);
+    assert!(
+        items.iter().any(|i| i.kind == ActivityKind::Conflict && i.path == "clash"),
+        "expected a conflict activity entry, got {items:?}"
+    );
+    fx.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn remote_file_over_local_folder_keeps_both_with_children() {
+    let fx = start().await;
+    fx.handle.pause().await.unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    std::fs::create_dir(fx.root.join("clashdir")).unwrap();
+    std::fs::write(fx.root.join("clashdir/child.txt"), b"local child").unwrap();
+    wait_for(|| {
+        fx.db
+            .node_by_path("clashdir/child.txt")
+            .ok()
+            .flatten()
+            .is_some()
+    })
+    .await;
+    let mut activity = fx.handle.subscribe_activity();
+
+    fx.mock
+        .remote_create_file("root", "clashdir", b"remote file bytes");
+    fx.handle.resume().await.unwrap();
+
+    wait_for(|| {
+        fx.root.join("clashdir").is_file()
+            && fx.db
+                .node_by_path("clashdir")
+                .ok()
+                .flatten()
+                .is_some_and(|r| r.is_file())
+            && entry_with_prefix(&fx.root, "clashdir (conflict ").is_some_and(|p| {
+                p.is_dir()
+                    && std::fs::read(p.join("child.txt")).ok().as_deref()
+                        == Some(b"local child".as_slice())
+            })
+    })
+    .await;
+    assert_eq!(
+        std::fs::read(fx.root.join("clashdir")).unwrap(),
+        b"remote file bytes"
+    );
+    // The nested child followed its renamed parent (same uid).
+    let conflict_dir = entry_with_prefix(&fx.root, "clashdir (conflict ").unwrap();
+    let conflict_name = conflict_dir.file_name().unwrap().to_string_lossy();
+    let child_row = fx
+        .db
+        .node_by_path(&format!("{conflict_name}/child.txt"))
+        .unwrap()
+        .expect("child row follows the folder rename");
+    let conflict_uid = fx
+        .db
+        .node_by_path(&conflict_name)
+        .unwrap()
+        .expect("conflict folder row")
+        .node_uid;
+    assert_eq!(child_row.parent_uid.as_deref(), Some(conflict_uid.as_str()));
+    assert!(fx.mock.trashed_uids().is_empty());
+    let items = drain_activity(&mut activity);
+    assert!(
+        items
+            .iter()
+            .any(|i| i.kind == ActivityKind::Conflict && i.path == "clashdir"),
+        "expected a conflict activity entry, got {items:?}"
+    );
+    fx.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn remote_rename_onto_existing_local_path_keeps_both() {
+    let fx = start().await;
+    std::fs::write(fx.root.join("occupied.txt"), b"local occupant").unwrap();
+    wait_for_synced(&fx.db, "occupied.txt").await;
+    let occupant_uid = fx.mock.find_uid("root", "occupied.txt").unwrap();
+    let downloads = fx.mock.downloaded_uids().len();
+
+    fx.mock.remote_rename("node-hello", "occupied.txt");
+
+    // The renamed remote node takes its new path; the local occupant is
+    // renamed aside, never clobbered.
+    wait_for(|| {
+        fx.db
+            .node_by_path("occupied.txt")
+            .ok()
+            .flatten()
+            .is_some_and(|r| r.node_uid == "node-hello")
+            && entry_with_prefix(&fx.root, "occupied (conflict ")
+                .is_some_and(|p| std::fs::read(&p).ok().as_deref() == Some(b"local occupant".as_slice()))
+    })
+    .await;
+    assert_eq!(
+        std::fs::read(fx.root.join("occupied.txt")).unwrap(),
+        b"hello drive"
+    );
+    let conflict = entry_with_prefix(&fx.root, "occupied (conflict ").unwrap();
+    assert_eq!(std::fs::read(&conflict).unwrap(), b"local occupant");
+    let occupant_row = fx.db.node_by_uid(&occupant_uid).unwrap().unwrap();
+    assert!(
+        occupant_row.local_path.starts_with("occupied (conflict "),
+        "occupant row re-keyed to {}, got {}",
+        conflict.display(),
+        occupant_row.local_path
+    );
+    assert_eq!(fx.mock.downloaded_uids().len(), downloads);
+    assert!(fx.mock.trashed_uids().is_empty());
+    fx.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn non_utf8_filename_is_skipped_and_reported_once() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    let fx = start().await;
+    let mut activity = fx.handle.subscribe_activity();
+    let bad = fx.root.join(OsStr::from_bytes(b"bad\xffname.txt"));
+    std::fs::write(&bad, b"not representable").unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut report = None;
+    while Instant::now() < deadline {
+        for item in drain_activity(&mut activity) {
+            if item.kind == ActivityKind::Skipped && item.path.contains("bad") {
+                report = Some(item);
+            }
+        }
+        if report.is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let report = report.expect("non-UTF-8 filename must surface in activity");
+    assert!(
+        report
+            .detail
+            .as_deref()
+            .is_some_and(|d| d.contains("ff") && d.to_ascii_lowercase().contains("hex")),
+        "raw bytes must be visible as hex, got {:?}",
+        report.detail
+    );
+    // The item survives untouched: never uploaded, never deleted.
+    assert_eq!(std::fs::read(&bad).unwrap(), b"not representable");
+    assert!(
+        !fx.mock
+            .uploaded_names()
+            .iter()
+            .any(|n| n.contains("bad") || n.contains('\u{fffd}')),
+        "non-UTF-8 file must not be uploaded"
+    );
+    assert!(fx.db.tombstones().unwrap().is_empty());
+
+    // Settle: the warning is once per path, not once per watcher batch.
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    let repeats = drain_activity(&mut activity)
+        .into_iter()
+        .filter(|i| i.kind == ActivityKind::Skipped && i.path.contains("bad"))
+        .count();
+    assert_eq!(repeats, 0, "non-UTF-8 warning repeated for the same path");
+
+    // Engine stays healthy and keeps syncing normal files.
+    std::fs::write(fx.root.join("normal.txt"), b"normal").unwrap();
+    wait_for(|| fx.mock.uploaded_names().contains(&"normal.txt".to_string())).await;
+    assert_eq!(
+        fx.handle.status().await.unwrap().state,
+        EngineState::Running
+    );
     fx.shutdown().await;
 }
 

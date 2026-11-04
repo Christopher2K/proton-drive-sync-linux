@@ -1017,6 +1017,7 @@ pub(crate) fn kind_color(kind: pds_core::ActivityKind) -> u32 {
         ActivityKind::Trashed => theme::MUTED,
         ActivityKind::Conflict => theme::WARN,
         ActivityKind::GuardPaused | ActivityKind::UploadErrored => theme::DANGER,
+        ActivityKind::Skipped => theme::WARN,
     }
 }
 

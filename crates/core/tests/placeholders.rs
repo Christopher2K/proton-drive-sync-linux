@@ -717,6 +717,70 @@ async fn evicted_placeholder_rehydrates_on_request() {
     fx.shutdown().await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn remote_folder_rename_moves_hydrated_backing_subtree() {
+    let fx = start().await;
+    wait_for(|| fx.store.snapshot().by_path.contains_key("hello.txt")).await;
+    fx.mock
+        .remote_create_file("node-docs", "nested.txt", b"nested bytes");
+    wait_for(|| {
+        fx.store
+            .snapshot()
+            .by_path
+            .contains_key("Documents/nested.txt")
+    })
+    .await;
+    assert!(fx.store.begin_hydrate("Documents/nested.txt"));
+    wait_for(|| {
+        fx.store
+            .snapshot()
+            .by_path
+            .get("Documents/nested.txt")
+            .is_some_and(|n| n.content_ready)
+    })
+    .await;
+    let downloads = fx.mock.downloaded_uids().len();
+
+    fx.mock.remote_rename("node-docs", "Docs");
+
+    // The snapshot re-keys with the row; the hydrated backing file moved
+    // under the new prefix, so the rename never re-downloads.
+    wait_for(|| {
+        fx.store
+            .snapshot()
+            .by_path
+            .get("Docs/nested.txt")
+            .is_some_and(|n| n.content_ready)
+            && !fx
+                .store
+                .snapshot()
+                .by_path
+                .contains_key("Documents/nested.txt")
+    })
+    .await;
+    let backing = fx
+        .store
+        .backing_path("Docs/nested.txt")
+        .expect("backing entry follows the folder rename");
+    assert_eq!(std::fs::read(&backing).unwrap(), b"nested bytes");
+    assert!(fx.store.backing_path("Documents/nested.txt").is_none());
+    assert_eq!(fx.mock.downloaded_uids().len(), downloads);
+
+    let db = pds_core::Db::open(&fx.root.join(STATE_DIR).join("state.db")).unwrap();
+    assert_eq!(
+        db.node_by_path("Docs/nested.txt")
+            .unwrap()
+            .expect("child row re-keyed")
+            .parent_uid
+            .as_deref(),
+        Some("node-docs")
+    );
+    assert!(db.node_by_path("Documents/nested.txt").unwrap().is_none());
+    assert!(fx.mock.trashed_uids().is_empty());
+    fx.shutdown().await;
+}
+
 // Keep imports honest even if a test is skipped.
 #[allow(dead_code)]
 fn _t(_: HashMap<String, String>) {}
