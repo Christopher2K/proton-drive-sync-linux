@@ -238,8 +238,9 @@ fn open_window(cx: &mut App, view: Entity<AppView>) -> anyhow::Result<WindowHand
     let handle = cx.open_window(options, move |window, cx| {
         window.focus(window_view.read(cx).focus_handle());
 
-        // Closing the dashboard puts the app back in the tray; only the
-        // tray's Quit (or the in-app quit buttons) actually stops sync.
+        // Closing the dashboard puts the app back in the tray where
+        // minimizing is reliable (X11); elsewhere closing stops sync, as the
+        // tray's Quit (or the in-app quit buttons) would.
         let weak = window_view.downgrade();
         window.on_window_should_close(cx, move |window, cx| {
             let quitting = weak
@@ -248,11 +249,11 @@ fn open_window(cx: &mut App, view: Entity<AppView>) -> anyhow::Result<WindowHand
             if quitting {
                 return false;
             }
-            if crate::ui::close_hides(window, cx) {
+            if crate::ui::close_hides(cx) {
                 window.minimize_window();
             } else {
-                // No tray to restore from, or no minimized state on this
-                // compositor: closing means quit.
+                // No tray to restore from, or a compositor whose minimize is
+                // not trustworthy (Wayland): closing means quit.
                 let _ = weak.update(cx, |view, cx| view.request_quit(cx));
             }
             false
