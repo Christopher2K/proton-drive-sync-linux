@@ -92,7 +92,10 @@ impl ActivityFilter {
             ActivityFilter::Deletes => kind == ActivityKind::Trashed,
             ActivityFilter::Conflicts => kind == ActivityKind::Conflict,
             ActivityFilter::Problems => {
-                matches!(kind, ActivityKind::UploadErrored | ActivityKind::GuardPaused)
+                matches!(
+                    kind,
+                    ActivityKind::UploadErrored | ActivityKind::GuardPaused | ActivityKind::Skipped
+                )
             }
         }
     }
@@ -433,6 +436,7 @@ pub fn kind_label(kind: ActivityKind) -> &'static str {
         ActivityKind::Conflict => "Conflict",
         ActivityKind::GuardPaused => "Guard paused",
         ActivityKind::UploadErrored => "Upload error",
+        ActivityKind::Skipped => "Skipped",
     }
 }
 

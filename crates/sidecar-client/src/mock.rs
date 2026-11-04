@@ -209,6 +209,83 @@ impl MockHandle {
         }));
     }
 
+    /// Rename a remote node in place and emit a `node_updated` event, as if
+    /// another client renamed it.
+    pub fn remote_rename(&self, uid: &str, new_name: &str) {
+        let mut st = self.state.lock().unwrap();
+        if let Some(n) = st.nodes.get_mut(uid) {
+            n.name = new_name.to_string();
+        }
+        let event_id = st.alloc_event_id();
+        let scope = st.scope_id.clone();
+        st.emit(json!({
+            "scopeId": scope,
+            "eventId": event_id,
+            "type": "node_updated",
+            "nodeUid": uid,
+        }));
+    }
+
+    /// Move a remote node under `new_parent_uid` and emit a `node_updated`
+    /// event, as if another client moved it.
+    pub fn remote_move(&self, uid: &str, new_parent_uid: &str) {
+        let mut st = self.state.lock().unwrap();
+        if let Some(n) = st.nodes.get_mut(uid) {
+            n.parent_uid = Some(new_parent_uid.to_string());
+        }
+        let event_id = st.alloc_event_id();
+        let scope = st.scope_id.clone();
+        st.emit(json!({
+            "scopeId": scope,
+            "eventId": event_id,
+            "type": "node_updated",
+            "nodeUid": uid,
+        }));
+    }
+
+    /// Inject a remote folder under `parent_uid` and emit a `node_created`
+    /// event, as if another client created it. Returns its uid.
+    pub fn remote_create_folder(&self, parent_uid: &str, name: &str) -> String {
+        let mut st = self.state.lock().unwrap();
+        let uid = st.alloc_uid();
+        st.nodes.insert(
+            uid.clone(),
+            MockNode {
+                uid: uid.clone(),
+                parent_uid: Some(parent_uid.to_string()),
+                name: name.to_string(),
+                kind: "folder",
+                size: None,
+                mtime: Some(1_700_000_000),
+                sha1: None,
+                content: None,
+                trashed: false,
+            },
+        );
+        let event_id = st.alloc_event_id();
+        let scope = st.scope_id.clone();
+        st.emit(json!({
+            "scopeId": scope,
+            "eventId": event_id,
+            "type": "node_created",
+            "nodeUid": uid,
+            "parentNodeUid": parent_uid,
+        }));
+        uid
+    }
+
+    /// Uids passed to `drive.download`, in call order.
+    pub fn downloaded_uids(&self) -> Vec<String> {
+        self.state
+            .lock()
+            .unwrap()
+            .calls
+            .iter()
+            .filter(|(m, _)| m == "download")
+            .flat_map(|(_, u)| u.clone())
+            .collect()
+    }
+
     /// Emit a `node_deleted` event for a uid and remove it remotely.
     pub fn remote_delete(&self, uid: &str) {
         let mut st = self.state.lock().unwrap();
@@ -737,6 +814,7 @@ impl MockSidecar {
             "drive.download" => {
                 let mut st = self.state.lock().unwrap();
                 st.next_transfer += 1;
+                st.calls.push(("download".into(), vec![pstr("nodeUid")]));
                 let transfer_id = format!("transfer-{}", st.next_transfer);
                 let content = st
                     .nodes

@@ -145,6 +145,9 @@ pub enum ActivityKind {
     GuardPaused,
     /// Upload failed terminally (non-retryable, or retries exhausted).
     UploadErrored,
+    /// A local item cannot be represented remotely (e.g. a non-UTF-8
+    /// filename) and was deliberately left alone (never uploaded/deleted).
+    Skipped,
 }
 
 /// A user-facing activity entry emitted by the engine. Broadcast to
@@ -442,6 +445,10 @@ pub struct Engine<S: SidecarApi> {
     watcher_ready: Arc<AtomicBool>,
     /// Activity feed broadcast (UI); sends are no-ops without receivers.
     activity_tx: broadcast::Sender<ActivityItem>,
+    /// Raw relative paths of non-UTF-8 items already surfaced in the
+    /// activity feed — the warning is emitted once per path, not once per
+    /// watcher batch.
+    non_utf8_reported: HashSet<Vec<u8>>,
 }
 
 impl<S: SidecarApi + 'static> Engine<S> {
@@ -524,6 +531,7 @@ impl<S: SidecarApi + 'static> Engine<S> {
             started: AtomicBool::new(false),
             watcher_ready: watcher_ready.clone(),
             activity_tx: activity_tx.clone(),
+            non_utf8_reported: HashSet::new(),
         };
         Ok((
             engine,
@@ -722,6 +730,26 @@ impl<S: SidecarApi + 'static> Engine<S> {
             path: path.to_string(),
             detail,
         });
+    }
+
+    /// Surface a filename the Drive protocol cannot carry (invalid UTF-8)
+    /// and leave it untouched: never uploaded, never deleted. Emitted once
+    /// per raw path — watcher batches repeat the same entry otherwise. The
+    /// raw bytes are shown lossily plus as hex so the user can find the file.
+    fn report_non_utf8(&mut self, raw: &[u8]) {
+        if !self.non_utf8_reported.insert(raw.to_vec()) {
+            return;
+        }
+        let lossy = String::from_utf8_lossy(raw);
+        let hex: String = raw.iter().map(|b| format!("{b:02x}")).collect();
+        warn!(path = %lossy, hex = %hex, "skipping non-UTF-8 filename");
+        self.emit_activity(
+            ActivityKind::Skipped,
+            &lossy,
+            Some(format!(
+                "non-UTF-8 filename (hex {hex}); left untouched, not uploaded or deleted"
+            )),
+        );
     }
 
     async fn main_loop(&mut self, fs_rx: &mut mpsc::Receiver<Vec<DebouncedEvent>>) -> Result<()> {
@@ -1002,8 +1030,13 @@ impl<S: SidecarApi + 'static> Engine<S> {
             let mut dirs = Vec::new();
             for entry in std::fs::read_dir(&d)? {
                 let path = entry?.path();
-                let Some(rel) = to_rel(&self.root, &path) else {
-                    continue;
+                let rel = match to_rel_checked(&self.root, &path) {
+                    RelCheck::Valid(rel) => rel,
+                    RelCheck::NotUtf8(raw) => {
+                        self.report_non_utf8(&raw);
+                        continue;
+                    }
+                    RelCheck::Outside => continue,
                 };
                 if is_internal_path(&rel) {
                     continue;
@@ -1035,8 +1068,13 @@ impl<S: SidecarApi + 'static> Engine<S> {
         let mut seen = HashSet::new();
         for ev in events {
             let path = ev.path;
-            let Some(rel) = to_rel(&self.root, &path) else {
-                continue;
+            let rel = match to_rel_checked(&self.root, &path) {
+                RelCheck::Valid(rel) => rel,
+                RelCheck::NotUtf8(raw) => {
+                    self.report_non_utf8(&raw);
+                    continue;
+                }
+                RelCheck::Outside => continue,
             };
             if rel.is_empty() || is_internal_path(&rel) {
                 continue;
@@ -1081,13 +1119,25 @@ impl<S: SidecarApi + 'static> Engine<S> {
     /// are not already in `seen`. Recovers the inotify recursive-watch race:
     /// contents created in the same breath as their parent folder never
     /// produce watcher events of their own.
-    fn sweep_new_dir(&self, rel: &str, seen: &mut HashSet<String>, queue: &mut Vec<(String, bool)>) {
+    fn sweep_new_dir(
+        &mut self,
+        rel: &str,
+        seen: &mut HashSet<String>,
+        queue: &mut Vec<(String, bool)>,
+    ) {
         let entries = match std::fs::read_dir(to_abs(&self.root, rel)) {
             Ok(entries) => entries,
             Err(_) => return, // vanished or unreadable: nothing to recover
         };
         for entry in entries.flatten() {
-            let child_rel = format!("{rel}/{}", entry.file_name().to_string_lossy());
+            let child_rel = match to_rel_checked(&self.root, &entry.path()) {
+                RelCheck::Valid(rel) => rel,
+                RelCheck::NotUtf8(raw) => {
+                    self.report_non_utf8(&raw);
+                    continue;
+                }
+                RelCheck::Outside => continue,
+            };
             if is_internal_path(&child_rel) {
                 continue;
             }
@@ -1894,6 +1944,23 @@ impl<S: SidecarApi + 'static> Engine<S> {
             }
         };
         let rel = self.local_path_for(&node)?;
+        // Resolve by node uid FIRST: a remote rename/move changes the path
+        // derived from the node's current name/parent, while the DB row (and
+        // its hydrated content) still sits at the old path. Without this the
+        // upsert below hits the `node_uid` UNIQUE constraint and the old
+        // path stays stale forever (TG-01/TG-02).
+        let existing = self.db.node_by_uid(uid)?;
+        let relocating = existing
+            .as_ref()
+            .is_some_and(|row| row.local_path != rel);
+        // Never overwrite whatever already lives at the destination
+        // (different node, or a file/folder type clash): keep both (F7).
+        self.clear_remote_path(&node, &rel, relocating).await?;
+        if let Some(old) = &existing
+            && relocating
+        {
+            self.rekey_remote_node(old, &node, &rel).await?;
+        }
         let abs = to_abs(&self.root, &rel);
 
         if node.is_folder() {
@@ -1943,6 +2010,216 @@ impl<S: SidecarApi + 'static> Engine<S> {
             std::fs::create_dir_all(dir)?;
         }
         self.download_file(uid, &rel).await
+    }
+
+    /// Free `rel` for an incoming remote node. A different tracked node, or
+    /// local content of the opposite type (file vs folder), is renamed aside
+    /// with the F7 keep-both convention — the remote node keeps the original
+    /// name, matching the existing event-application conflict policy. Never
+    /// destroys either side.
+    async fn clear_remote_path(
+        &mut self,
+        node: &Node,
+        rel: &str,
+        relocating: bool,
+    ) -> Result<()> {
+        let row_at = self.db.node_by_path(rel)?;
+        if row_at
+            .as_ref()
+            .is_some_and(|row| row.node_uid == node.uid)
+        {
+            return Ok(()); // this IS the node: a normal update in place
+        }
+        let abs = self.content_path(rel);
+        let type_clash = if node.is_folder() {
+            abs.is_file()
+        } else {
+            abs.is_dir()
+        };
+        // A move/rename must not land on anything already at the
+        // destination; an in-place create only conflicts on a different
+        // tracked node or a type mismatch (an existing folder dir is the
+        // normal first-run state).
+        let row_clash = row_at.is_some();
+        let dest_taken = relocating && abs.exists();
+        if row_clash || type_clash || dest_taken {
+            let conflict = self.rename_local_for_conflict(rel, &node.uid).await?;
+            warn!(
+                path = %rel,
+                conflict = %conflict,
+                "remote node collides with local path: keeping both"
+            );
+            self.emit_activity(
+                ActivityKind::Conflict,
+                rel,
+                Some(format!("kept both; local copy renamed to {conflict}")),
+            );
+        }
+        Ok(())
+    }
+
+    /// Rename a local file or folder (and its whole tracked subtree) aside
+    /// to a conflict name, moving hydrated content with it. A node with a
+    /// real remote uid is renamed remotely as well so the remote tree keeps
+    /// agreeing with the local paths; never-synced rows follow the rename
+    /// as dirty pending uploads.
+    async fn rename_local_for_conflict(
+        &mut self,
+        rel: &str,
+        incoming_uid: &str,
+    ) -> Result<String> {
+        let new_rel = local_free_conflict_rel_in(&self.db, self.content_dir(), rel)?;
+        let from = self.content_path(rel);
+        let to = self.content_path(&new_rel);
+        if from.exists() {
+            if let Some(dir) = to.parent() {
+                std::fs::create_dir_all(dir)?;
+            }
+            std::fs::rename(&from, &to)?;
+        }
+
+        let mut rows = self.db.nodes_under(&format!("{rel}/%"))?;
+        if let Some(row) = self.db.node_by_path(rel)? {
+            rows.push(row);
+        }
+        let new_name = new_rel
+            .rsplit('/')
+            .next()
+            .unwrap_or(&new_rel)
+            .to_string();
+        let mut moves = Vec::with_capacity(rows.len());
+        for mut row in rows {
+            let old_path = row.local_path.clone();
+            let was_root = old_path == rel;
+            row.local_path = if was_root {
+                new_rel.clone()
+            } else {
+                format!("{new_rel}/{}", &old_path[rel.len() + 1..])
+            };
+            if was_root {
+                row.name = new_name.clone();
+            }
+            // The conflict copy is local content the remote does not know
+            // under that name: let it upload if it has pending changes.
+            if row.sync_state != SyncState::Synced {
+                row.sync_state = SyncState::Dirty;
+            }
+            moves.push((old_path, row));
+        }
+        if !moves.is_empty() {
+            self.db.rekey_nodes(&moves)?;
+        }
+
+        if let Some(mut row) = self.db.node_by_path(&new_rel)? {
+            if row.node_uid == incoming_uid {
+                // The remote node changed type in place (same uid): the
+                // displaced local content cannot keep that identity, so it
+                // re-uploads as a new node under the conflict name.
+                row.node_uid = format!("pending:{new_rel}");
+                row.sync_state = SyncState::Dirty;
+                self.db.upsert_node(&row)?;
+            } else if !row.node_uid.starts_with("pending:") {
+                // Keep the local node's identity (uid, revisions, share
+                // links) and rename it remotely too.
+                if let Err(e) = self.sidecar.rename_node(&row.node_uid, &new_name).await {
+                    warn!(
+                        path = %new_rel,
+                        error = %e,
+                        "remote rename for conflict failed; local copy kept"
+                    );
+                }
+            } else {
+                row.node_uid = format!("pending:{new_rel}");
+                row.sync_state = SyncState::Dirty;
+                self.db.upsert_node(&row)?;
+            }
+        }
+
+        if let Some(store) = &self.store {
+            store.forget_tree(rel);
+            let like = format!("{new_rel}/%");
+            for child in self.db.nodes_under(&like)? {
+                let abs = self.content_path(&child.local_path);
+                if abs.is_file() {
+                    store.set_backing(&child.local_path, abs);
+                }
+            }
+            if to.is_file() {
+                store.set_backing(&new_rel, to);
+            }
+        }
+        info!(from = %rel, to = %new_rel, "local item renamed aside for conflict");
+        Ok(new_rel)
+    }
+
+    /// Re-key a remote node (and, for folders, every descendant) from its
+    /// old local path to the path derived from its current remote name and
+    /// parent. Hydrated content moves with it, so a rename never triggers a
+    /// re-download; the VFS snapshot is republished by the caller.
+    async fn rekey_remote_node(
+        &mut self,
+        old: &NodeRow,
+        node: &Node,
+        new_rel: &str,
+    ) -> Result<()> {
+        let old_rel = old.local_path.clone();
+        let mut rows = if old.is_file() {
+            Vec::new()
+        } else {
+            self.db.nodes_under(&format!("{old_rel}/%"))?
+        };
+        rows.push(old.clone());
+        let mut moves = Vec::with_capacity(rows.len());
+        for mut row in rows {
+            let old_path = row.local_path.clone();
+            let was_root = old_path == old_rel;
+            row.local_path = if was_root {
+                new_rel.to_string()
+            } else {
+                format!("{new_rel}/{}", &old_path[old_rel.len() + 1..])
+            };
+            if was_root {
+                // Relocation only: content metadata stays as-is so a rename
+                // combined with a remote content change still compares the
+                // real local hash against the remote head and downloads the
+                // new bytes (a pure rename keeps the matching hash and skips
+                // the re-download).
+                row.name = node.name.clone();
+                row.parent_uid = node.parent_uid.clone();
+                row.kind = node.kind;
+            }
+            moves.push((old_path, row));
+        }
+        // One transaction: a crash can never leave both the old and the new
+        // path rows (or a half-moved folder subtree) behind.
+        self.db.rekey_nodes(&moves)?;
+
+        // Move the hydrated copy (visible root in mirror mode, backing cache
+        // in placeholder mode). The row paths moved first, so a failure here
+        // simply re-downloads instead of losing the node.
+        let from = self.content_path(&old_rel);
+        let to = self.content_path(new_rel);
+        if from.exists() {
+            if let Some(dir) = to.parent() {
+                std::fs::create_dir_all(dir)?;
+            }
+            std::fs::rename(&from, &to)?;
+        }
+        if let Some(store) = &self.store {
+            store.forget_tree(&old_rel);
+            let like = format!("{new_rel}/%");
+            for child in self.db.nodes_under(&like)? {
+                let abs = self.content_path(&child.local_path);
+                if abs.is_file() {
+                    store.set_backing(&child.local_path, abs);
+                }
+            }
+            if to.is_file() {
+                store.set_backing(new_rel, to);
+            }
+        }
+        info!(from = %old_rel, to = %new_rel, uid = %node.uid, "remote rename/move applied");
+        Ok(())
     }
 
     /// Compute the local relative path for a remote node by walking parent
@@ -2908,6 +3185,35 @@ fn retry_backoff(base: Duration, count: i64) -> Duration {
 /// Absolute path from a root-relative '/'-separated path.
 pub fn to_abs(root: &Path, rel: &str) -> PathBuf {
     rel.split('/').fold(root.to_path_buf(), |p, c| p.join(c))
+}
+
+/// Relative-path classification: the Drive protocol only carries UTF-8
+/// names, so an invalid filename must be reported (never silently dropped).
+enum RelCheck {
+    Valid(String),
+    NotUtf8(Vec<u8>),
+    Outside,
+}
+
+/// Like [`to_rel`], but distinguishes a non-UTF-8 filename (returning its
+/// raw bytes) from a path outside the root. The sync pipeline uses this at
+/// every local scan/watch site so such items are surfaced once and skipped.
+fn to_rel_checked(root: &Path, path: &Path) -> RelCheck {
+    use std::os::unix::ffi::OsStrExt;
+    let Ok(rel) = path.strip_prefix(root) else {
+        return RelCheck::Outside;
+    };
+    let mut parts = Vec::new();
+    for component in rel.components() {
+        let std::path::Component::Normal(name) = component else {
+            continue;
+        };
+        let Some(name) = name.to_str() else {
+            return RelCheck::NotUtf8(rel.as_os_str().as_bytes().to_vec());
+        };
+        parts.push(name.to_string());
+    }
+    RelCheck::Valid(parts.join("/"))
 }
 
 /// Root-relative '/'-separated path, or None if outside root.

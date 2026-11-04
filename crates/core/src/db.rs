@@ -260,6 +260,39 @@ impl Db {
         Ok(())
     }
 
+    /// Re-key a set of rows: `moves` is `(old_local_path, new_row)`. Every
+    /// old path is deleted and every new row inserted in ONE transaction, so
+    /// a crash can never leave a half-moved subtree (duplicate or missing
+    /// paths). Fails — and rolls back everything — if a destination path or
+    /// node uid is still occupied.
+    pub fn rekey_nodes(&self, moves: &[(String, NodeRow)]) -> rusqlite::Result<()> {
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+        for (old, _) in moves {
+            tx.execute("DELETE FROM nodes WHERE local_path=?1", params![old])?;
+        }
+        for (_, row) in moves {
+            tx.execute(
+                "INSERT INTO nodes (local_path, node_uid, parent_uid, name, kind, size, sha1, mtime, sync_state, pinned, synced_sha1)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
+                params![
+                    row.local_path,
+                    row.node_uid,
+                    row.parent_uid,
+                    row.name,
+                    match row.kind { NodeKind::File => "file", NodeKind::Folder => "folder" },
+                    row.size,
+                    row.sha1,
+                    row.mtime,
+                    row.sync_state.as_str(),
+                    row.pinned as i64,
+                    row.synced_sha1,
+                ],
+            )?;
+        }
+        tx.commit()
+    }
+
     pub fn set_sync_state(&self, local_path: &str, state: SyncState) -> rusqlite::Result<()> {
         self.lock().execute(
             "UPDATE nodes SET sync_state=?2 WHERE local_path=?1",
@@ -561,5 +594,55 @@ impl Db {
         self.lock()
             .execute("DELETE FROM meta WHERE key=?1", params![key])?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn row(local_path: &str, uid: &str) -> NodeRow {
+        NodeRow {
+            local_path: local_path.to_string(),
+            node_uid: uid.to_string(),
+            parent_uid: Some("root".into()),
+            name: local_path.rsplit('/').next().unwrap_or(local_path).to_string(),
+            kind: NodeKind::File,
+            size: None,
+            sha1: None,
+            mtime: None,
+            sync_state: SyncState::Synced,
+            pinned: false,
+            synced_sha1: None,
+        }
+    }
+
+    #[test]
+    fn rekey_nodes_is_all_or_nothing() {
+        let db = Db::open_memory().unwrap();
+        db.upsert_node(&row("a.txt", "uid-a")).unwrap();
+        db.upsert_node(&row("b.txt", "uid-b")).unwrap();
+
+        // Two rows moved onto the same destination: the insert conflicts and
+        // the whole transaction must roll back (the old paths stay intact).
+        let bad = vec![
+            ("a.txt".to_string(), row("dest.txt", "uid-a")),
+            ("b.txt".to_string(), row("dest.txt", "uid-b")),
+        ];
+        assert!(db.rekey_nodes(&bad).is_err());
+        assert!(db.node_by_path("a.txt").unwrap().is_some());
+        assert!(db.node_by_path("b.txt").unwrap().is_some());
+        assert!(db.node_by_path("dest.txt").unwrap().is_none());
+
+        // A valid multi-row re-key moves every row atomically.
+        let good = vec![
+            ("a.txt".to_string(), row("c.txt", "uid-a")),
+            ("b.txt".to_string(), row("d.txt", "uid-b")),
+        ];
+        db.rekey_nodes(&good).unwrap();
+        assert!(db.node_by_path("a.txt").unwrap().is_none());
+        assert!(db.node_by_path("b.txt").unwrap().is_none());
+        assert_eq!(db.node_by_path("c.txt").unwrap().unwrap().node_uid, "uid-a");
+        assert_eq!(db.node_by_path("d.txt").unwrap().unwrap().node_uid, "uid-b");
     }
 }
