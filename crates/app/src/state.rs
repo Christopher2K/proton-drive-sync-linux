@@ -369,6 +369,10 @@ pub fn apply(state: &mut AppState, update: &AppUpdate) {
             state.phase = Phase::Failed;
             state.fatal = Some(error.clone());
             state.sign_out = SignOutState::None;
+            // A failure aborts any pending mode-switch restart: otherwise a
+            // later Exited would still be treated as an expected restart and
+            // silently start a second engine.
+            state.mode_switch = ModeSwitchState::None;
         }
         AppUpdate::SignedOut => {
             // Back to a pristine signed-out state so another account can sign
@@ -637,6 +641,26 @@ mod tests {
         assert_eq!(s.phase, Phase::Starting);
         assert_eq!(s.mode_switch, ModeSwitchState::None);
         assert!(s.fatal.is_none());
+    }
+
+    #[test]
+    fn failure_during_mode_switch_cancels_the_expected_restart() {
+        let mut s = AppState::new(PathBuf::from("/tmp/root"));
+        apply(&mut s, &AppUpdate::EngineStarted);
+        s.open_mode_switch(SyncMode::Mirror);
+        s.mode_switch = ModeSwitchState::InProgress(SyncMode::Mirror);
+
+        // A fatal error while the restart is in flight must not leave the
+        // state machine believing the next Exited is an expected restart.
+        apply(
+            &mut s,
+            &AppUpdate::Failed {
+                error: "restart failed".into(),
+            },
+        );
+        assert_eq!(s.phase, Phase::Failed);
+        assert_eq!(s.mode_switch, ModeSwitchState::None);
+        assert_eq!(s.fatal.as_deref(), Some("restart failed"));
     }
 
     #[test]

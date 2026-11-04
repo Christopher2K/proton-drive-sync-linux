@@ -77,7 +77,7 @@ Sidecar consumes the SDK event stream; host applies create/update/trash events t
 
 ### F7 — Conflicts
 
-Keep-both: the losing version is renamed `name (conflict YYYY-MM-DD HHmm).ext`; no silent overwrites in either direction.
+Keep-both: the losing version is renamed `name (conflict YYYY-MM-DD HHmm).ext`; no silent overwrites in either direction. The timestamp is generated in UTC so a DST fold or a backwards clock correction cannot reuse a name; dedup is existence-based, so conflict copies from older local-time builds remain valid and are never overwritten.
 
 ### F8 — Background service, start at login, tray (M5 ✅ 2026-10-31)
 
