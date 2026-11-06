@@ -21,7 +21,7 @@ A **Linux** desktop app that syncs a folder with [Proton Drive](https://proton.m
 - **Product spec:** [SPEC.md](SPEC.md) — source of truth
 - **Agent notes:** [AGENT.md](AGENT.md)
 
-Stack: Rust + GPUI (native Linux desktop UI) · Node.js sidecar running the official [Proton Drive SDK](https://github.com/ProtonDriveApps/sdk) · SQLite state. (macOS and Windows were supported in an earlier iteration and have been dropped.)
+Stack: MyGo-native Linux UI shell (`mygo-shell/`) · Rust headless sync engine (`crates/engine-headless/`) · Node.js sidecar running the official [Proton Drive SDK](https://github.com/ProtonDriveApps/sdk) · SQLite state. (macOS and Windows were supported in an earlier iteration and have been dropped; the previous GPUI app is preserved in-tree as a reference.)
 
 ## Read this first (important)
 
@@ -64,9 +64,9 @@ deletes from Drive.
 
 ### Native desktop integration
 
-- Single main window with **Overview**, **Activity**, **Conflicts**, and **Settings** pages.
-- Optional **start at login** via XDG autostart.
-- **Tray icon** with status dot, pause/resume, open folder, and quit.
+- Single MyGo-native main window with **Overview**, **Activity**, **Conflicts**, and **Settings** pages.
+- Optional **start at login** via the platform login-items / XDG autostart API.
+- **Tray icon** with status dot, pause/resume, open folder, preferences, and quit.
 - Closing the dashboard hides the app to the tray; sync keeps running.
 
 ### CLI companion
@@ -99,10 +99,15 @@ nix profile install github:Christopher2K/proton-drive-sync-linux
 # 1. Enter the pinned development environment
 devenv shell
 
-# 2. Build
-cargo build --release -p pds-app -p pds-cli
+# 2. Build the Rust headless engine
+cargo build --release -p pds-engine-headless -p pds-cli
 
-# 3. Install system-wide (or PREFIX=$HOME/.local for a user install)
+# 3. Build the MyGo UI shell
+cd mygo-shell
+go build -o proton-drive-sync .
+cd ..
+
+# 4. Install system-wide (or PREFIX=$HOME/.local for a user install)
 sudo packaging/linux/install.sh
 ```
 
@@ -152,16 +157,25 @@ cannot provide; the shell points `fuser` at the host binary automatically.
 ## Build (Linux)
 
 ```sh
-cargo build --release -p pds-app -p pds-cli
+# Headless engine + CLI
+cargo build --release -p pds-engine-headless -p pds-cli
+
+# MyGo UI shell
+cd mygo-shell
+go build -o proton-drive-sync .
 ```
 
-A GPU stack for GPUI (Vulkan/Mesa; under a Wayland or X11 session this is
-already present) is not part of devenv — it is host-specific.
+The MyGo shell needs the Go toolchain (in `devenv.nix`) and GTK/WebKit libraries
+present on the host; it is otherwise self-contained.
 
-Run from the repository root (dev mode — the sidecar is found relative to the repo):
+Run from the repository root (dev mode — the engine and sidecar are found
+relative to the repo):
 
 ```sh
-cargo run -p pds-app
+cd mygo-shell
+./proton-drive-sync
+# or start minimized to the tray
+./proton-drive-sync --minimized
 ```
 
 Environment knobs:
@@ -177,20 +191,17 @@ Environment knobs:
 
 ## Background service and tray
 
-The app **is** the sync service: the engine, the on-demand mount, and the tray
-live in one long-running process, so closing the dashboard never interrupts a
-transfer.
+The app **is** the sync service: the MyGo dashboard launches the headless Rust
+engine as a child process, and the tray outlives the window, so closing the
+dashboard never interrupts a transfer.
 
 - **Start at login** is on by default for installed builds (development
-  builds from `target/` stay opt-in). `Settings → Startup` toggles it. The app
-  writes the standard XDG entry
-  `~/.config/autostart/proton-drive-sync.desktop`, launching
-  `proton-drive-sync --minimized` a few seconds after you sign in to your
-  desktop session. `--minimized` always wins: a login start never opens a
+  builds stay opt-in). `Settings → Startup` toggles it. The MyGo runtime writes
+  the standard XDG entry `~/.config/autostart/proton-drive-sync.desktop`,
+  launching `proton-drive-sync --minimized` a few seconds after you sign in to
+  your desktop session. `--minimized` always wins: a login start never opens a
   window, even if the panel (and its tray host) has not come up yet. The
-  dashboard opens only when you ask for it. Your choice is remembered in
-  `~/.config/proton-drive-sync/app.conf`; toggling it off removes the entry
-  and a later launch will not re-enable it.
+  dashboard opens only when you ask for it.
 - **Tray icon** (StatusNotifierItem): a coloured dot shows syncing, paused,
   delete-guard, signed-out, or stopped. The menu has *Open Dashboard*,
   *Pause/Resume syncing*, *Open Sync Folder*, *Preferences…*, and *Quit*;
@@ -204,9 +215,9 @@ transfer.
   `proton-drive-sync`) to open the dashboard, and closing the window then
   stops the service because there is no icon to bring it back.
 - **One instance only:** launching `proton-drive-sync` again does not start a
-  second engine — it asks the running instance to show its dashboard
-  (`$XDG_RUNTIME_DIR/proton-drive-sync.sock`) and exits. This protects the
-  SQLite state and the FUSE mount from two writers.
+  second engine — MyGo's single-instance lock asks the running instance to show
+  its dashboard and exits. This protects the SQLite state and the FUSE mount
+  from two writers.
 
 ## Releases
 
@@ -239,8 +250,9 @@ conventional commits, and opens a `release/vX.Y.Z` PR titled
 ## Testing
 
 ```sh
-devenv test                     # Rust workspace + sidecar typecheck/tests
+devenv test                     # Rust workspace + sidecar typecheck/tests + MyGo shell
 devenv shell -- cargo test --workspace   # Rust only, inside the env
+cd mygo-shell && go test ./...           # MyGo shell unit tests
 ```
 
 Notes for VM development (OrbStack et al.): inotify over shared folders is unreliable — run the engine tests on VM-native disk. See [AGENT.md](AGENT.md) for details.

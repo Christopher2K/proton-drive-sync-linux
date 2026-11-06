@@ -6,9 +6,11 @@ A **Linux** desktop app that syncs Proton Drive into a local folder. **Read `SPE
 
 ## Tech stack
 
-- **Host app:** Rust + [GPUI Community Edition](https://github.com/gpui-ce/gpui-ce) (`gpui-ce` 0.3, lib name `gpui`) (UI, orchestration, sync engine, SQLite state) — native Linux desktop window (Wayland/X11)
+- **Host UI shell:** MyGo (Go) — `mygo-shell/` is the production Linux dashboard (Overview/Activity/Conflicts/Settings, tray, autostart, single instance)
+- **Sync engine:** Rust headless service — `crates/engine-headless/` runs the same engine as the GPUI app but exposes a JSON-line Unix socket so the MyGo shell can control it
+- **Legacy host app:** Rust + [GPUI Community Edition](https://github.com/gpui-ce/gpui-ce) (`gpui-ce` 0.3, lib name `gpui`) (`crates/app/`) — preserved in-tree, not the production entry point
 - **Drive SDK sidecar:** Node.js + official [`ProtonDriveApps/sdk`](https://github.com/ProtonDriveApps/sdk) (TypeScript client module), spawned as a child process, JSON-RPC over stdio
-- **VFS (M3, planned):** FUSE (`fuser` crate)
+- **VFS:** FUSE (`fuser` crate; `crates/vfs-linux/`)
 - **State:** SQLite
 
 ## Hard rules (non-negotiable)
@@ -33,7 +35,7 @@ A **Linux** desktop app that syncs Proton Drive into a local folder. **Read `SPE
 - [x] M3.5 — Configurable cache cap: **done 2026-10-30** — the placeholder backing-cache cap (until now hardwired to `EVICTION_CAP_DEFAULT`, 10 GiB) is user-configurable on three surfaces with precedence **`pds mount --cache-cap <SIZE>` > `$PDS_CACHE_CAP` (session-only, never rewrites the persisted value — same rule as `PDS_SYNC_MODE`) > the persisted per-root Settings choice > 10 GiB default**. `unlimited` (no eviction) is expressible on all three. Sizes parse as bytes with an optional binary `K`/`M`/`G`/`T` suffix (`parse_cache_cap`; `0`/`none`/`off`/`unlimited` → unlimited; invalid values are ignored with a warning, never silently disabling eviction). Persistence: meta key `cache_cap_bytes` (Unlimited stored as the literal `unlimited`; unset key = never configured → default). **Settings applies live**: `Command::SetEvictionCap(Option<u64>)` mutates the running engine's cap and runs an immediate `maybe_evict` pass when the new cap is already exceeded (no restart, unlike the mode toggle); `EngineStatus.cache_cap` feeds the Settings chips (2/5/10/25 GB + Unlimited on the Sync mode card, with a `$PDS_CACHE_CAP`-override notice). App engine build resolves env > persisted > default; `pds sync`/`pds mount` resolve the same way (mount additionally honoring the flag). Tests: parse/precedence/persistence unit tests, live `set_cache_cap` integration test (immediate eviction on shrink, no eviction after re-widening to unlimited); full `devenv test` green incl. real-kernel FUSE e2e.
 - [x] M4 — Hardening: **done 2026-10-30** — (1) crash recovery: rows stuck `Uploading` from a previous run reset to Dirty at startup (re-uploaded through the full F7/retry machinery; vanished files tombstone pre-approved so the guard never trips on recovery); stale `*.pds-part` temps swept from both content roots. (2) Rate limits: `transfer.error` now carries `data.retryAfter` (sidecar + Rust decode) and the engine honors the server hint over the computed backoff; `retry_backoff` unit-tested. (3) Soak battery (`tests/soak.rs`): repeated simultaneous edits, remote-delete-vs-edit, remote burst convergence, conflict-copy churn — **found a real F7 hole**: `apply_remote_delete` trusted `sync_state` alone, so a local write inside the watcher debounce window was DESTROYED by a concurrent remote delete; now hashes on-disk content first (mirrors `apply_node_upsert`). (4) Test-flake root fix: `EngineHandle::wait_for_watcher` — fixtures synchronized on initial-sync completion, which can precede watcher attach, losing inotify events for immediate writes (the "rotating flake" across engine tests). (5) SDK rehearsal documented (`docs/sdk-upgrade-rehearsal.md`); current stack verified green (SDK 0.23.0, crypto 2.2.0 + openpgp patch, Node 22).
 - [x] M5 — Background service, login start, tray: **done 2026-10-31**
-- [x] MyGo migration Phase 1 PoC: **done 2026-11-05** — `pds-engine-headless` binary exposes a JSON-line Unix socket; `mygo-shell/` is a MyGo-native UI that launches the engine and receives `AuthOk`/`EngineStarted`/`Status`/`Activity` updates. See `docs/research/mygo-migration-poc.md`. Existing GPUI app is untouched. — `gpui-tray 0.3` (StatusNotifierItem over zbus) with a code-drawn status icon (running/paused/guard/sign-in/stopped), dynamic menu (Open Dashboard, Pause/Resume, Open Sync Folder, Preferences, Quit) and primary-click activation; **XDG autostart** (`$XDG_CONFIG_HOME/autostart/proton-drive-sync.desktop`, `--minimized`) toggled in Settings → Startup, with the user's decision persisted in `$XDG_CONFIG_HOME/proton-drive-sync/app.conf` (dev builds from `target/` stay opt-in); **single-instance socket** in `$XDG_RUNTIME_DIR` (a second launch asks the primary to show its dashboard and exits — two engines on one root would corrupt state / fight over the mount); `--minimized` launch flag (starts with the tray only; the root view lives independently of the window, which is created on first use). Key constraints discovered: GPUI 0.2's Linux backend stops the event loop when the last window is destroyed (`signal.stop()`) — never opening one is fine — and it has no hide/unminimize, so the first close-to-tray fix used **minimize**. The app now ships **gpui-ce 0.3**, whose `Window::set_visible` unmaps/remaps the toplevel without destroying it, so close-to-tray = **hide** on both Wayland and X11. A **D-Bus probe for `org.kde.StatusNotifierWatcher`** decides whether closing is safe — without a tray host (GNOME without AppIndicator, bare niri) login still stays windowless and close quits; starting the app again opens the dashboard. The autostart entry is always `--minimized` (the flag is authoritative, so a slow panel cannot make login open a window) and is rewritten on every launch so older entries get the flag. The autostart `Exec=` uses `argv[0]` (not `current_exe`) so Nix/makeWrapper's sidecar env survives. Tests: autostart entry/decision/roundtrip, single-instance handshake, tray status mapping/tooltips/icon build.
+- [x] MyGo migration Option B: **done 2026-11-05** — `crates/engine-headless/` is promoted to the production background sync service; `mygo-shell/` is a full MyGo-native UI replacement that replicates the GPUI Overview/Activity/Conflicts/Settings surface, tray, XDG autostart, single-instance lock, and `--minimized` start. The engine process loops across sign-out and sync-mode switches instead of exiting. The existing GPUI app, CLI, FUSE, and sidecar are untouched. See `docs/research/mygo-migration-poc.md`.
 
 ## Linux development (OrbStack VM)
 
@@ -128,12 +130,14 @@ proton-drive-sync/
 ├── SPEC.md            # Product spec — source of truth
 ├── AGENT.md           # This file
 ├── crates/
-│   ├── app/           # GPUI Linux desktop app (single window)
+│   ├── app/           # GPUI Linux desktop app (single window) — reference / legacy
 │   ├── cli/           # `pds` — headless engine + status/pause/resume/mount
 │   ├── core/          # Sync engine, state DB, queues, trash guards, VFS store
+│   ├── engine-headless/ # Production headless engine controlled over a Unix socket
 │   ├── vfs-linux/     # FUSE placeholder filesystem (fuser; M3)
 │   ├── xdg/           # XDG base-dir resolution shared by every crate
 │   └── sidecar-client/ # Sidecar spawn + JSON-RPC protocol (+ MockSidecar for tests)
+├── mygo-shell/        # MyGo-native production UI shell
 ├── sidecar/           # Node.js + official Proton Drive SDK
 └── packaging/linux/   # .desktop entry, icon, install script
 ```

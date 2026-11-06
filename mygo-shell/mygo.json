@@ -1,6 +1,6 @@
 {
-  "name": "mygo-shell",
-  "identifier": "com.example.mygoshell",
-  "version": "0.1.0",
+  "name": "proton-drive-sync",
+  "identifier": "com.example.protondrivesync",
+  "version": "0.3.0",
   "out": "build"
 }

@@ -15,10 +15,10 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use clap::Parser;
 use pds_core::{
-    Db, Engine, EngineConfig, EngineHandle, EVICTION_CAP_DEFAULT, RETRY_BASE_DEFAULT, SyncMode,
+    Db, EVICTION_CAP_DEFAULT, Engine, EngineConfig, EngineHandle, RETRY_BASE_DEFAULT, SyncMode,
     engine_state_dir,
 };
-use pds_sidecar_client::{Notification, SidecarApi, spawn::spawn_sidecar};
+use pds_sidecar_client::{Notification, SidecarApi, spawn::spawn_sidecar, types::error_codes};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
@@ -32,7 +32,10 @@ enum UiCommand {
     StartLogin,
     Pause,
     Resume,
+    SignOut,
     Shutdown,
+    SetCacheCap(Option<u64>),
+    SetMode(String),
 }
 
 /// Updates the engine streams back to every connected UI client.
@@ -40,21 +43,54 @@ enum UiCommand {
 #[serde(tag = "update", rename_all = "PascalCase")]
 enum EngineUpdate {
     AuthRequired,
-    AuthOk { email: String },
+    AuthOk {
+        email: String,
+    },
     LoginStarted,
-    LoginUrl { url: String, user_code: String },
-    LoginFailed { error: String },
+    LoginUrl {
+        url: String,
+        user_code: String,
+    },
+    LoginFailed {
+        error: String,
+    },
     EngineStarted,
     LayoutMigrated,
-    MountUnavailable { error: String },
+    MountUnavailable {
+        error: String,
+    },
     Status(EngineStatusJson),
     Activity(ActivityItemJson),
     Inbox {
         conflicts: Vec<String>,
-        errored: Vec<(String, String)>,
+        errored: Vec<ErroredItemJson>,
     },
-    Failed { error: String },
-    Exited { reason: String },
+    SignedOut,
+    ModeSwitched {
+        mode: String,
+    },
+    Failed {
+        error: String,
+    },
+    Exited {
+        reason: String,
+    },
+}
+
+/// JSON-serializable conflict/error inbox item.
+#[derive(Debug, Clone, Serialize)]
+struct ErroredItemJson {
+    path: String,
+    error: String,
+}
+
+impl From<&(String, String)> for ErroredItemJson {
+    fn from((path, error): &(String, String)) -> Self {
+        Self {
+            path: path.clone(),
+            error: error.clone(),
+        }
+    }
 }
 
 /// JSON-serializable mirror of `pds_core::EngineStatus`.
@@ -355,6 +391,12 @@ async fn handle_client(
 
 enum EngineExit {
     Quit(String),
+    /// The UI asked to sign out: the engine is stopped; the caller logs out
+    /// and loops back to the sign-in flow.
+    SignOut,
+    /// The UI changed the persisted sync mode: the engine is stopped; the
+    /// caller restarts the sidecar and engine into the new mode.
+    ModeSwitch(SyncMode),
 }
 
 async fn run_engine(
@@ -363,41 +405,73 @@ async fn run_engine(
     updates: tokio::sync::broadcast::Sender<EngineUpdate>,
     mut cmds: UnboundedReceiver<UiCommand>,
 ) -> Result<()> {
-    let (mut client, _child) = spawn_sidecar(sidecar_cmd.as_deref())?;
-    let mut notifications = client.take_notifications();
-    let client = Arc::new(client);
+    // Session loop: sign-out drops the sidecar (its notification stream is
+    // consumed by the engine and can't be reclaimed) and restarts into the
+    // login flow so a different account can sign in. A mode switch restarts
+    // into the new persisted mode while staying signed in.
+    loop {
+        let (mut client, child) = spawn_sidecar(sidecar_cmd.as_deref())?;
+        let mut notifications = client.take_notifications();
+        let client = Arc::new(client);
 
-    let auth = client.auth_status().await.context("auth.status")?;
-    let email = if auth.logged_in {
-        let email = auth.email.unwrap_or_else(|| "unknown account".into());
-        let _ = updates.send(EngineUpdate::AuthOk {
-            email: email.clone(),
-        });
-        email
-    } else {
-        let _ = updates.send(EngineUpdate::AuthRequired);
-        match login_flow(client.as_ref(), &mut notifications, &mut cmds, &updates).await? {
-            Some(email) => email,
-            None => {
-                let _ = updates.send(EngineUpdate::Exited {
-                    reason: "shutdown".into(),
-                });
+        let auth = client.auth_status().await.context("auth.status")?;
+        let email = if auth.logged_in {
+            let email = auth.email.unwrap_or_else(|| "unknown account".into());
+            let _ = updates.send(EngineUpdate::AuthOk {
+                email: email.clone(),
+            });
+            email
+        } else {
+            let _ = updates.send(EngineUpdate::AuthRequired);
+            match login_flow(client.as_ref(), &mut notifications, &mut cmds, &updates).await? {
+                Some(email) => email,
+                None => {
+                    let _ = updates.send(EngineUpdate::Exited {
+                        reason: "shutdown".into(),
+                    });
+                    return Ok(());
+                }
+            }
+        };
+        info!(email = %email, root = %root.display(), "starting sync engine");
+
+        match engine_session(
+            client.clone(),
+            root.clone(),
+            notifications,
+            &mut cmds,
+            &updates,
+        )
+        .await
+        {
+            EngineExit::Quit(reason) => {
+                let _ = updates.send(EngineUpdate::Exited { reason });
                 return Ok(());
             }
+            EngineExit::SignOut => {
+                // The engine is already stopped (graceful shutdown above).
+                // `auth.logout` deletes the session server-side and wipes
+                // session.json; a 1001 "already gone" is success enough.
+                match client.logout().await {
+                    Ok(()) => info!("signed out"),
+                    Err(e) if e.code() == Some(error_codes::AUTH_REQUIRED) => {
+                        info!("auth.logout: session already gone (1001), proceeding");
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "auth.logout failed; proceeding to signed-out state");
+                    }
+                }
+                drop(child); // kill_on_drop: stop the old sidecar process
+                let _ = updates.send(EngineUpdate::SignedOut);
+            }
+            EngineExit::ModeSwitch(mode) => {
+                drop(child); // restart the sidecar to get a fresh notification stream
+                let _ = updates.send(EngineUpdate::ModeSwitched {
+                    mode: mode.as_meta_value().to_string(),
+                });
+            }
         }
-    };
-    info!(email = %email, root = %root.display(), "starting sync engine");
-
-    let EngineExit::Quit(reason) = engine_session(
-        client.clone(),
-        root.clone(),
-        notifications,
-        &mut cmds,
-        &updates,
-    )
-    .await;
-    let _ = updates.send(EngineUpdate::Exited { reason });
-    Ok(())
+    }
 }
 
 async fn engine_session(
@@ -420,10 +494,8 @@ async fn engine_session(
     };
 
     if mode == SyncMode::Placeholders
-        && let Err(e) = pds_vfs_linux::mount::ensure_placeholder_mountpoint(
-            &root,
-            Duration::from_secs(2),
-        )
+        && let Err(e) =
+            pds_vfs_linux::mount::ensure_placeholder_mountpoint(&root, Duration::from_secs(2))
     {
         warn!(root = %root.display(), error = %e, "refusing to start with an unusable placeholder mountpoint");
         let _ = updates.send(EngineUpdate::MountUnavailable {
@@ -512,20 +584,13 @@ fn fuse_available() -> bool {
     use std::sync::atomic::{AtomicU64, Ordering};
     static SEQ: AtomicU64 = AtomicU64::new(0);
     let seq = SEQ.fetch_add(1, Ordering::Relaxed);
-    let probe = std::env::temp_dir().join(format!(
-        "pds-fuse-probe-{}-{seq}",
-        std::process::id()
-    ));
+    let probe = std::env::temp_dir().join(format!("pds-fuse-probe-{}-{seq}", std::process::id()));
     let mnt = probe.join("mnt");
     if std::fs::create_dir_all(&mnt).is_err() {
         return false;
     }
     let store = pds_core::Store::new();
-    let fs = pds_vfs_linux::PdsFs::new(
-        store,
-        probe.join("state"),
-        probe.join("backing"),
-    );
+    let fs = pds_vfs_linux::PdsFs::new(store, probe.join("state"), probe.join("backing"));
     let mut cfg = fuser::Config::default();
     cfg.mount_options = vec![fuser::MountOption::FSName("pds-probe".into())];
     let ok = match fuser::Session::new(fs, &mnt, &cfg) {
@@ -624,7 +689,11 @@ fn prepare_layout(root: &Path) -> Result<RootLayout> {
                 &db_path,
                 rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
             )
-            .and_then(|c| c.query_row("SELECT count(*) FROM sqlite_master", [], |r| r.get::<_, i64>(0)))
+            .and_then(|c| {
+                c.query_row("SELECT count(*) FROM sqlite_master", [], |r| {
+                    r.get::<_, i64>(0)
+                })
+            })
             .map(|n| n >= 0)
             .unwrap_or(false);
             if !verified {
@@ -684,8 +753,7 @@ fn build_engine(
 ) -> Result<(Engine<pds_sidecar_client::SidecarClient>, EngineHandle)> {
     let eviction_cap = match pds_core::cache_cap_from_env() {
         Some(session) => session,
-        None => pds_core::persisted_cache_cap(&db_path)
-            .unwrap_or(Some(EVICTION_CAP_DEFAULT)),
+        None => pds_core::persisted_cache_cap(&db_path).unwrap_or(Some(EVICTION_CAP_DEFAULT)),
     };
     Engine::new(
         client,
@@ -748,6 +816,38 @@ async fn drive_engine_task(
                     let res = engine_task.await;
                     return EngineExit::Quit(engine_result(res));
                 }
+                Some(UiCommand::SignOut) => {
+                    let _ = handle.shutdown().await;
+                    let res = engine_task.await;
+                    info!(reason = %engine_result(res), "engine stopped for sign-out");
+                    return EngineExit::SignOut;
+                }
+                Some(UiCommand::SetMode(raw)) => {
+                    // Persist the new mode so the next session picks it up,
+                    // then stop the engine. The caller will respawn the sidecar
+                    // and start a fresh engine session in the new mode.
+                    let Some(mode) = SyncMode::from_meta_value(Some(&raw)) else {
+                        warn!(mode = %raw, "ignoring invalid SetMode value");
+                        continue;
+                    };
+                    if db.is_none() {
+                        db = Db::open(db_path).ok();
+                    }
+                    if let Some(conn) = db.as_ref() {
+                        if let Err(e) = pds_core::set_sync_mode(conn, mode) {
+                            warn!(error = %e, "persisting sync mode failed");
+                        }
+                    }
+                    let _ = handle.shutdown().await;
+                    let res = engine_task.await;
+                    info!(reason = %engine_result(res), "engine stopped for mode switch");
+                    return EngineExit::ModeSwitch(mode);
+                }
+                Some(UiCommand::SetCacheCap(cap)) => {
+                    if let Err(e) = handle.set_cache_cap(cap).await {
+                        warn!("set cache cap: {e}");
+                    }
+                }
                 Some(UiCommand::StartLogin) => {}
             },
             item = activity_rx.recv() => match item {
@@ -800,13 +900,13 @@ fn poll_inbox(
             return;
         }
     };
-    let errored = conn
+    let errored: Vec<_> = conn
         .errored_paths()
         .unwrap_or_default()
         .into_iter()
         .map(|p| {
-            let err = conn.upload_error(&p).ok().flatten().unwrap_or_default();
-            (p, err)
+            let error = conn.upload_error(&p).ok().flatten().unwrap_or_default();
+            ErroredItemJson { path: p, error }
         })
         .collect();
     let _ = updates.send(EngineUpdate::Inbox { conflicts, errored });
