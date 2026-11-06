@@ -172,7 +172,7 @@ fn main() {
     let cli = Cli::parse();
     init_logging();
 
-    let root = cli.root.map(PathBuf::from).unwrap_or_else(default_root);
+    let root = cli.root.unwrap_or_else(default_root);
     let sidecar_cmd = cli.sidecar_cmd;
     let socket_path = cli.socket.unwrap_or_else(|| default_socket_path(&root));
 
@@ -242,7 +242,7 @@ fn default_root() -> PathBuf {
 fn default_socket_path(root: &Path) -> PathBuf {
     let runtime = std::env::var_os("XDG_RUNTIME_DIR")
         .map(PathBuf::from)
-        .unwrap_or_else(|| std::env::temp_dir());
+        .unwrap_or_else(std::env::temp_dir);
     let key = pds_core::mode::root_key(root);
     runtime.join(format!("pds-engine-{key}.sock"))
 }
@@ -331,21 +331,16 @@ async fn handle_client(
     // Spawn a task to pump updates to this client.
     let mut updates_rx_local = updates_rx.resubscribe();
     let writer_pump = tokio::spawn(async move {
-        loop {
-            match updates_rx_local.recv().await {
-                Ok(update) => {
-                    let line = match serde_json::to_vec(&update) {
-                        Ok(v) => v,
-                        Err(_) => continue,
-                    };
-                    if writer.write_all(&line).await.is_err()
-                        || writer.write_all(b"\n").await.is_err()
-                        || writer.flush().await.is_err()
-                    {
-                        break;
-                    }
-                }
-                Err(_) => break,
+        while let Ok(update) = updates_rx_local.recv().await {
+            let line = match serde_json::to_vec(&update) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            if writer.write_all(&line).await.is_err()
+                || writer.write_all(b"\n").await.is_err()
+                || writer.flush().await.is_err()
+            {
+                break;
             }
         }
     });
@@ -833,10 +828,10 @@ async fn drive_engine_task(
                     if db.is_none() {
                         db = Db::open(db_path).ok();
                     }
-                    if let Some(conn) = db.as_ref() {
-                        if let Err(e) = pds_core::set_sync_mode(conn, mode) {
-                            warn!(error = %e, "persisting sync mode failed");
-                        }
+                    if let Some(conn) = db.as_ref()
+                        && let Err(e) = pds_core::set_sync_mode(conn, mode)
+                    {
+                        warn!(error = %e, "persisting sync mode failed");
                     }
                     let _ = handle.shutdown().await;
                     let res = engine_task.await;
