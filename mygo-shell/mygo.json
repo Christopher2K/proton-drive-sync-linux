@@ -1,0 +1,6 @@
+{
+  "name": "mygo-shell",
+  "identifier": "com.example.mygoshell",
+  "version": "0.1.0",
+  "out": "build"
+}

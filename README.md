@@ -1,10 +1,22 @@
-# proton-drive-sync
+# Proton Drive Sync
 
 > **Experimental, unofficial, and used at your own risk.** Not affiliated with
 > Proton. Built for my own personal use case; I am not responsible for any data
 > loss. See [Read this first](#read-this-first-important).
 
-A **Linux** desktop app that syncs a folder with [Proton Drive](https://proton.me/drive) — the app defaults to **on-demand placeholders**: your whole Drive appears in `~/ProtonDrive` at ~0 bytes, files hydrate when opened, and a capped local cache keeps SSD usage near zero. Prefer everything offline? A Settings toggle switches the same folder to full **mirror** mode. Deletions stay conservative either way (remote deletes go to Trash, with a mass-delete guard).
+A **Linux** desktop app that syncs a folder with [Proton Drive](https://proton.me/drive).
+
+![Sign in screen](docs/screenshots/login.png)
+
+- Your whole Drive appears in `~/ProtonDrive` at ~0 bytes.
+- Files hydrate when opened.
+- A capped local cache keeps SSD usage near zero.
+- Prefer everything offline? A Settings toggle switches the same folder to full **mirror** mode.
+
+| | |
+|---|---|
+| ![Overview](docs/screenshots/overview.png) | ![Settings](docs/screenshots/settings.png) |
+| ![Activity](docs/screenshots/activity.png) | ![Conflicts](docs/screenshots/conflicts.png) |
 
 - **Product spec:** [SPEC.md](SPEC.md) — source of truth
 - **Agent notes:** [AGENT.md](AGENT.md)
@@ -30,26 +42,94 @@ Stack: Rust + GPUI (native Linux desktop UI) · Node.js sidecar running the offi
 If any of that is a dealbreaker, please use the official Proton Drive apps
 instead.
 
-## Features (M1–M4)
+## Features
 
-- Browser-based Proton sign-in (session-fork; no password handling in the app)
-- **On-demand placeholders by default (F5):** the sync root is a FUSE view of
-  your Drive — every file visible at ~0 bytes, hydrating on open, with an
-  LRU-capped local cache (default 10 GiB). Nothing downloads until you use it.
-- **Settings → Sync mode:** switch the same folder between *On demand* and
-  *Mirror everything* at any time. Switching moves existing content (no
-  re-download) and never deletes from Drive.
-- Two-way sync of one local root (`~/ProtonDrive` by default) with your Drive
-- Upload on new/changed files; trash-on-delete
-- Mass-deletion guard: bulk deletes pause sync until you confirm
-- Pause / resume; conflict handling keeps both versions (`name (conflict …).ext`)
-- Native GPUI window: Overview, Activity, Conflicts, and Settings pages
-- **Runs in the background:** optional start-at-login (XDG autostart) plus a
-  tray icon with live status; closing the dashboard hides it to the tray, and
-  a later launch simply reopens the running instance
+### On-demand placeholders by default
 
-In **mirror** mode the sync root is a fully materialized folder instead (the
-pre-placeholder behavior, still available for `pds sync` via `PDS_SYNC_MODE`).
+The sync root is a FUSE view of your Drive. Every file is visible at ~0 bytes,
+hydrating on open, with an LRU-capped local cache (default 10 GiB). Nothing
+downloads until you use it.
+
+### Switch to mirror mode at any time
+
+**Settings → Sync mode** switches the same folder between *On demand* and
+*Mirror everything*. Switching moves existing content (no re-download) and never
+deletes from Drive.
+
+### Two-way sync with conservative deletes
+
+- Upload on new/changed files.
+- Local deletes are sent to the Proton Drive Trash, never permanently deleted.
+- A mass-deletion guard pauses sync when too many files are deleted at once.
+
+### Native desktop integration
+
+- Single main window with **Overview**, **Activity**, **Conflicts**, and **Settings** pages.
+- Optional **start at login** via XDG autostart.
+- **Tray icon** with status dot, pause/resume, open folder, and quit.
+- Closing the dashboard hides the app to the tray; sync keeps running.
+
+### CLI companion
+
+`pds sync` runs the engine headless; `pds status|pause|resume` control a running
+engine; `pds mount <folder> <mountpoint>` serves a placeholder view anywhere. See
+`pds --help`.
+
+## Install
+
+### Nix (recommended on NixOS or Nix-enabled distros)
+
+```sh
+# Try without installing
+nix run .#proton-drive-sync
+
+# Install app + CLI + sidecar into a profile
+nix profile install .#default
+```
+
+Or install straight from GitHub:
+
+```sh
+nix profile install github:Christopher2K/proton-drive-sync-linux
+```
+
+### From source
+
+```sh
+# 1. Enter the pinned development environment
+devenv shell
+
+# 2. Build
+cargo build --release -p pds-app -p pds-cli
+
+# 3. Install system-wide (or PREFIX=$HOME/.local for a user install)
+sudo packaging/linux/install.sh
+```
+
+### From a release tarball
+
+Download `proton-drive-sync-<version>-<arch>.tar.xz` from
+[GitHub Releases](https://github.com/Christopher2K/proton-drive-sync-linux/releases),
+then run:
+
+```sh
+tar -xJf proton-drive-sync-*.tar.xz
+sudo proton-drive-sync-*/install.sh
+```
+
+`.deb` and `.rpm` packages are also published on releases (require `nodejs >= 20`
+and `npm` at runtime).
+
+## First launch
+
+1. Open **Proton Drive Sync** from your application menu.
+2. Click **Sign in with Proton**. Your browser handles login; the app never sees
+   your password.
+3. Choose your sync folder (default: `~/ProtonDrive`).
+4. The app starts syncing in the background. Close the window to keep it in the
+   tray.
+
+![Sign in screen](docs/screenshots/login.png)
 
 ## Development environment (devenv)
 
@@ -95,17 +175,6 @@ Environment knobs:
 | `PDS_SIDECAR_DIR` | Sidecar directory override for auto-discovery |
 | `RUST_LOG` | Log filter (default `info,pds_core=debug`), logs go to stderr |
 
-## Install (system-wide)
-
-```sh
-cargo build --release -p pds-app -p pds-cli
-sudo packaging/linux/install.sh            # PREFIX=/usr/local by default
-# or, user-local (no root):
-PREFIX=$HOME/.local packaging/linux/install.sh
-```
-
-This installs the `proton-drive-sync` binary, the `pds` CLI, the sidecar (with vendored npm deps), a `.desktop` entry, and an icon. The app then appears in your application menu.
-
 ## Background service and tray
 
 The app **is** the sync service: the engine, the on-demand mount, and the tray
@@ -139,30 +208,6 @@ transfer.
   (`$XDG_RUNTIME_DIR/proton-drive-sync.sock`) and exits. This protects the
   SQLite state and the FUSE mount from two writers.
 
-## Install (Nix)
-
-On Nix-based Linux systems (NixOS or any distro with Nix), build and install straight from this repository:
-
-```sh
-# try the app without installing (apps: proton-drive-sync, pds)
-nix run .#proton-drive-sync
-
-# install the app + CLI + sidecar into a profile
-nix profile install .#default
-```
-
-Or from a remote machine directly:
-
-```sh
-nix profile install github:Christopher2K/proton-drive-sync-linux
-```
-
-The flake exposes `packages.proton-drive-sync` (app + CLI + sidecar, wrapped so
-the binaries find their sidecar in the Nix store), `packages.sidecar`, and a
-`nix develop` shell mirroring `devenv.nix`. Only Linux systems are supported —
-the GPUI shell does not build on macOS. The Rust tests run via
-`nix flake check` (the FUSE e2e test self-skips without `/dev/fuse`).
-
 ## Releases
 
 Releases are versioned as a single product (`MAJOR.MINOR.PATCH`, semver while
@@ -191,17 +236,6 @@ conventional commits, and opens a `release/vX.Y.Z` PR titled
 - `.deb` / `.rpm` packages (require `nodejs >= 20` and `npm` at runtime)
 - `checksums.txt` (sha256)
 
-Install from a tarball without cloning the repository:
-
-```sh
-tar -xJf proton-drive-sync-*.tar.xz
-sudo proton-drive-sync-*/install.sh
-```
-
-## CLI companion
-
-`pds sync` runs the engine headless; `pds status|pause|resume` control a running engine; `pds conflicts` lists the conflict inbox. `pds mount <folder> <mountpoint>` serves a **placeholder view** of a sync root (requires `/dev/fuse`): files hydrate from Drive on first open, files/folders you create through the mount upload to Drive on close, and edits to existing files upload as new revisions of the same Drive file (M3). Hydrated content is an LRU cache capped at 10 GiB by default — `pds mount --cache-cap <SIZE>` (e.g. `500M`, `10G`, `unlimited`) changes it for one invocation, `$PDS_CACHE_CAP` and the persisted Settings choice cover the rest. `pds pin <folder> <path>` keeps a file (or folder, recursively) offline-safe, `pds unpin` releases it. See `pds --help`.
-
 ## Testing
 
 ```sh
@@ -210,3 +244,7 @@ devenv shell -- cargo test --workspace   # Rust only, inside the env
 ```
 
 Notes for VM development (OrbStack et al.): inotify over shared folders is unreliable — run the engine tests on VM-native disk. See [AGENT.md](AGENT.md) for details.
+
+## License
+
+[MIT](LICENSE)
