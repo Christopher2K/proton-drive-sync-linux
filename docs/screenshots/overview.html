@@ -1,0 +1,264 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body {
+  width: 1152px; height: 648px;
+  background: #101218;
+  color: #e7eaf0;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  font-size: 13px;
+  line-height: 1.4;
+  overflow: hidden;
+}
+.window {
+  display: flex; flex-direction: column;
+  width: 100%; height: 100%;
+  border: 1px solid #272d3a;
+  border-radius: 10px;
+  overflow: hidden;
+}
+.titlebar {
+  height: 34px;
+  background: #101218;
+  border-bottom: 1px solid #272d3a;
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 0 12px;
+  color: #6b7486; font-size: 11px;
+}
+.titlebar-close {
+  width: 26px; height: 26px;
+  display: flex; align-items: center; justify-content: center;
+  border-radius: 6px;
+  font-size: 16px; color: #98a1b3;
+}
+.body {
+  display: flex; flex: 1;
+  min-height: 0;
+}
+.sidebar {
+  width: 232px;
+  background: #151821;
+  border-right: 1px solid #272d3a;
+  padding: 20px 16px 16px;
+  display: flex; flex-direction: column;
+}
+.brand {
+  display: flex; align-items: center; gap: 12px;
+  margin-bottom: 24px;
+}
+.brand-icon {
+  width: 34px; height: 34px;
+  background: #5b8def;
+  border-radius: 10px;
+  display: flex; align-items: center; justify-content: center;
+}
+.brand-icon-inner {
+  width: 15px; height: 15px;
+  border: 2px solid #fff;
+  border-radius: 50%;
+}
+.brand-title { font-size: 13px; font-weight: 600; }
+.brand-tagline { font-size: 11px; color: #6b7486; }
+.nav { display: flex; flex-direction: column; gap: 4px; }
+.nav-item {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 8px 12px;
+  border-radius: 8px;
+  color: #98a1b3;
+  font-size: 13px;
+}
+.nav-item.active { background: #222733; color: #e7eaf0; }
+.nav-badge {
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: #33280e;
+  color: #f0b64a;
+  font-size: 10px;
+}
+.sidebar-spacer { flex: 1; }
+.status-card {
+  background: #1a1e28;
+  border: 1px solid #272d3a;
+  border-radius: 10px;
+  padding: 12px;
+  display: flex; flex-direction: column; gap: 12px;
+}
+.status-line {
+  display: flex; align-items: center; gap: 8px;
+  font-size: 11px;
+}
+.status-dot { width: 7px; height: 7px; border-radius: 50%; background: #44d19a; }
+.status-text { color: #44d19a; }
+.pause-btn {
+  width: 100%; padding: 8px 0;
+  background: #5b8def;
+  color: #fff;
+  border-radius: 8px;
+  text-align: center;
+  font-size: 12px;
+  font-weight: 500;
+}
+.content {
+  flex: 1;
+  padding: 28px;
+  display: flex; flex-direction: column;
+  gap: 20px;
+  overflow-y: auto;
+}
+.card {
+  background: #1a1e28;
+  border: 1px solid #272d3a;
+  border-radius: 12px;
+  padding: 16px;
+  display: flex; flex-direction: column; gap: 12px;
+}
+.card-header {
+  display: flex; align-items: flex-start; justify-content: space-between;
+}
+.headline { font-size: 22px; font-weight: 600; }
+.subheadline { font-size: 13px; color: #98a1b3; margin-top: 4px; }
+.pill {
+  padding: 4px 10px;
+  border-radius: 999px;
+  font-size: 11px;
+  background: #113227;
+  color: #44d19a;
+}
+.stats { display: flex; gap: 12px; }
+.stat {
+  flex: 1;
+  background: #0d0f14;
+  border-radius: 8px;
+  padding: 12px;
+  display: flex; flex-direction: column; gap: 4px;
+}
+.stat-label { font-size: 11px; color: #98a1b3; }
+.stat-value { font-size: 18px; font-weight: 600; }
+.stat-value.accent { color: #5b8def; }
+.section-title { font-size: 14px; font-weight: 600; }
+.section-subtitle { font-size: 11px; color: #98a1b3; }
+.text-btn { color: #98a1b3; font-size: 12px; padding: 4px 8px; border-radius: 6px; }
+.empty-state {
+  color: #6b7486;
+  font-size: 12px;
+  padding: 12px 0;
+}
+.activity-row {
+  display: flex; align-items: center; gap: 12px;
+  padding: 10px 0;
+  border-top: 1px solid #272d3a;
+  font-size: 12px;
+}
+.activity-row:first-of-type { border-top: none; }
+.activity-time { width: 64px; color: #98a1b3; }
+.activity-event { width: 92px; }
+.activity-path { flex: 1; color: #98a1b3; }
+</style>
+</head>
+<body>
+<div class="window">
+  <div class="titlebar">
+    <span>Proton Drive Sync</span>
+    <div class="titlebar-close">×</div>
+  </div>
+  <div class="body">
+    <div class="sidebar">
+      <div class="brand">
+        <div class="brand-icon"><div class="brand-icon-inner"></div></div>
+        <div>
+          <div class="brand-title">Proton Drive Sync</div>
+          <div class="brand-tagline">Unofficial Linux client</div>
+        </div>
+      </div>
+      <div class="nav">
+        <div class="nav-item active">Overview</div>
+        <div class="nav-item">Activity</div>
+        <div class="nav-item">Conflicts <span class="nav-badge">2</span></div>
+        <div class="nav-item">Settings</div>
+      </div>
+      <div class="sidebar-spacer"></div>
+      <div class="status-card">
+        <div class="status-line">
+          <div class="status-dot"></div>
+          <div class="status-text">Syncing</div>
+        </div>
+        <div class="pause-btn">Pause syncing</div>
+      </div>
+    </div>
+    <div class="content">
+      <div class="card">
+        <div class="card-header">
+          <div>
+            <div class="headline">Everything is up to date</div>
+            <div class="subheadline">chris.katoyi@proton.me</div>
+          </div>
+          <div class="pill">Up to date</div>
+        </div>
+        <div class="stats">
+          <div class="stat">
+            <div class="stat-label">Synced items</div>
+            <div class="stat-value" style="color:#44d19a">428</div>
+          </div>
+          <div class="stat">
+            <div class="stat-label">Pending uploads</div>
+            <div class="stat-value accent">3</div>
+          </div>
+          <div class="stat">
+            <div class="stat-label">Deletes queued</div>
+            <div class="stat-value">0</div>
+          </div>
+          <div class="stat">
+            <div class="stat-label">Needs attention</div>
+            <div class="stat-value" style="color:#ef7373">2</div>
+          </div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-header">
+          <div>
+            <div class="section-title">Needs attention</div>
+            <div class="section-subtitle">Conflicts and failed uploads</div>
+          </div>
+          <div class="text-btn">Review</div>
+        </div>
+        <div style="color:#98a1b3; font-size:12px;">2 conflicts · 0 failed uploads</div>
+      </div>
+
+      <div class="card">
+        <div class="card-header">
+          <div>
+            <div class="section-title">Recent activity</div>
+            <div class="section-subtitle">Newest first</div>
+          </div>
+          <div class="text-btn">View all</div>
+        </div>
+        <div class="activity-row">
+          <div class="activity-time">10:42</div>
+          <div class="activity-event" style="color:#5b8def">Uploaded</div>
+          <div class="activity-path">Notes/Meeting.md</div>
+        </div>
+        <div class="activity-row">
+          <div class="activity-time">10:38</div>
+          <div class="activity-event" style="color:#44d19a">Downloaded</div>
+          <div class="activity-path">Documents/Invoice.pdf</div>
+        </div>
+        <div class="activity-row">
+          <div class="activity-time">09:15</div>
+          <div class="activity-event" style="color:#ef7373">Conflict</div>
+          <div class="activity-path">Projects/README.md</div>
+        </div>
+        <div class="activity-row">
+          <div class="activity-time">09:12</div>
+          <div class="activity-event" style="color:#f0b64a">Trashed</div>
+          <div class="activity-path">Temp/old-draft.txt</div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+</body>
+</html>

@@ -4636,6 +4636,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "pds-engine-headless"
+version = "0.5.9"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "clap",
+ "fuser",
+ "pds-core",
+ "pds-sidecar-client",
+ "pds-vfs-linux",
+ "pds-xdg",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "pds-sidecar-client"
 version = "0.5.9"
 dependencies = [
