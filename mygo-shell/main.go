@@ -612,6 +612,7 @@ func (a *app) applyUpdate(up engineUpdate) {
 		a.page = pageOverview
 		a.modeSwitch = modeSwitchNone
 		a.mountError = ""
+		a.settingsScroll.Y = 0
 	case "LayoutMigrated":
 		a.layoutMigrated = true
 	case "MountUnavailable":
@@ -698,6 +699,13 @@ func (a *app) invalidate() {
 // UI: theme
 // ---------------------------------------------------------------------------
 
+// Design tokens mirroring crates/app/src/theme.rs, so both shells render
+// the same design. Sizes are in DIPs, matching the GPUI pixel values.
+const (
+	sidebarWidth = 232.0
+	pagePadding  = 28.0
+)
+
 var (
 	bg           = ui.RGB(0x10, 0x12, 0x18)
 	sidebar      = ui.RGB(0x15, 0x18, 0x21)
@@ -751,68 +759,79 @@ func appTheme() *ui.Theme {
 // UI: primitives
 // ---------------------------------------------------------------------------
 
+// appCard mirrors components::card: gap 3, p 4 (16), radius 12.
 func appCard(c *ui.Context, children func()) ui.Element {
 	t := c.Theme()
-	return ui.Box(c).Background(t.Surface).Border(1, t.Border).Radius(t.Radius).Padding(t.Space(4)).Children(children)
+	return ui.Box(c).Background(t.Surface).Border(1, t.Border).Radius(12).Padding(16).Children(children)
 }
 
 func pageCard(c *ui.Context, children func()) ui.Element {
-	return appCard(c, children).Grow(1).FillWidth()
+	return appCard(c, children).FillWidth()
 }
 
+// statusDot mirrors components::status_dot: 7px dot, text_sm label.
 func statusDot(c *ui.Context, label string, color ui.Color) ui.Element {
 	t := c.Theme()
-	size := t.Space(1.75)
-	return ui.Row(c).Gap(t.Space(2)).AlignItems(ui.Start).Children(func() {
-		ui.Box(c).Width(size).Height(size).Radius(size / 2).Background(color)
-		ui.Text(c, label).TextColor(color).FontSize(t.FontSize * 0.85).Grow(1)
+	return ui.Row(c).Gap(t.Space(2)).AlignItems(ui.Center).Children(func() {
+		ui.Box(c).Width(7).Height(7).Radius(3.5).Background(color)
+		ui.Text(c, label).TextColor(color).FontSize(t.FontSize).Grow(1)
 	})
 }
 
+// pill mirrors components::pill: px 2 (8), py 0.5 (2), radius full, text_xs.
 func pill(c *ui.Context, txt string, fg, bgc ui.Color) ui.Element {
 	t := c.Theme()
-	return ui.Box(c).Background(bgc).Padding(t.Space(1), t.Space(2)).Radius(999).Children(func() {
-		ui.Text(c, txt).TextColor(fg).FontSize(t.FontSize * 0.85).Bold()
+	return ui.Box(c).Background(bgc).Padding(2, 8).Radius(999).Children(func() {
+		ui.Text(c, txt).TextColor(fg).FontSize(t.FontSize * 0.85)
 	})
 }
 
+// statBox mirrors components::stat: gap 1, p 3 (12), radius 10, inset bg.
 func statBox(c *ui.Context, label, value string, color ui.Color) ui.Element {
 	t := c.Theme()
-	return ui.Box(c).Grow(1).Background(inset).Padding(t.Space(3)).Radius(t.Radius).Children(func() {
-		ui.Text(c, value).FontSize(t.FontSize * 1.75).Bold().TextColor(color)
-		ui.Text(c, label).FontSize(t.FontSize * 0.85).TextColor(t.TextMuted)
+	return ui.Box(c).Grow(1).Background(inset).Padding(12).Radius(10).Children(func() {
+		ui.Column(c).Gap(t.Space(1)).Children(func() {
+			ui.Text(c, value).FontSize(t.FontSize * 2).Bold().TextColor(color)
+			ui.Text(c, label).FontSize(t.FontSize * 0.85).TextColor(t.TextMuted)
+		})
 	})
 }
 
+// sectionTitle mirrors components::section_title: text_base semibold + text_xs.
 func sectionTitle(c *ui.Context, title, subtitle string) ui.Element {
 	t := c.Theme()
-	return ui.Column(c).Gap(t.Space(1)).Children(func() {
-		ui.Text(c, title).FontSize(t.FontSize * 1.15).Bold()
+	return ui.Column(c).Gap(t.Space(0.5)).Children(func() {
+		ui.Text(c, title).FontSize(t.FontSize).Bold()
 		if subtitle != "" {
 			ui.Text(c, subtitle).FontSize(t.FontSize * 0.85).TextColor(t.TextMuted)
 		}
 	})
 }
 
+// emptyState mirrors components::empty_state: py 48, gap 2, centered.
 func emptyState(c *ui.Context, title, body string) ui.Element {
 	t := c.Theme()
-	return ui.Column(c).Gap(t.Space(2)).AlignItems(ui.Center).Padding(t.Space(12)).Children(func() {
-		ui.Text(c, title).FontSize(t.FontSize).Bold()
+	return ui.Column(c).Gap(t.Space(2)).AlignItems(ui.Center).Justify(ui.Center).Padding(48, 0).Children(func() {
+		ui.Text(c, title).FontSize(t.FontSize).Bold().TextColor(t.Text)
 		ui.Text(c, body).FontSize(t.FontSize).TextColor(t.TextMuted)
 	})
 }
 
+// banner mirrors components::banner: gap 1, p 3 (12), radius 10.
 func banner(c *ui.Context, title, body string, fg, bgc ui.Color) ui.Element {
 	t := c.Theme()
-	return ui.Box(c).Border(1, fg).Background(bgc).Padding(t.Space(3)).Radius(t.Radius).Children(func() {
-		ui.Text(c, title).FontSize(t.FontSize).Bold().TextColor(fg)
-		ui.Text(c, body).FontSize(t.FontSize).TextColor(t.TextMuted)
+	return ui.Box(c).Border(1, fg).Background(bgc).Padding(12).Radius(10).Children(func() {
+		ui.Column(c).Gap(t.Space(1)).Children(func() {
+			ui.Text(c, title).FontSize(t.FontSize).TextColor(fg)
+			ui.Text(c, body).FontSize(t.FontSize).TextColor(t.TextMuted)
+		})
 	})
 }
 
+// fieldRow mirrors components::field_row: py 2, bottom border.
 func fieldRow(c *ui.Context, label, value string) ui.Element {
 	t := c.Theme()
-	return ui.Row(c).Gap(t.Space(4)).AlignItems(ui.Center).Children(func() {
+	return ui.Row(c).Gap(t.Space(4)).AlignItems(ui.Center).Padding(t.Space(2), 0).BorderWidth(0, 0, 1, 0).BorderColor(t.Border).Children(func() {
 		ui.Text(c, label).FontSize(t.FontSize).TextColor(t.TextMuted)
 		ui.Spacer(c)
 		ui.Text(c, value).FontSize(t.FontSize).TextColor(t.Text)
@@ -821,7 +840,7 @@ func fieldRow(c *ui.Context, label, value string) ui.Element {
 
 func chipButton(c *ui.Context, label string, active bool, onClick func()) ui.Element {
 	t := c.Theme()
-	el := ui.Button(c, label).FontSize(t.FontSize*0.85).Padding(t.Space(1), t.Space(3)).Radius(t.Radius)
+	el := ui.Button(c, label).FontSize(t.FontSize * 0.85).Padding(t.Space(1), 12).Radius(6)
 	if active {
 		el = el.Background(inset).Border(1, accent).TextColor(accent)
 	} else {
@@ -1038,15 +1057,15 @@ func (a *app) brandBlock(c *ui.Context) ui.Element {
 }
 
 func (a *app) renderShell(c *ui.Context) {
-	t := c.Theme()
-	ui.Row(c).Fill().Children(func() {
-		a.renderSidebar(c)
-		ui.Column(c).Grow(1).MinHeight(0).Children(func() {
-			a.renderHeader(c)
-			a.renderPage(c)
-			ui.Divider(c).Height(1).Background(t.Border)
-			a.renderStatusBar(c)
+	ui.Column(c).Fill().Children(func() {
+		ui.Row(c).FillWidth().Grow(1).MinHeight(0).Children(func() {
+			a.renderSidebar(c)
+			ui.Column(c).Grow(1).MinWidth(0).FillHeight().MinHeight(0).Children(func() {
+				a.renderHeader(c)
+				a.renderPage(c)
+			})
 		})
+		a.renderStatusBar(c)
 	})
 }
 
@@ -1058,33 +1077,59 @@ func (a *app) renderSidebar(c *ui.Context) {
 	account := a.accountLabel()
 	a.mu.Unlock()
 
-	ui.Column(c).Width(260).Fill().Background(sidebar).Padding(t.Space(4)).Gap(t.Space(2)).Children(func() {
-		a.brandBlock(c)
+	// Mirrors render_sidebar: w 232, p 4 (16), no gap; children stacked with
+	// a flex spacer between nav and the status card, right border.
+	ui.Column(c).Width(sidebarWidth).FillHeight().Background(sidebar).Padding(16).
+		BorderWidth(0, 1, 0, 0).BorderColor(border).
+		Children(func() {
+			// Brand: 34px icon, radius 10, text_sm semibold + text_xs faint.
+			ui.Row(c).Gap(t.Space(3)).AlignItems(ui.Center).Children(func() {
+				ui.Box(c).Width(34).Height(34).Radius(10).Background(accent).AlignItems(ui.Center).Justify(ui.Center).Children(func() {
+					ui.Box(c).Width(15).Height(15).Radius(7.5).Border(2, ui.RGB(0xff, 0xff, 0xff)).Fill()
+				})
+				ui.Column(c).Children(func() {
+					ui.Text(c, appTitle).FontSize(t.FontSize)
+					ui.Text(c, appTagline).FontSize(t.FontSize * 0.85).TextColor(faint)
+				})
+			})
 
-		ui.Column(c).Gap(t.Space(1)).Grow(1).Padding(0, 0, t.Space(4), 0).Children(func() {
-			for _, p := range []page{pageOverview, pageActivity, pageConflicts, pageSettings} {
-				a.navItem(c, p)
-			}
-		})
-
-		ui.Box(c).Background(t.Surface).Border(1, t.Border).Radius(t.Radius).Padding(t.Space(2)).Children(func() {
-			ui.Column(c).Gap(t.Space(2)).Children(func() {
-				dot, _, _ := a.badgeColors()
-				statusDot(c, badgeText, dot)
-				ui.Text(c, account).FontSize(t.FontSize * 0.85).Bold()
-				pauseLabel := a.pauseLabel()
-				if ui.Button(c, pauseLabel).Background(accent).TextColor(ui.RGB(0xff, 0xff, 0xff)).Fill().FontSize(t.FontSize * 0.85).Clicked() {
-					go a.togglePause()
+			// Nav: mt 6 (24), gap 1 (4).
+			ui.Column(c).Gap(t.Space(1)).Margin(t.Space(6), 0, 0, 0).Children(func() {
+				for _, p := range []page{pageOverview, pageActivity, pageConflicts, pageSettings} {
+					a.navItem(c, p)
 				}
 			})
-		})
 
-		ui.Row(c).Gap(t.Space(1)).Children(func() {
-			ui.Text(c, fmt.Sprintf("v%s", appVersion())).FontSize(t.FontSize * 0.85).TextColor(faint)
 			ui.Spacer(c)
-			ui.Text(c, "Linux").FontSize(t.FontSize * 0.85).TextColor(faint)
+
+			// Status card: gap 3 (12), p 3 (12), radius 10.
+			ui.Box(c).Background(card).Border(1, border).Radius(10).Padding(12).Children(func() {
+				ui.Column(c).Gap(t.Space(3)).Children(func() {
+					dot, _, _ := a.badgeColors()
+					ui.Row(c).Gap(t.Space(2)).AlignItems(ui.Center).Children(func() {
+						ui.Box(c).Width(7).Height(7).Radius(3.5).Background(dot)
+						ui.Text(c, badgeText).TextColor(dot).FontSize(t.FontSize * 0.85)
+					})
+					ui.Text(c, account).FontSize(t.FontSize).SingleLine()
+					pauseColor := accent
+					switch a.engineState() {
+					case "Paused":
+						pauseColor = ok
+					case "GuardPaused":
+						pauseColor = warn
+					}
+					if ui.Button(c, a.pauseLabel()).Background(pauseColor).TextColor(ui.RGB(0xff, 0xff, 0xff)).FillWidth().FontSize(t.FontSize).Clicked() {
+						go a.togglePause()
+					}
+				})
+			})
+
+			// Footer: mt 3 (12), text_xs faint.
+			ui.Row(c).Margin(t.Space(3), 0, 0, 0).AlignItems(ui.Center).Justify(ui.SpaceBetween).Children(func() {
+				ui.Text(c, fmt.Sprintf("v%s", appVersion())).FontSize(t.FontSize * 0.85).TextColor(faint)
+				ui.Text(c, "Linux").FontSize(t.FontSize * 0.85).TextColor(faint)
+			})
 		})
-	})
 }
 
 func (a *app) navItem(c *ui.Context, p page) ui.Element {
@@ -1098,7 +1143,9 @@ func (a *app) navItem(c *ui.Context, p page) ui.Element {
 	}
 	a.mu.Unlock()
 
-	el := ui.Row(c).Gap(t.Space(2)).AlignItems(ui.Center).Padding(t.Space(2), t.Space(3)).Radius(t.Radius).
+	// Mirrors components::nav_item: px 3 (12), py 2 (8), radius 8, text_sm.
+	el := ui.Row(c).Gap(t.Space(2)).AlignItems(ui.Center).Padding(t.Space(2), t.Space(3)).Radius(8).
+		FontSize(t.FontSize).
 		TextColor(func() ui.Color {
 			if selected {
 				return t.Text
@@ -1143,14 +1190,16 @@ func (a *app) renderHeader(c *ui.Context) {
 	}
 	a.mu.Unlock()
 
-	ui.Row(c).AlignItems(ui.Center).Justify(ui.SpaceBetween).Gap(t.Space(4)).Padding(t.Space(4), t.Space(5)).Children(func() {
+	// Mirrors render_header: px 28, py 4 (16), bottom border.
+	ui.Row(c).AlignItems(ui.Center).Justify(ui.SpaceBetween).Gap(t.Space(4)).Padding(16, pagePadding).
+		BorderWidth(0, 0, 1, 0).BorderColor(border).FillWidth().Children(func() {
 		ui.Column(c).Gap(t.Space(1)).Children(func() {
 			ui.Text(c, pageTitle).FontSize(t.FontSize * 1.5).Bold()
 			ui.Text(c, pageSubtitle).FontSize(t.FontSize).TextColor(t.TextMuted)
 		})
 		ui.Row(c).Gap(t.Space(3)).AlignItems(ui.Center).Children(func() {
 			statusDot(c, statusLabel, statusColor)
-			if ui.Button(c, "Open folder").Background(t.SurfaceHover).TextColor(t.Text).Clicked() {
+			if ui.Button(c, "Open folder").Background(cardHover).Border(1, borderStrong).TextColor(t.Text).Clicked() {
 				go a.openSyncFolder()
 			}
 		})
@@ -1170,10 +1219,12 @@ func (a *app) renderStatusBar(c *ui.Context) {
 	}
 	a.mu.Unlock()
 
-	ui.Row(c).AlignItems(ui.Center).Justify(ui.SpaceBetween).Gap(t.Space(4)).Padding(t.Space(3), t.Space(5)).Children(func() {
+	// Mirrors render_status_bar: px 28, py 2 (8), top border, text_xs faint.
+	ui.Row(c).AlignItems(ui.Center).Justify(ui.SpaceBetween).Gap(t.Space(4)).Padding(t.Space(2), pagePadding).
+		BorderWidth(1, 0, 0, 0).BorderColor(border).FillWidth().Children(func() {
 		ui.Row(c).Gap(t.Space(2)).AlignItems(ui.Center).Children(func() {
 			ui.Text(c, "Sync folder").FontSize(t.FontSize * 0.85).TextColor(t.TextMuted)
-			ui.Text(c, root).FontSize(t.FontSize * 0.85).TextColor(t.Text).SingleLine()
+			ui.Text(c, root).FontSize(t.FontSize * 0.85).TextColor(faint).SingleLine()
 		})
 		ui.Text(c, counts).FontSize(t.FontSize * 0.85).TextColor(faint)
 	})
@@ -1183,6 +1234,7 @@ func (a *app) renderPage(c *ui.Context) {
 	a.mu.Lock()
 	p := a.page
 	a.mu.Unlock()
+
 	switch p {
 	case pageOverview:
 		a.renderOverview(c)
@@ -1230,8 +1282,9 @@ func (a *app) renderOverview(c *ui.Context) {
 	recent := a.recentActivity(7)
 	a.mu.Unlock()
 
-	ui.Box(c).FillWidth().Grow(1).MinHeight(0).Padding(t.Space(7)).Children(func() {
-		ui.Column(c).Grow(1).MinHeight(0).Gap(t.Space(5)).Children(func() {
+	// Mirrors overview::render: p 28, gap 5 (20), scrollable.
+	ui.Scroll(c).FillWidth().Grow(1).MinHeight(0).Padding(pagePadding).Children(func() {
+		ui.Column(c).FillWidth().Gap(t.Space(5)).Children(func() {
 			if a.engineState() == "GuardPaused" {
 				banner(c, "Too many deletes in a short window",
 					"Syncing is paused to protect your Drive. Review the pending deletions, then resume to approve them.",
@@ -1239,10 +1292,10 @@ func (a *app) renderOverview(c *ui.Context) {
 			}
 
 			pageCard(c, func() {
-				ui.Column(c).Gap(t.Space(4)).Children(func() {
+				ui.Column(c).Gap(t.Space(3)).Children(func() {
 					ui.Row(c).AlignItems(ui.Start).Justify(ui.SpaceBetween).Gap(t.Space(4)).Children(func() {
 						ui.Column(c).Gap(t.Space(1)).Children(func() {
-							ui.Text(c, headline).FontSize(t.FontSize * 1.75).Bold()
+							ui.Text(c, headline).FontSize(t.FontSize * 2).Bold()
 							ui.Text(c, account).FontSize(t.FontSize).TextColor(t.TextMuted).SingleLine()
 						})
 						pill(c, badgeText, badgeFg, badgeBg)
@@ -1281,7 +1334,7 @@ func (a *app) renderOverview(c *ui.Context) {
 					ui.Column(c).Gap(t.Space(3)).Children(func() {
 						ui.Row(c).AlignItems(ui.Center).Justify(ui.SpaceBetween).Children(func() {
 							sectionTitle(c, "Needs attention", "Conflicts and failed uploads")
-							if ui.Button(c, "Review").Background(t.SurfaceHover).TextColor(t.Text).Clicked() {
+							if ui.Button(c, "Review").Background(cardHover).TextColor(muted).Radius(6).Clicked() {
 								a.setPage(pageConflicts)
 							}
 						})
@@ -1300,7 +1353,7 @@ func (a *app) renderOverview(c *ui.Context) {
 				ui.Column(c).Gap(t.Space(3)).Children(func() {
 					ui.Row(c).AlignItems(ui.Center).Justify(ui.SpaceBetween).Children(func() {
 						sectionTitle(c, "Recent activity", "Newest first")
-						if ui.Button(c, "View all").Background(t.SurfaceHover).TextColor(t.Text).Clicked() {
+						if ui.Button(c, "View all").Background(cardHover).TextColor(muted).Radius(6).Clicked() {
 							a.setPage(pageActivity)
 						}
 					})
@@ -1337,18 +1390,20 @@ func (a *app) renderActivity(c *ui.Context) {
 
 	rows := a.filteredActivity(f)
 
-	ui.Box(c).FillWidth().Grow(1).MinHeight(0).Padding(t.Space(7)).Children(func() {
-		ui.Column(c).Grow(1).MinHeight(0).Gap(t.Space(4)).Children(func() {
-			ui.Row(c).Gap(t.Space(2)).Wrap().Children(func() {
+	// Mirrors activity::render: p 28, gap 4 (16).
+	ui.Box(c).FillWidth().Grow(1).MinHeight(0).Padding(pagePadding).Children(func() {
+		ui.Column(c).Grow(1).MinHeight(0).FillWidth().Gap(t.Space(4)).Children(func() {
+			// Filter pills: px 3 (12), py 1 (4), radius full, text_xs, gap 2.
+			ui.Row(c).Gap(t.Space(2)).Wrap().AlignItems(ui.Center).Children(func() {
 				for _, candidate := range allFilters {
 					active := candidate == f
 					count := a.activityCount(candidate)
 					el := ui.Button(c, fmt.Sprintf("%s %d", candidate.label(), count)).
-						FontSize(t.FontSize*0.85).Padding(t.Space(1), t.Space(3)).Radius(999)
+						FontSize(t.FontSize * 0.85).Padding(t.Space(1), t.Space(3)).Radius(999)
 					if active {
 						el = el.Background(accent).TextColor(t.Text)
 					} else {
-						el = el.Background(t.Surface).TextColor(t.TextMuted)
+						el = el.Background(card).TextColor(t.TextMuted)
 					}
 					if el.Clicked() {
 						a.setFilter(candidate)
@@ -1356,26 +1411,36 @@ func (a *app) renderActivity(c *ui.Context) {
 				}
 			})
 
-			pageCard(c, func() {
+			// List card: radius 12, header row with bottom border, then
+			// the table header and the (scrollable) rows.
+			ui.Box(c).FillWidth().Grow(1).MinHeight(0).Background(card).Border(1, border).Radius(12).Children(func() {
 				ui.Column(c).Grow(1).MinHeight(0).Children(func() {
-					ui.Row(c).AlignItems(ui.Center).Justify(ui.SpaceBetween).Padding(t.Space(3), t.Space(4)).Children(func() {
-						ui.Text(c, fmt.Sprintf("%d %s", len(rows), pluralize(len(rows), "event", "events"))).FontSize(t.FontSize).Bold()
-						if ui.Button(c, "Settings").Background(t.SurfaceHover).TextColor(t.Text).Clicked() {
+					ui.Row(c).AlignItems(ui.Center).Justify(ui.SpaceBetween).Padding(t.Space(3), 16).
+						BorderWidth(0, 0, 1, 0).BorderColor(border).Children(func() {
+						ui.Text(c, fmt.Sprintf("%d %s", len(rows), pluralize(len(rows), "event", "events"))).FontSize(t.FontSize)
+						if ui.Button(c, "Settings").Background(cardHover).TextColor(muted).Radius(6).Clicked() {
 							a.setPage(pageSettings)
 						}
 					})
 					if len(rows) == 0 {
 						emptyState(c, "Nothing here yet", "Sync activity will show up as files move in either direction.")
 					} else {
-						ui.Row(c).Gap(t.Space(3)).Padding(t.Space(2), t.Space(4)).Children(func() {
+						// Table header: px 4 (16), py 2 (8), text_xs faint.
+						ui.Row(c).Gap(t.Space(3)).Padding(t.Space(2), 16).
+							BorderWidth(0, 0, 1, 0).BorderColor(border).Children(func() {
 							ui.Text(c, "Time").FontSize(t.FontSize * 0.85).TextColor(faint).Width(64)
 							ui.Text(c, "Event").FontSize(t.FontSize * 0.85).TextColor(faint).Width(92)
 							ui.Text(c, "Path").FontSize(t.FontSize * 0.85).TextColor(faint).Grow(1)
 						})
-						ui.Column(c).Grow(1).MinHeight(0).Children(func() {
-							for _, it := range rows {
-								a.activityRow(c, it)
-							}
+						// Rows: 42 DIP tall each, like the uniform_list rows.
+						ui.Scroll(c).Grow(1).MinHeight(0).TrackScroll(&a.activityScroll).Children(func() {
+							ui.Column(c).FillWidth().Children(func() {
+								for _, it := range rows {
+									ui.Box(c).FillWidth().Height(42).Children(func() {
+										a.activityRow(c, it)
+									})
+								}
+							})
 						})
 					}
 				})
@@ -1384,15 +1449,17 @@ func (a *app) renderActivity(c *ui.Context) {
 	})
 }
 
+// activityRow mirrors ui::activity_row: py 2 (8), bottom border, pill for
+// the event kind.
 func (a *app) activityRow(c *ui.Context, it activityItem) ui.Element {
 	t := c.Theme()
 	return ui.Column(c).Children(func() {
-		ui.Row(c).Gap(t.Space(3)).AlignItems(ui.Center).Padding(t.Space(2), 0).Children(func() {
-			ui.Text(c, formatTime(it.AtUnix)).FontSize(t.FontSize).TextColor(faint).Width(64)
-			ui.Text(c, kindLabel(it.Kind)).FontSize(t.FontSize).TextColor(kindColor(it.Kind)).Width(92).SingleLine()
+		ui.Row(c).Gap(t.Space(3)).AlignItems(ui.Center).Padding(t.Space(2), 0).
+			BorderWidth(0, 0, 1, 0).BorderColor(t.Border).Children(func() {
+			ui.Text(c, formatTime(it.AtUnix)).FontSize(t.FontSize * 0.85).TextColor(faint).Width(64)
+			pill(c, kindLabel(it.Kind), kindColor(it.Kind), inset)
 			ui.Text(c, it.Path).FontSize(t.FontSize).TextColor(t.Text).Grow(1).SingleLine()
 		})
-		ui.Divider(c).Height(1).Background(t.Border)
 	})
 }
 
@@ -1415,8 +1482,9 @@ func (a *app) renderConflicts(c *ui.Context) {
 	errored := append([]erroredItem(nil), a.errored...)
 	a.mu.Unlock()
 
-	ui.Box(c).FillWidth().Grow(1).MinHeight(0).Padding(t.Space(7)).Children(func() {
-		ui.Column(c).Grow(1).MinHeight(0).Gap(t.Space(5)).Children(func() {
+	// Mirrors conflicts::render: p 28, gap 5 (20), scrollable.
+	ui.Scroll(c).FillWidth().Grow(1).MinHeight(0).Padding(pagePadding).Children(func() {
+		ui.Column(c).FillWidth().Gap(t.Space(5)).Children(func() {
 			if len(conflicts) == 0 && len(errored) == 0 {
 				pageCard(c, func() {
 					emptyState(c, "Everything is in sync", "No conflicts or failed uploads. Keep-both copies and upload errors will show up here.")
@@ -1428,10 +1496,13 @@ func (a *app) renderConflicts(c *ui.Context) {
 					ui.Column(c).Gap(t.Space(3)).Children(func() {
 						sectionTitle(c, "Conflicts", "The remote copy changed while a local edit was pending")
 						for _, path := range conflicts {
-							ui.Box(c).Background(inset).Padding(t.Space(3)).Radius(t.Radius).Children(func() {
-								ui.Text(c, path).FontSize(t.FontSize).Bold().SingleLine()
-								ui.Text(c, "Kept both versions — the local copy will be renamed with a conflict suffix and uploaded separately.").
-									FontSize(t.FontSize * 0.85).TextColor(t.TextMuted)
+							// Inset box: p 3 (12), radius 8, gap 1 (4).
+							ui.Box(c).Background(inset).Padding(12).Radius(8).Children(func() {
+								ui.Column(c).Gap(t.Space(1)).Children(func() {
+									ui.Text(c, path).FontSize(t.FontSize).SingleLine()
+									ui.Text(c, "Kept both versions — the local copy will be renamed with a conflict suffix and uploaded separately.").
+										FontSize(t.FontSize * 0.85).TextColor(t.TextMuted)
+								})
 							})
 						}
 					})
@@ -1447,9 +1518,11 @@ func (a *app) renderConflicts(c *ui.Context) {
 							if msg == "" {
 								msg = "Upload failed without a reported reason."
 							}
-							ui.Box(c).Background(inset).Padding(t.Space(3)).Radius(t.Radius).Children(func() {
-								ui.Text(c, it.Path).FontSize(t.FontSize).Bold().SingleLine()
-								ui.Text(c, msg).FontSize(t.FontSize * 0.85).TextColor(danger)
+							ui.Box(c).Background(inset).Padding(12).Radius(8).Children(func() {
+								ui.Column(c).Gap(t.Space(1)).Children(func() {
+									ui.Text(c, it.Path).FontSize(t.FontSize).SingleLine()
+									ui.Text(c, msg).FontSize(t.FontSize * 0.85).TextColor(danger)
+								})
 							})
 						}
 					})
@@ -1482,8 +1555,13 @@ func (a *app) renderSettings(c *ui.Context) {
 	mountErr := a.mountError
 	a.mu.Unlock()
 
-	ui.Box(c).FillWidth().Grow(1).MinHeight(0).Padding(t.Space(7)).Children(func() {
-		ui.Column(c).Grow(1).MinHeight(0).Gap(t.Space(4)).Children(func() {
+	// Mirrors settings::render: p 28, gap 4 (16), scrollable, with the
+	// "Preferences" heading and cards in the GPUI order.
+	a.settingsScroll.Y = 0
+	ui.Scroll(c).FillWidth().Grow(1).MinHeight(0).Padding(pagePadding).TrackScroll(&a.settingsScroll).Children(func() {
+		ui.Column(c).FillWidth().Gap(t.Space(4)).Children(func() {
+			ui.Text(c, "Preferences").FontSize(t.FontSize).Bold()
+
 			if switching {
 				banner(c, "Switching sync mode…", "The sync engine is restarting with your new setting. This notice clears when the new mode is active.", accent, inset)
 			}
@@ -1493,26 +1571,36 @@ func (a *app) renderSettings(c *ui.Context) {
 					warn, warnSoft)
 			}
 
+			// Account card: field row + sign-out row.
 			pageCard(c, func() {
 				ui.Column(c).Gap(t.Space(3)).Children(func() {
 					sectionTitle(c, "Account", "The Proton account this sync root belongs to")
 					fieldRow(c, "Signed in as", account)
+					ui.Row(c).AlignItems(ui.Center).Justify(ui.SpaceBetween).Gap(t.Space(4)).Children(func() {
+						ui.Text(c, "Signing out stops sync and deletes the saved session.").
+							FontSize(t.FontSize * 0.85).TextColor(t.TextMuted).Grow(1)
+						if ui.Button(c, "Sign out…").Background(cardHover).Border(1, borderStrong).TextColor(t.Text).Radius(6).Clicked() {
+							a.openSignOut()
+						}
+					})
 				})
 			})
 
+			// Sync mode card, with the cache block inside it (as in GPUI).
 			pageCard(c, func() {
 				ui.Column(c).Gap(t.Space(4)).Children(func() {
-					sectionTitle(c, "Sync mode", "")
+					sectionTitle(c, "Sync mode", "How files in the sync folder are stored locally")
 					for _, m := range []syncMode{modePlaceholders, modeMirror} {
-						title := m.label()
-						detail := ""
-						if m == modePlaceholders {
-							detail = "Files stay on Drive until you open them; the local cache is capped and cleaned up automatically. Nothing else downloads."
-						} else {
-							detail = "Every file in your Drive is downloaded to the sync folder. This uses more disk space but works offline."
-						}
+						title, detail := func() (string, string) {
+							if m == modePlaceholders {
+								return "On demand (recommended)",
+									"Files appear as placeholders at ~0 bytes. Opening one downloads it on the spot; the local cache is capped and cleaned up automatically. Nothing else is stored on disk."
+							}
+							return "Mirror everything",
+								"Every file on Drive is downloaded into the sync folder and kept in full — offline by default, uses the same space as your Drive."
+						}()
 						selected := currentMode == m
-						el := ui.Row(c).Gap(t.Space(3)).AlignItems(ui.Start).Padding(t.Space(3)).Radius(t.Radius).Border(1, func() ui.Color {
+						el := ui.Box(c).FillWidth().Padding(12).Radius(8).Border(1, func() ui.Color {
 							if selected {
 								return accent
 							}
@@ -1527,74 +1615,103 @@ func (a *app) renderSettings(c *ui.Context) {
 							a.openModeSwitch(m)
 						}
 						el.Children(func() {
-							ui.Column(c).Gap(t.Space(1)).Grow(1).Children(func() {
-								ui.Text(c, title).FontSize(t.FontSize).Bold()
+							ui.Column(c).FillWidth().Gap(t.Space(1)).Children(func() {
+								ui.Row(c).AlignItems(ui.Center).Justify(ui.SpaceBetween).Children(func() {
+									ui.Text(c, title).FontSize(t.FontSize)
+									if selected {
+										pill(c, "Active", ok, okSoft)
+									}
+								})
 								ui.Text(c, detail).FontSize(t.FontSize * 0.85).TextColor(t.TextMuted)
 							})
 						})
 					}
 					ui.Text(c, "Switching modes keeps every file and never deletes from Drive.").FontSize(t.FontSize * 0.85).TextColor(t.TextMuted)
+
+					if currentMode == modePlaceholders {
+						ui.Column(c).Gap(t.Space(2)).Children(func() {
+							ui.Row(c).AlignItems(ui.Center).Justify(ui.SpaceBetween).Children(func() {
+								ui.Text(c, "Local cache").FontSize(t.FontSize)
+								var capText string
+								if cacheCap == nil {
+									capText = fmt.Sprintf("%s used / unlimited", formatBytes(cacheUsed))
+								} else {
+									capText = fmt.Sprintf("%s used / %s max", formatBytes(cacheUsed), formatBytes(*cacheCap))
+								}
+								ui.Text(c, capText).FontSize(t.FontSize * 0.85).TextColor(t.TextMuted)
+							})
+							ui.Row(c).Gap(t.Space(2)).Wrap().Children(func() {
+								presets := []struct {
+									cap   *uint64
+									label string
+								}{
+									{ptr(uint64(2 << 30)), "2 GB"},
+									{ptr(uint64(5 << 30)), "5 GB"},
+									{ptr(uint64(10 << 30)), "10 GB"},
+									{ptr(uint64(25 << 30)), "25 GB"},
+									{nil, "Unlimited"},
+								}
+								for _, p := range presets {
+									active := (cacheCap == nil && p.cap == nil) || (cacheCap != nil && p.cap != nil && *cacheCap == *p.cap)
+									chipButton(c, p.label, active, func(cap *uint64) func() {
+										return func() { go a.setCacheCap(cap) }
+									}(p.cap))
+								}
+							})
+							ui.Text(c, "Files you open are stored locally up to this size; the least-used are cleaned automatically. Pinned files are never cleaned.").
+								FontSize(t.FontSize * 0.85).TextColor(t.TextMuted)
+						})
+					}
 				})
 			})
 
-			if currentMode == modePlaceholders {
-				pageCard(c, func() {
-					ui.Column(c).Gap(t.Space(3)).Children(func() {
-						ui.Row(c).AlignItems(ui.Center).Justify(ui.SpaceBetween).Children(func() {
-							ui.Text(c, "Local cache").FontSize(t.FontSize).Bold()
-							var capText string
-							if cacheCap == nil {
-								capText = fmt.Sprintf("%s used / unlimited", formatBytes(cacheUsed))
-							} else {
-								capText = fmt.Sprintf("%s used / %s", formatBytes(cacheUsed), formatBytes(*cacheCap))
-							}
-							ui.Text(c, capText).FontSize(t.FontSize * 0.85).TextColor(t.TextMuted)
-						})
-						ui.Row(c).Gap(t.Space(2)).Wrap().Children(func() {
-							presets := []struct {
-								cap   *uint64
-								label string
-							}{
-								{ptr(uint64(2 << 30)), "2 GB"},
-								{ptr(uint64(5 << 30)), "5 GB"},
-								{ptr(uint64(10 << 30)), "10 GB"},
-								{ptr(uint64(25 << 30)), "25 GB"},
-								{nil, "Unlimited"},
-							}
-							for _, p := range presets {
-								active := (cacheCap == nil && p.cap == nil) || (cacheCap != nil && p.cap != nil && *cacheCap == *p.cap)
-								chipButton(c, p.label, active, func(cap *uint64) func() {
-									return func() { go a.setCacheCap(cap) }
-								}(p.cap))
-							}
-						})
-						ui.Text(c, "Files you open are stored locally up to this size; the least-used are cleaned automatically. Pinned files are never cleaned.").
-							FontSize(t.FontSize * 0.85).TextColor(t.TextMuted)
-					})
-				})
-			}
-
+			// Sync folder card: inset path row with Open folder button.
 			pageCard(c, func() {
 				ui.Column(c).Gap(t.Space(3)).Children(func() {
-					sectionTitle(c, "Sync folder", "")
-					fieldRow(c, "Location", root)
+					folderSub := "Everything in this folder is mirrored to Proton Drive"
 					if currentMode == modePlaceholders {
-						fieldRow(c, "View", "Placeholder view mounted at the sync folder")
-					} else {
-						fieldRow(c, "View", "Fully materialized folder")
+						folderSub = "A placeholder view of your Drive; files hydrate when opened"
 					}
-					if ui.Button(c, "Open sync folder").Background(t.SurfaceHover).TextColor(t.Text).Clicked() {
-						go a.openSyncFolder()
+					sectionTitle(c, "Sync folder", folderSub)
+					ui.Row(c).AlignItems(ui.Center).Justify(ui.SpaceBetween).Gap(t.Space(4)).Padding(12).Radius(8).Background(inset).Children(func() {
+						ui.Text(c, root).FontSize(t.FontSize).TextColor(t.Text).Grow(1).SingleLine()
+						if ui.Button(c, "Open folder").Background(cardHover).Border(1, borderStrong).TextColor(t.Text).Radius(6).Clicked() {
+							go a.openSyncFolder()
+						}
+					})
+				})
+			})
+
+			// Sync engine card: status row + wide pause button.
+			pageCard(c, func() {
+				ui.Column(c).Gap(t.Space(3)).Children(func() {
+					sectionTitle(c, "Sync engine", "Pause at any time; changes are buffered and applied on resume")
+					ui.Row(c).AlignItems(ui.Center).Justify(ui.SpaceBetween).Children(func() {
+						ui.Text(c, "Status").FontSize(t.FontSize).TextColor(t.TextMuted)
+						dot, fg, bgc := a.badgeColors()
+						pill(c, a.badge(), fg, bgc)
+						_ = dot
+					})
+					pauseColor := accent
+					switch a.engineState() {
+					case "GuardPaused":
+						pauseColor = warn
+					case "Paused":
+						pauseColor = warn
+					}
+					if ui.Button(c, a.pauseLabel()).Background(pauseColor).TextColor(ui.RGB(0xff, 0xff, 0xff)).FillWidth().Radius(6).Clicked() {
+						go a.togglePause()
 					}
 				})
 			})
 
+			// Startup card.
 			pageCard(c, func() {
 				ui.Column(c).Gap(t.Space(3)).Children(func() {
 					sectionTitle(c, "Startup", "Keep syncing in the background without opening the dashboard")
 					ui.Row(c).AlignItems(ui.Center).Justify(ui.SpaceBetween).Gap(t.Space(4)).Children(func() {
 						ui.Column(c).Gap(t.Space(1)).Grow(1).Children(func() {
-							ui.Text(c, "Start at login").FontSize(t.FontSize).Bold()
+							ui.Text(c, "Start at login").FontSize(t.FontSize)
 							ui.Text(c, "Launches minimized to the tray when you sign in, so files keep syncing. Close the dashboard at any time to keep the app running in the background.").
 								FontSize(t.FontSize * 0.85).TextColor(t.TextMuted)
 						})
@@ -1609,27 +1726,19 @@ func (a *app) renderSettings(c *ui.Context) {
 				})
 			})
 
-			pageCard(c, func() {
-				ui.Column(c).Gap(t.Space(3)).Children(func() {
-					sectionTitle(c, "Account actions", "")
-					ui.Row(c).Gap(t.Space(3)).Children(func() {
-						if ui.Button(c, "Sign out").Background(danger).TextColor(ui.RGB(0xff, 0xff, 0xff)).Clicked() {
-							a.openSignOut()
-						}
-						if ui.Button(c, "Quit").Background(t.SurfaceHover).TextColor(t.Text).Clicked() {
-							go a.quit()
-						}
-					})
-				})
-			})
-
+			// About card: field rows, disclosure inset, Quit text button.
 			pageCard(c, func() {
 				ui.Column(c).Gap(t.Space(3)).Children(func() {
 					sectionTitle(c, "About", "A third-party client built on Proton's official Drive SDK")
 					fieldRow(c, "Application", fmt.Sprintf("%s %s", appTitle, appVersion()))
 					fieldRow(c, "Platform", "Linux")
-					ui.Box(c).Background(inset).Padding(t.Space(3)).Radius(t.Radius).Children(func() {
+					ui.Box(c).Background(inset).Padding(12).Radius(8).Children(func() {
 						ui.Text(c, disclosure).FontSize(t.FontSize * 0.85).TextColor(t.TextMuted)
+					})
+					ui.Row(c).Justify(ui.End).FillWidth().Children(func() {
+						if ui.Button(c, "Quit application").Background(bg).TextColor(muted).Radius(6).Clicked() {
+							go a.quit()
+						}
 					})
 				})
 			})
