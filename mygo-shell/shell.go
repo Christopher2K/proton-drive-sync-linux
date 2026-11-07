@@ -45,10 +45,12 @@ func (a *app) view(c *ui.Context) {
 
 func (a *app) renderSplash(c *ui.Context) {
 	t := c.Theme()
+	// Mirrors render_splash: centered brand block, status dot, and a
+	// 420-wide-max disclosure line.
 	ui.Column(c).Fill().AlignItems(ui.Center).Justify(ui.Center).Gap(t.Space(4)).Children(func() {
 		a.brandBlock(c)
 		statusDot(c, "Starting the sync engine…", accent)
-		ui.Text(c, disclosure).FontSize(t.FontSize * 0.85).TextColor(faint).AlignItems(ui.Center)
+		ui.Text(c, disclosure).FontSize(t.FontSize * 0.85).TextColor(faint).MaxWidth(420).TextAlign(ui.Center)
 	})
 }
 
@@ -62,18 +64,21 @@ func (a *app) renderFailure(c *ui.Context) {
 	}
 
 	ui.Column(c).Fill().AlignItems(ui.Center).Justify(ui.Center).Padding(t.Space(6)).Children(func() {
-		pageCard(c, func() {
-			ui.Column(c).Gap(t.Space(4)).Width(520).Children(func() {
+		// Mirrors render_failure: the card itself is 520 wide, p 6 (24),
+		// radius 14, gap 4 (16) — not pageCard, which would stretch
+		// full width with different padding.
+		ui.Box(c).Width(520).Background(t.Surface).Border(1, t.Border).Radius(14).Padding(24).Children(func() {
+			ui.Column(c).Gap(t.Space(4)).Children(func() {
 				a.brandBlock(c)
 				ui.Text(c, "Sync is stopped").FontSize(t.FontSize * 1.25).Bold().TextColor(danger)
 				ui.Box(c).Background(inset).Padding(t.Space(3)).Radius(t.Radius).Children(func() {
 					ui.Text(c, fatal).FontSize(t.FontSize).TextColor(t.TextMuted)
 				})
-				ui.Row(c).Gap(t.Space(3)).Children(func() {
-					if ui.PrimaryButton(c, "Try again").Clicked() {
+				ui.Row(c).Gap(t.Space(3)).AlignItems(ui.Center).Children(func() {
+					if ui.PrimaryButton(c, "Try again").AlignSelf(ui.Start).Clicked() {
 						go a.startEngine()
 					}
-					if ui.Button(c, "Quit").Background(t.SurfaceHover).TextColor(t.Text).Clicked() {
+					if ui.Button(c, "Quit").Background(t.SurfaceHover).TextColor(t.Text).AlignSelf(ui.Start).Clicked() {
 						go a.quit()
 					}
 				})
