@@ -36,6 +36,7 @@ A **Linux** desktop app that syncs Proton Drive into a local folder. **Read `SPE
 - [x] M4 — Hardening: **done 2026-10-30** — (1) crash recovery: rows stuck `Uploading` from a previous run reset to Dirty at startup (re-uploaded through the full F7/retry machinery; vanished files tombstone pre-approved so the guard never trips on recovery); stale `*.pds-part` temps swept from both content roots. (2) Rate limits: `transfer.error` now carries `data.retryAfter` (sidecar + Rust decode) and the engine honors the server hint over the computed backoff; `retry_backoff` unit-tested. (3) Soak battery (`tests/soak.rs`): repeated simultaneous edits, remote-delete-vs-edit, remote burst convergence, conflict-copy churn — **found a real F7 hole**: `apply_remote_delete` trusted `sync_state` alone, so a local write inside the watcher debounce window was DESTROYED by a concurrent remote delete; now hashes on-disk content first (mirrors `apply_node_upsert`). (4) Test-flake root fix: `EngineHandle::wait_for_watcher` — fixtures synchronized on initial-sync completion, which can precede watcher attach, losing inotify events for immediate writes (the "rotating flake" across engine tests). (5) SDK rehearsal documented (`docs/sdk-upgrade-rehearsal.md`); current stack verified green (SDK 0.23.0, crypto 2.2.0 + openpgp patch, Node 22).
 - [x] M5 — Background service, login start, tray: **done 2026-10-31**
 - [x] MyGo migration Option B: **done 2026-11-05** — `crates/engine-headless/` is promoted to the production background sync service; `mygo-shell/` is a full MyGo-native UI replacement that replicates the GPUI Overview/Activity/Conflicts/Settings surface, tray, XDG autostart, single-instance lock, and `--minimized` start. The engine process loops across sign-out and sync-mode switches instead of exiting. The existing GPUI app, CLI, FUSE, and sidecar are untouched. See `docs/research/mygo-migration-poc.md`.
+- [ ] MyGo migration Phase 2 (engine → Go): **in progress 2026-11-07** — plan in `docs/research/go-engine-migration.md`; FUSE-on-Go validated with a real kernel mount (go-fuse v2.12.1); `engine-go/` skeleton speaks the pds-engine-headless socket protocol (protocol + session packages, `pds-engine-go` binary, stub backend; sync internals land next). Known Phase 1 bug: the Rust `UiCommand` tuple variants cannot decode the shell's `SetMode`/`SetCacheCap` shapes — fix pending on the Rust side; the Go engine accepts both shapes.
 
 ## Linux development (OrbStack VM)
 
@@ -138,6 +139,7 @@ proton-drive-sync/
 │   ├── xdg/           # XDG base-dir resolution shared by every crate
 │   └── sidecar-client/ # Sidecar spawn + JSON-RPC protocol (+ MockSidecar for tests)
 ├── mygo-shell/        # MyGo-native production UI shell
+├── engine-go/         # Go sync engine (Phase 2 migration; protocol-compatible skeleton)
 ├── sidecar/           # Node.js + official Proton Drive SDK
 └── packaging/linux/   # .desktop entry, icon, install script
 ```
