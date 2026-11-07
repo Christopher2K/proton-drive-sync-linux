@@ -2,7 +2,10 @@ module pds.dev/engine-go
 
 go 1.26.0
 
-require modernc.org/sqlite v1.62.0
+require (
+	github.com/hanwen/go-fuse/v2 v2.12.1
+	modernc.org/sqlite v1.62.0
+)
 
 require (
 	github.com/dustin/go-humanize v1.1.0 // indirect
