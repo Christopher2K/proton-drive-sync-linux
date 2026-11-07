@@ -146,9 +146,14 @@ func (a *app) renderSettings(c *ui.Context) {
 					sectionTitle(c, "Sync folder", folderSub)
 					ui.Row(c).AlignItems(ui.Center).Justify(ui.SpaceBetween).Gap(t.Space(4)).Padding(12).Radius(8).Background(inset).Children(func() {
 						ui.Text(c, root).FontSize(t.FontSize).TextColor(t.Text).Grow(1).SingleLine()
-						if ui.Button(c, "Open folder").Background(cardHover).Border(1, borderStrong).TextColor(t.Text).Radius(6).Clicked() {
-							go a.openSyncFolder()
-						}
+						ui.Row(c).Gap(t.Space(2)).AlignItems(ui.Center).Children(func() {
+							if ui.Button(c, "Change…").Background(cardHover).Border(1, borderStrong).TextColor(t.Text).Radius(6).Clicked() {
+								a.beginFolderChange()
+							}
+							if ui.Button(c, "Open folder").Background(cardHover).Border(1, borderStrong).TextColor(t.Text).Radius(6).Clicked() {
+								go a.openSyncFolder()
+							}
+						})
 					})
 				})
 			})

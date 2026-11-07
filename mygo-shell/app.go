@@ -28,6 +28,13 @@ type app struct {
 
 	root string
 
+	// folderChange drives the change-sync-folder modal: a text field the
+	// user edits, error text from validating it, and an in-progress flag
+	// while the engine restarts on the new folder.
+	folderChangePath  string
+	folderChangeError string
+	folderChanging    bool
+
 	quitting bool
 	signOut  signOutState
 	page     page
@@ -59,7 +66,7 @@ func newApp() *app {
 		phase: phaseStarting,
 		page:  pageOverview,
 		login: loginState{kind: "idle"},
-		root:  defaultRoot(),
+		root:  storedSyncRoot(),
 	}
 }
 

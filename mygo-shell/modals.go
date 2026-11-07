@@ -89,3 +89,46 @@ func (a *app) renderModeSwitchModal(c *ui.Context) {
 // ---------------------------------------------------------------------------
 // Actions
 // ---------------------------------------------------------------------------
+
+// renderFolderChangeModal shows the change-sync-folder dialog: a path
+// field, validation error, and confirm/cancel. While the engine restarts
+// on the new folder it shows a progress state instead.
+func (a *app) renderFolderChangeModal(c *ui.Context) {
+	t := c.Theme()
+
+	a.mu.Lock()
+	path := a.folderChangePath
+	errText := a.folderChangeError
+	changing := a.folderChanging
+	a.mu.Unlock()
+
+	modalOverlay(c, func() {
+		appCard(c, func() {
+			ui.Column(c).Gap(t.Space(4)).Width(460).Children(func() {
+				ui.Text(c, "Change sync folder").FontSize(t.FontSize * 1.25).Bold()
+				if changing {
+					statusDot(c, "Restarting the sync engine in the new folder…", accent)
+				} else {
+					ui.Text(c, "The engine restarts in the new folder. Files already synced stay where they are; the new folder starts empty and syncs from Drive.").FontSize(t.FontSize).TextColor(t.TextMuted)
+					ui.Field(c, "Folder path", func() {
+						ui.TextInput(c, &path).FillWidth()
+					}).Description("An existing folder; it is created on disk if missing.")
+					if errText != "" {
+						ui.Text(c, errText).FontSize(t.FontSize * 0.85).TextColor(danger)
+					}
+					ui.Row(c).Gap(t.Space(3)).AlignItems(ui.Center).Children(func() {
+						if ui.Button(c, "Change folder").Background(accent).TextColor(ui.RGB(0xff, 0xff, 0xff)).AlignSelf(ui.Start).Clicked() {
+							a.mu.Lock()
+							a.folderChangePath = path
+							a.mu.Unlock()
+							a.confirmFolderChange()
+						}
+						if ui.Button(c, "Cancel").Background(t.SurfaceHover).TextColor(t.Text).AlignSelf(ui.Start).Clicked() {
+							a.cancelFolderChange()
+						}
+					})
+				}
+			})
+		})
+	})
+}

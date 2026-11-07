@@ -34,12 +34,15 @@ func (a *app) view(c *ui.Context) {
 	a.mu.Lock()
 	so := a.signOut
 	ms := a.modeSwitch
+	fc := a.folderChangePath != "" || a.folderChanging || a.folderChangeError != ""
 	a.mu.Unlock()
 
 	if so != signOutNone {
 		a.renderSignOutModal(c)
 	} else if ms != modeSwitchNone {
 		a.renderModeSwitchModal(c)
+	} else if fc {
+		a.renderFolderChangeModal(c)
 	}
 }
 
