@@ -9,6 +9,9 @@ import (
 func (a *app) setPage(p page) {
 	a.mu.Lock()
 	a.page = p
+	if p == pageSettings {
+		a.settingsScroll.Y = 0
+	}
 	a.mu.Unlock()
 	a.invalidate()
 }

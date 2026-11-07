@@ -192,7 +192,6 @@ func (a *app) readUpdates(conn net.Conn) {
 
 func (a *app) applyUpdate(up engineUpdate) {
 	a.mu.Lock()
-	defer a.mu.Unlock()
 
 	switch up.Update {
 	case "AuthRequired":
@@ -222,7 +221,7 @@ func (a *app) applyUpdate(up engineUpdate) {
 		a.mountError = up.Error
 	case "Status":
 		a.status = &engineStatus{
-			State:              up.State,
+			State:              normalizeEngineState(up.State),
 			SyncedNodes:        up.SyncedNodes,
 			DirtyNodes:         up.DirtyNodes,
 			QueuedTombstones:   up.QueuedTombstones,
@@ -279,8 +278,15 @@ func (a *app) applyUpdate(up engineUpdate) {
 		}
 	}
 
+	// SetToolTip marshals to the main thread, which must stay free to run
+	// the UI frame (view()) — calling it with a.mu held deadlocks.
+	tooltip := ""
 	if a.tray != nil {
-		a.tray.SetToolTip(fmt.Sprintf("%s — %s", appTitle, a.badge()))
+		tooltip = fmt.Sprintf("%s — %s", appTitle, a.badge())
+	}
+	a.mu.Unlock()
+	if a.tray != nil {
+		a.tray.SetToolTip(tooltip)
 	}
 	a.invalidate()
 }
@@ -296,6 +302,21 @@ func (a *app) invalidate() {
 	if a.win != nil {
 		a.win.Invalidate()
 	}
+}
+
+// normalizeEngineState maps the engine's EngineState Display strings
+// ("running", "paused", "guard-paused"; crates/core/src/engine.rs) onto the
+// capitalized forms the UI compares against.
+func normalizeEngineState(s string) string {
+	switch s {
+	case "running":
+		return "Running"
+	case "paused":
+		return "Paused"
+	case "guard-paused":
+		return "GuardPaused"
+	}
+	return s
 }
 
 // ---------------------------------------------------------------------------

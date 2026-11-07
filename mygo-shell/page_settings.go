@@ -26,8 +26,9 @@ func (a *app) renderSettings(c *ui.Context) {
 	a.mu.Unlock()
 
 	// Mirrors settings::render: p 28, gap 4 (16), scrollable, with the
-	// "Preferences" heading and cards in the GPUI order.
-	a.settingsScroll.Y = 0
+	// "Preferences" heading and cards in the GPUI order. The scroll
+	// position resets on page entry (setPage), not here — setting it
+	// every frame would fight the user's mouse wheel.
 	ui.Scroll(c).FillWidth().Grow(1).MinHeight(0).Padding(pagePadding).TrackScroll(&a.settingsScroll).Children(func() {
 		ui.Column(c).FillWidth().Gap(t.Space(4)).Children(func() {
 			ui.Text(c, "Preferences").FontSize(t.FontSize).Bold()

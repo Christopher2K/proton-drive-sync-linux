@@ -90,8 +90,11 @@ func (a *app) renderLogin(c *ui.Context) {
 	a.mu.Unlock()
 
 	ui.Column(c).Fill().AlignItems(ui.Center).Justify(ui.Center).Padding(t.Space(6)).Children(func() {
-		pageCard(c, func() {
-			ui.Column(c).Gap(t.Space(4)).Width(460).Children(func() {
+		// Mirrors render_login: the card itself is 460 wide, p 6 (24),
+		// radius 14, gap 4 (16) — not the shared pageCard, which would
+		// stretch full width with different padding.
+		ui.Box(c).Width(460).Background(t.Surface).Border(1, t.Border).Radius(14).Padding(24).Children(func() {
+			ui.Column(c).Gap(t.Space(4)).Children(func() {
 				a.brandBlock(c)
 				ui.Box(c).Background(inset).Padding(t.Space(3)).Radius(t.Radius).Children(func() {
 					ui.Text(c, disclosure).FontSize(t.FontSize * 0.85).TextColor(t.TextMuted)
@@ -101,7 +104,9 @@ func (a *app) renderLogin(c *ui.Context) {
 				case "idle":
 					ui.Text(c, "Sign in with your Proton account to start syncing. Your browser handles the sign-in — this app never sees your password.").
 						FontSize(t.FontSize).TextColor(t.TextMuted)
-					if ui.PrimaryButton(c, "Sign in with Proton").Clicked() {
+					// Buttons hug their label (GPUI px_3 py_1p5);
+					// column children stretch by default here.
+					if ui.PrimaryButton(c, "Sign in with Proton").AlignSelf(ui.Start).Clicked() {
 						go a.startLogin()
 					}
 				case "waiting":
@@ -116,7 +121,7 @@ func (a *app) renderLogin(c *ui.Context) {
 						})
 					}
 					ui.Text(c, login.url).FontSize(t.FontSize * 0.85).TextColor(faint).SingleLine()
-					ui.Row(c).Gap(t.Space(3)).Children(func() {
+					ui.Row(c).Gap(t.Space(3)).AlignItems(ui.Center).Children(func() {
 						if ui.Button(c, "Open sign-in page again").Background(t.SurfaceHover).TextColor(t.Text).Clicked() {
 							_ = mygo.Shell.OpenExternal(login.url)
 						}
@@ -124,7 +129,7 @@ func (a *app) renderLogin(c *ui.Context) {
 					})
 				case "failed":
 					ui.Text(c, fmt.Sprintf("Sign-in failed: %s", login.err)).FontSize(t.FontSize).TextColor(danger)
-					if ui.PrimaryButton(c, "Try again").Clicked() {
+					if ui.PrimaryButton(c, "Try again").AlignSelf(ui.Start).Clicked() {
 						go a.startLogin()
 					}
 				}
