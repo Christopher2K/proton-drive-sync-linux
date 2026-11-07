@@ -8,6 +8,10 @@ should be shown or verified — never claim a visual fix without one. Never use
 `browser.preview` or `html_preview` for native app work; they cannot show this
 app.
 
+For **interaction** (clicking, typing, state assertions) use mygo's
+`ui.NewTester` instead — see the headless-testing skill; screenshots only
+verify rendering.
+
 ## Tool: grim (Wayland)
 
 The machine runs niri on Wayland. `grim` is not on `$PATH`; resolve it fresh

@@ -171,8 +171,10 @@ Gate it in the root view on a state field; render it last.
   `Fill` vs `Width`, `Grow` on hug-containers.
 - Verify visually with a screenshot before claiming a fix; iterate.
 - Unit-test the wire protocol separately (dial the socket, assert parses) —
-  UI code can't be unit-tested, so keep parsing/normalize logic in plain
-  functions.
+  keep parsing/normalize logic in plain functions.
+- **UI logic CAN be tested headlessly**: `ui.NewTester` drives the real view
+  with clicks/typing and asserts via `HasText`/`Texts` — see
+  `mygo-shell/folder_ui_test.go` and the headless-testing skill.
 
 ## Verify loop
 
