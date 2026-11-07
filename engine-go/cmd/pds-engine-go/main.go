@@ -17,8 +17,11 @@ import (
 	"path/filepath"
 	"syscall"
 
+	"pds.dev/engine-go/internal/backend"
+	"pds.dev/engine-go/internal/engine"
 	"pds.dev/engine-go/internal/protocol"
 	"pds.dev/engine-go/internal/session"
+	"pds.dev/engine-go/internal/sidecar"
 	"pds.dev/engine-go/internal/stubbackend"
 )
 
@@ -29,13 +32,44 @@ func main() {
 	flag.Parse()
 
 	logger := log.New(os.Stderr, "pds-engine-go: ", log.LstdFlags|log.Ltime)
-	_ = sidecarCmd // used from Phase 2 step 3 (sidecar client)
 
 	if err := os.MkdirAll(*root, 0o755); err != nil {
 		logger.Fatalf("create sync root: %v", err)
 	}
 
+	// Resolve the sidecar: an explicit --sidecar-cmd / $PDS_SIDECAR_CMD /
+	// discovered installation runs the real engine; without one, fall back
+	// to the protocol-identical stub so the shell still gets a sane state.
+	var cmdOverride *string
+	if *sidecarCmd != "" {
+		cmdOverride = sidecarCmd
+	}
+	client, _, err := sidecar.SpawnSidecar(cmdOverride)
+	if err != nil {
+		logger.Printf("sidecar unavailable (%v); running as protocol stub", err)
+	}
+
 	var sess *session.Session
+	if client != nil {
+		cfg := engine.DefaultConfig()
+		cfg.Root = *root
+		cfg.DBPath = filepath.Join(*root, ".pds", "state.db")
+		be := backend.New(cfg, client, client.Close, func(u protocol.Update) {
+			if sess != nil {
+				sess.Emit(u)
+			}
+		})
+		sess = session.New(session.Config{Root: *root, SocketPath: *socketPath}, be)
+		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+		defer stop()
+		go be.Start(ctx)
+		logger.Printf("starting (root %s, socket %s) — engine live", *root, *socketPath)
+		if err := sess.Run(ctx); err != nil {
+			logger.Fatalf("session: %v", err)
+		}
+		return
+	}
+
 	backend := stubbackend.New(func(u protocol.Update) {
 		if sess != nil {
 			sess.Emit(u)
