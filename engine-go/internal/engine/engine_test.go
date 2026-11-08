@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -20,13 +21,14 @@ import (
 
 // fixture is the Rust Fixture: temp root, mock-connected engine, DB handle.
 type fixture struct {
-	t      *testing.T
-	root   string
-	handle *engine.Handle
-	mock   *sidecar.MockHandle
-	db     *db.Db
-	done   chan error // engine.Run's return
-	client *sidecar.SidecarClient
+	t        *testing.T
+	root     string
+	handle   *engine.Handle
+	mock     *sidecar.MockHandle
+	db       *db.Db
+	done     chan error // engine.Run's return
+	client   *sidecar.SidecarClient
+	stopOnce sync.Once
 }
 
 func start(t *testing.T) *fixture {
@@ -127,19 +129,21 @@ func waitForDeletesAccounted(t *testing.T, fx *fixture, total int) {
 
 func (fx *fixture) shutdown() {
 	fx.t.Helper()
-	select {
-	case <-fx.done:
-		return // already stopped
-	default:
-	}
-	fx.handle.Shutdown()
-	select {
-	case <-fx.done:
-	case <-time.After(30 * time.Second):
-		fx.t.Fatal("engine did not stop")
-	}
-	_ = fx.db.Close()
-	fx.client.Close()
+	fx.stopOnce.Do(func() {
+		select {
+		case <-fx.done:
+			return // already stopped
+		default:
+		}
+		fx.handle.Shutdown()
+		select {
+		case <-fx.done:
+		case <-time.After(30 * time.Second):
+			fx.t.Fatal("engine did not stop")
+		}
+		_ = fx.db.Close()
+		fx.client.Close()
+	})
 }
 
 func (fx *fixture) write(rel string, content []byte) {

@@ -1123,7 +1123,9 @@ func (h *MockHandle) SetDownloadDelay(d time.Duration) {
 
 // EmitEvent emits a raw drive event (for custom scenarios).
 func (h *MockHandle) EmitEvent(ev *DriveEvent) {
-	b, err := json.Marshal(ev)
+	b, err := json.Marshal(map[string]any{
+		"jsonrpc": "2.0", "method": "drive.event", "params": ev,
+	})
 	if err != nil {
 		return
 	}
