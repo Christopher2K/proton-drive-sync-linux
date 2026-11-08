@@ -1,24 +1,29 @@
 #!/usr/bin/env bash
 # Install proton-drive-sync for the local system (Linux only).
 #
-# Works from a repository checkout (expects a `cargo build --release` under
-# target/ and the ./sidecar source tree) or from an extracted release tarball
-# (binaries under bin/, vendored sidecar under share/proton-drive-sync/sidecar).
+# Works from a repository checkout (expects Go builds at
+# ./mygo-shell/proton-drive-sync and ./engine-go/pds-engine-go plus the
+# ./sidecar source tree) or from an extracted release tarball (binaries
+# under bin/, vendored sidecar under share/proton-drive-sync/sidecar).
 #
 # Layout (PREFIX defaults to /usr/local):
-#   $PREFIX/bin/proton-drive-sync          GPUI desktop app
-#   $PREFIX/bin/pds                        CLI companion (if built)
+#   $PREFIX/bin/proton-drive-sync          MyGo desktop app
+#   $PREFIX/bin/pds-engine-go              Go sync engine (headless; driven
+#                                          by the shell over a Unix socket)
 #   $PREFIX/share/proton-drive-sync/sidecar/  Node sidecar (runtime deps vendored)
 #   $PREFIX/share/applications/proton-drive-sync.desktop
 #   $PREFIX/share/icons/hicolor/scalable/apps/proton-drive-sync.svg
 #
 # Usage:
-#   cargo build --release -p pds-app -p pds-cli   # in the repository root
+#   (cd engine-go && go build -o pds-engine-go ./cmd/pds-engine-go)
+#   (cd mygo-shell && go build -o proton-drive-sync .)
 #   sudo packaging/linux/install.sh               # or: PREFIX=$HOME/.local ...
 #
 # Environment:
-#   PDS_BIN   path to the built `proton-drive-sync` binary
-#             (default: <repo>/target/release/proton-drive-sync)
+#   PDS_BIN   path to the built `proton-drive-sync` binary (the MyGo shell)
+#             (default: <repo>/mygo-shell/proton-drive-sync)
+#   PDS_ENGINE_BIN  path to the built `pds-engine-go` binary
+#             (default: <repo>/engine-go/pds-engine-go)
 #   PDS_SKIP_SIDECAR_DEPS=1  skip `npm ci`; you must run it later in the
 #             installed sidecar directory (Node >= 20 required either way)
 
@@ -27,7 +32,7 @@ set -euo pipefail
 # Repository checkout: script lives in packaging/linux/, root is two up.
 # Release tarball: script lives at the tarball root itself.
 script_dir="$(cd "$(dirname "$0")" && pwd)"
-if [ -d "$script_dir/../../crates" ]; then
+if [ -d "$script_dir/../../mygo-shell" ] && [ -d "$script_dir/../../engine-go" ]; then
   cd "$script_dir/../.."
 else
   cd "$script_dir"
@@ -38,20 +43,36 @@ APP_DIR="$PREFIX/share/proton-drive-sync"
 
 fail() { echo "install.sh: $*" >&2; exit 1; }
 
-# Binary location: a repository build (target/release) or an extracted
-# release tarball (bin/). Override with PDS_BIN.
+# Shell binary location: a repository build (mygo-shell/proton-drive-sync)
+# or an extracted release tarball (bin/proton-drive-sync). Override with
+# PDS_BIN.
 BIN="${PDS_BIN:-}"
 if [ -z "$BIN" ]; then
-  if [ -f target/release/proton-drive-sync ]; then
-    BIN=target/release/proton-drive-sync
+  if [ -f mygo-shell/proton-drive-sync ]; then
+    BIN=mygo-shell/proton-drive-sync
   elif [ -f bin/proton-drive-sync ]; then
     BIN=bin/proton-drive-sync
   else
-    fail "binary not found — run 'cargo build --release -p pds-app -p pds-cli' \
-first, or run this script from an extracted release tarball"
+    fail "shell binary not found — build it first with
+'(cd mygo-shell && go build -o proton-drive-sync .)' (and
+'(cd engine-go && go build -o pds-engine-go ./cmd/pds-engine-go)'),
+or run this script from an extracted release tarball"
   fi
 fi
-BIN_DIR="$(dirname "$BIN")"
+
+# Engine binary location: same two layouts. Override with PDS_ENGINE_BIN.
+ENGINE_BIN="${PDS_ENGINE_BIN:-}"
+if [ -z "$ENGINE_BIN" ]; then
+  if [ -f engine-go/pds-engine-go ]; then
+    ENGINE_BIN=engine-go/pds-engine-go
+  elif [ -f bin/pds-engine-go ]; then
+    ENGINE_BIN=bin/pds-engine-go
+  else
+    fail "engine binary not found — build it first with
+'(cd engine-go && go build -o pds-engine-go ./cmd/pds-engine-go)',
+or run this script from an extracted release tarball"
+  fi
+fi
 
 if [ "$(id -u)" -eq 0 ]; then
   SUDO=""
@@ -60,14 +81,11 @@ else
   [ -n "$SUDO" ] || fail "not root and sudo is unavailable; run as root or set PREFIX to a writable dir"
 fi
 
-echo "==> Installing binary to $PREFIX/bin"
+echo "==> Installing shell to $PREFIX/bin"
 $SUDO install -Dm755 "$BIN" "$PREFIX/bin/proton-drive-sync"
-for cand in "$BIN_DIR/pds" target/release/pds; do
-  if [ -f "$cand" ]; then
-    $SUDO install -Dm755 "$cand" "$PREFIX/bin/pds"
-    break
-  fi
-done
+
+echo "==> Installing engine to $PREFIX/bin"
+$SUDO install -Dm755 "$ENGINE_BIN" "$PREFIX/bin/pds-engine-go"
 
 echo "==> Installing sidecar to $APP_DIR/sidecar"
 # Repository layout keeps the sidecar in ./sidecar; release tarballs carry it

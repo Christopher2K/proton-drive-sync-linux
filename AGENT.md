@@ -6,16 +6,19 @@ A **Linux** desktop app that syncs Proton Drive into a local folder. **Read `SPE
 
 ## Tech stack
 
-- **Host app:** Rust + [GPUI Community Edition](https://github.com/gpui-ce/gpui-ce) (`gpui-ce` 0.3, lib name `gpui`) (UI, orchestration, sync engine, SQLite state) — native Linux desktop window (Wayland/X11)
+- **Host UI shell:** MyGo (Go) — `mygo-shell/` is the production Linux dashboard (Overview/Activity/Conflicts/Settings, tray, autostart, single instance)
+- **Sync engine:** Go — `engine-go/` (`pds-engine-go`) runs the sync engine (SQLite state, watcher, queues, FUSE VFS) and exposes a JSON-line Unix socket so the MyGo shell can control it
 - **Drive SDK sidecar:** Node.js + official [`ProtonDriveApps/sdk`](https://github.com/ProtonDriveApps/sdk) (TypeScript client module), spawned as a child process, JSON-RPC over stdio
-- **VFS (M3, planned):** FUSE (`fuser` crate)
+- **VFS:** FUSE via `go-fuse` (`engine-go/internal/vfs/`)
 - **State:** SQLite
+
+The Rust workspace (`crates/` + `Cargo.toml`) was removed after the Go port reached parity (Phase 2, done 2026-11-08) — nothing in the tree references it anymore. Its concepts survive only as history in the milestone log below.
 
 ## Hard rules (non-negotiable)
 
 1. **Conservative deletes.** Remote deletes are always Trash (never permanent), only for nodes previously confirmed synced in SQLite, and subject to the mass-deletion guard (SPEC.md F3). An empty local folder must never wipe the Drive.
 2. **Proton compliance.** Event-based sync only (no polling, no recursive tree scans). Set an honest `x-pm-appversion` header in the `external-drive-{name}@{semver}-{channel}` format. No Proton branding. Login UI must show: *"This is a third-party application not officially supported by Proton."*
-3. **All Drive API traffic goes through the Node sidecar.** Never call Proton endpoints from Rust directly — the sidecar isolates SDK churn and the upcoming 2026/27 crypto migration.
+3. **All Drive API traffic goes through the Node sidecar.** Never call Proton endpoints from Go directly — the sidecar isolates SDK churn and the upcoming 2026/27 crypto migration.
 4. **Keep-both on conflicts** — never silently overwrite in either direction.
 5. **Never evict** pinned, dirty (un-uploaded), or open files from the local cache.
 
@@ -32,37 +35,40 @@ A **Linux** desktop app that syncs Proton Drive into a local folder. **Read `SPE
 - [x] M3.4 — Desktop placeholder integration: **done 2026-10-30** — the app defaults NEW sync roots to placeholder mode and mounts the FUSE view **at the sync root** (`~/ProtonDrive` is the placeholder view). Key decisions: (1) all engine state (SQLite DB, VFS backing cache, `root` marker) lives under `$XDG_DATA_HOME/proton-drive-sync/roots/<hash>/` — OUTSIDE the root — because mounting over the root shadows everything under it and running the DB through FUSE would risk corruption; `crates/core/src/mode.rs` owns these paths (`engine_state_dir`, `root_key`). (2) The app **probes FUSE with a throwaway temp-dir mount BEFORE building the engine** — the engine consumes the sidecar's single notification stream, so a post-hoc mirror fallback would be deaf to remote events; probe failure downgrades the session to mirror (`MountUnavailable` notice in Settings). (3) The real mount goes up **only after `wait_for_watcher`** — the engine's first-run local scan and the layout conversion must see the real folder (the mount serves an empty tree until the first snapshot publish, which would hide every pre-existing local file). (4) Mode is a persisted per-root setting (`meta.sync_mode`, `$PDS_SYNC_MODE` override); Settings toggle → confirm modal → persist → restart the engine thread. Legacy in-root state DBs are adopted into the external dir (copy, original removed after success) and default to mirror so upgrades change nothing. (5) `convert_layout` (engine, runs in `Engine::new` when `backing_dir` is external): mirror→placeholders moves tracked files into the backing cache (hydrated, no re-download) AND adopts untracked leftovers as dirty pending-uploads (nothing stranded under the mount); placeholders→mirror moves hydrated content back; idempotent via a DIRECTION-AWARE `.layout-converted` marker (records which layout it produced — a ran-once marker would strand content on the second toggle), never deletes. (6) Placeholder-mode bug fixed while tracing content paths: F7 conflict renames and remote-name-collision renames wrote into the VISIBLE root instead of the backing dir — all content paths now flow through `content_dir()`. (7) Self-review hardening: `$PDS_SYNC_MODE` is session-only (never rewrites the persisted `sync_mode`); legacy in-root DBs are removed only after the adopted copy verifies as a readable SQLite DB; the app's mount gets an EMPTY `.pds` proxy dir (the fs's state-dir proxy would otherwise serve the live DB + backing cache inside the user-facing mount); the engine never unlinks visible paths in placeholder mode when the root is the mount (an unlink would round-trip through FUSE into a spurious store delete — placeholders vanish via snapshot refresh instead); e2e regression proves mounting over a non-empty root shadows leftovers and preserves every byte. Tests: mode unit tests (incl. env-session-only), `convert_layout` round-trips, `Engine::new` mode-resolution, external-backing adoption integration test, non-empty-root FUSE e2e; full `devenv test` green (Rust + sidecar) plus headless GUI smoke.
 - [x] M3.5 — Configurable cache cap: **done 2026-10-30** — the placeholder backing-cache cap (until now hardwired to `EVICTION_CAP_DEFAULT`, 10 GiB) is user-configurable on three surfaces with precedence **`pds mount --cache-cap <SIZE>` > `$PDS_CACHE_CAP` (session-only, never rewrites the persisted value — same rule as `PDS_SYNC_MODE`) > the persisted per-root Settings choice > 10 GiB default**. `unlimited` (no eviction) is expressible on all three. Sizes parse as bytes with an optional binary `K`/`M`/`G`/`T` suffix (`parse_cache_cap`; `0`/`none`/`off`/`unlimited` → unlimited; invalid values are ignored with a warning, never silently disabling eviction). Persistence: meta key `cache_cap_bytes` (Unlimited stored as the literal `unlimited`; unset key = never configured → default). **Settings applies live**: `Command::SetEvictionCap(Option<u64>)` mutates the running engine's cap and runs an immediate `maybe_evict` pass when the new cap is already exceeded (no restart, unlike the mode toggle); `EngineStatus.cache_cap` feeds the Settings chips (2/5/10/25 GB + Unlimited on the Sync mode card, with a `$PDS_CACHE_CAP`-override notice). App engine build resolves env > persisted > default; `pds sync`/`pds mount` resolve the same way (mount additionally honoring the flag). Tests: parse/precedence/persistence unit tests, live `set_cache_cap` integration test (immediate eviction on shrink, no eviction after re-widening to unlimited); full `devenv test` green incl. real-kernel FUSE e2e.
 - [x] M4 — Hardening: **done 2026-10-30** — (1) crash recovery: rows stuck `Uploading` from a previous run reset to Dirty at startup (re-uploaded through the full F7/retry machinery; vanished files tombstone pre-approved so the guard never trips on recovery); stale `*.pds-part` temps swept from both content roots. (2) Rate limits: `transfer.error` now carries `data.retryAfter` (sidecar + Rust decode) and the engine honors the server hint over the computed backoff; `retry_backoff` unit-tested. (3) Soak battery (`tests/soak.rs`): repeated simultaneous edits, remote-delete-vs-edit, remote burst convergence, conflict-copy churn — **found a real F7 hole**: `apply_remote_delete` trusted `sync_state` alone, so a local write inside the watcher debounce window was DESTROYED by a concurrent remote delete; now hashes on-disk content first (mirrors `apply_node_upsert`). (4) Test-flake root fix: `EngineHandle::wait_for_watcher` — fixtures synchronized on initial-sync completion, which can precede watcher attach, losing inotify events for immediate writes (the "rotating flake" across engine tests). (5) SDK rehearsal documented (`docs/sdk-upgrade-rehearsal.md`); current stack verified green (SDK 0.23.0, crypto 2.2.0 + openpgp patch, Node 22).
-- [x] M5 — Background service, login start, tray: **done 2026-10-31** — `gpui-tray 0.3` (StatusNotifierItem over zbus) with a code-drawn status icon (running/paused/guard/sign-in/stopped), dynamic menu (Open Dashboard, Pause/Resume, Open Sync Folder, Preferences, Quit) and primary-click activation; **XDG autostart** (`$XDG_CONFIG_HOME/autostart/proton-drive-sync.desktop`, `--minimized`) toggled in Settings → Startup, with the user's decision persisted in `$XDG_CONFIG_HOME/proton-drive-sync/app.conf` (dev builds from `target/` stay opt-in); **single-instance socket** in `$XDG_RUNTIME_DIR` (a second launch asks the primary to show its dashboard and exits — two engines on one root would corrupt state / fight over the mount); `--minimized` launch flag (starts with the tray only; the root view lives independently of the window, which is created on first use). Key constraints discovered: GPUI 0.2's Linux backend stops the event loop when the last window is destroyed (`signal.stop()`) — never opening one is fine — and it has no hide/unminimize, so the first close-to-tray fix used **minimize**. The app now ships **gpui-ce 0.3**, whose `Window::set_visible` unmaps/remaps the toplevel without destroying it, so close-to-tray = **hide** on both Wayland and X11. A **D-Bus probe for `org.kde.StatusNotifierWatcher`** decides whether closing is safe — without a tray host (GNOME without AppIndicator, bare niri) login still stays windowless and close quits; starting the app again opens the dashboard. The autostart entry is always `--minimized` (the flag is authoritative, so a slow panel cannot make login open a window) and is rewritten on every launch so older entries get the flag. The autostart `Exec=` uses `argv[0]` (not `current_exe`) so Nix/makeWrapper's sidecar env survives. Tests: autostart entry/decision/roundtrip, single-instance handshake, tray status mapping/tooltips/icon build.
+- [x] M5 — Background service, login start, tray: **done 2026-10-31**
+- [x] MyGo migration Option B: **done 2026-11-05** — `crates/engine-headless/` is promoted to the production background sync service; `mygo-shell/` is a full MyGo-native UI replacement that replicates the GPUI Overview/Activity/Conflicts/Settings surface, tray, XDG autostart, single-instance lock, and `--minimized` start. The engine process loops across sign-out and sync-mode switches instead of exiting. The existing GPUI app, CLI, FUSE, and sidecar are untouched. See `docs/research/mygo-migration-poc.md`.
+- [x] MyGo migration Phase 2 (engine → Go): **done 2026-11-08** — plan in `docs/research/go-engine-migration.md`; FUSE-on-Go validated with a real kernel mount (go-fuse v2.12.1); `engine-go/` speaks the socket protocol (`pds-engine-go` binary) and the Go engine has reached parity with the Rust one. The Rust workspace (`crates/`, `Cargo.toml`, `Cargo.lock`, `rust-toolchain.toml`) has been **removed**: the tree is the Go engine + MyGo shell + Node sidecar, and `devenv test` (Go engine + sidecar) is green with zero cargo references left (the handful of remaining mentions are historical milestone notes below).
 
 ## Linux development (OrbStack VM)
 
-The host Mac is not a build target anymore — `pds-app` does not compile on macOS (gpui Linux backend). Build and test inside the Ubuntu 24.04 arm64 VM:
+The host Mac is not a build target anymore — the MyGo shell and Go engine target Linux only. Build and test inside the Ubuntu 24.04 arm64 VM:
 
 ```sh
 ssh pds-linux@orb
 cd /Users/christopher/Developer/proton-drive-sync   # repo is shared into the VM
 devenv shell                                      # same env as CI (devenv.nix/lock)
-export CARGO_TARGET_DIR=$HOME/pds-target          # keep the VM-local build cache
-cargo check --workspace --all-targets && cargo test --workspace
+(cd engine-go && go vet ./... && go test ./... -short)
+(cd mygo-shell && go vet ./... && go test ./...)
 ```
 
-`devenv test` runs the whole suite (workspace tests + sidecar typecheck/tests)
-in the pinned environment; install Nix/devenv in the VM once, then it matches
-CI exactly.
+Note: the MyGo shell module needs Go ≥ 1.27.3 (its `go.mod` declares it, via the `mygo` dependency), while devenv ships Go 1.26.10 — so `go build/test` in `mygo-shell/` currently pulls the 1.27.3 toolchain via GOTOOLCHAIN (needs network on first run). engine-go declares go 1.26.0 and builds with the local toolchain (`GOTOOLCHAIN=local`). Bump `devenv.nix` to `go_1_27` (1.27.3 is in the pinned nixpkgs) to drop the download entirely.
+
+`devenv test` runs the Go engine tests + sidecar typecheck/tests in the pinned environment; install Nix/devenv in the VM once, then it matches
+CI exactly. (MyGo shell tests are run separately, as above — the shell is not part of `devenv test`.)
 
 Notes:
 
-- `libc` is pinned to `0.2.186` in `Cargo.lock` — `0.2.19x` removed `ENOATTR` on Linux, breaking `xattr 0.2.3` (via `zed-async-tar`/`gpui_http_client`). Re-pin after xattr updates.
-- The repo sits on a virtiofs share in the VM: **inotify events are unreliable there**, so the local-watcher engine tests can flake under load (`cargo test -p pds-core --test engine`). They pass on VM-native disk (copy the tree to `~/pds-src`) and on macOS.
-- GUI smoke test without a desktop: `xvfb-run -a target/debug/proton-drive-sync --headless` proves the event loop. For real UI screenshots use a headless Wayland compositor — Xvfb maps the window but Vulkan cannot present there (captures come back black):
-
+- The repo sits on a virtiofs share in the VM: **inotify events are unreliable there**, so the fsnotify-based engine tests can flake under load (`go test ./...` in `engine-go/`). They pass on VM-native disk (copy the tree to `~/pds-src`) and on macOS.
+- GUI smoke test without a desktop: run the shell under a headless Wayland compositor and screenshot it with grim:
   ```sh
+  mkdir -p /tmp/xdg && chmod 700 /tmp/xdg
   WLR_BACKENDS=headless WLR_LIBINPUT_NO_DEVICES=1 WLR_RENDERER=pixman \
-    XDG_RUNTIME_DIR=/tmp/xdg sway -c /dev/null &   # mkdir -p /tmp/xdg; chmod 700 first
-  WAYLAND_DISPLAY=wayland-1 PDS_SYNC_ROOT=/tmp/root target/debug/proton-drive-sync &
+    XDG_RUNTIME_DIR=/tmp/xdg sway -c /dev/null &
+  (cd mygo-shell && go build -o proton-drive-sync .)   # Go >= 1.27.3 toolchain via GOTOOLCHAIN
+  (cd engine-go && go build -o pds-engine-go ./cmd/pds-engine-go)
+  WAYLAND_DISPLAY=wayland-1 PDS_SYNC_ROOT=/tmp/root mygo-shell/proton-drive-sync &
   sleep 15 && WAYLAND_DISPLAY=wayland-1 grim shot.png
   ```
-
   Rendering works with Mesa lavapipe (`VK_ICD_FILENAMES` unset — pointing it at a wrong filename *disables* software Vulkan).
 
 ## Engine timing gotchas (learned in M4)
@@ -126,35 +132,32 @@ Notes:
 proton-drive-sync/
 ├── SPEC.md            # Product spec — source of truth
 ├── AGENT.md           # This file
-├── crates/
-│   ├── app/           # GPUI Linux desktop app (single window)
-│   ├── cli/           # `pds` — headless engine + status/pause/resume/mount
-│   ├── core/          # Sync engine, state DB, queues, trash guards, VFS store
-│   ├── vfs-linux/     # FUSE placeholder filesystem (fuser; M3)
-│   ├── xdg/           # XDG base-dir resolution shared by every crate
-│   └── sidecar-client/ # Sidecar spawn + JSON-RPC protocol (+ MockSidecar for tests)
+├── mygo-shell/        # MyGo-native production UI shell (Go 1.27+ toolchain, see above)
+├── engine-go/         # Go sync engine (pds-engine-go; SQLite, FUSE VFS via go-fuse)
 ├── sidecar/           # Node.js + official Proton Drive SDK
 └── packaging/linux/   # .desktop entry, icon, install script
 ```
+
+(The pre-Go-port Rust workspace `crates/` was removed in Phase 2, 2026-11-08.)
 
 ## Conventions
 
 - Dev environment: `devenv.nix` (pinned by `devenv.lock`) is the source of truth for
   toolchains and native deps; CI runs `devenv test`. Add new libraries there, not as
   ad-hoc apt/brew installs.
-- Rust: edition 2024, `cargo clippy -- -D warnings` clean, `tokio` for async.
+- Go: `go vet ./...` clean, `gofmt`-clean (both `engine-go/` and `mygo-shell/`).
 - Sidecar: TypeScript, strict mode, ESM. SDK version pinned exactly in `package.json`.
 - Commit messages: conventional commits (`feat:`, `fix:`, `chore:` …) — they
   drive the changelog (`cliff.toml`), so keep scopes meaningful.
-- Releases: single workspace version (`[workspace.package]` in `Cargo.toml`;
-  crates inherit). Cut releases only via `scripts/release.sh <major|minor|patch>`
-  — it syncs the sidecar `package.json`/`APP_VERSION` (Proton compliance
-  string) and the Nix derivations, regenerates `CHANGELOG.md` (git-cliff), and
+- Releases: single product version (`version` in `sidecar/package.json`);
+  `scripts/release.sh` mirrors it to the sidecar `APP_VERSION` and the Nix
+  derivations. Cut releases only via `scripts/release.sh <major|minor|patch>`
+  — it bumps every version site, regenerates `CHANGELOG.md` (git-cliff), and
   opens a `release/vX.Y.Z` PR. `main` is protected: merge it by PR, never push
-  the bump directly. After the merge, `.github/workflows/tag-release.yml` tags
-  `vX.Y.Z` and dispatches `.github/workflows/release.yml` (tarball + deb + rpm);
-  tags pushed by CI do not fire `push: tags`, hence the explicit dispatch.
-  `scripts/check-versions.sh` runs in CI to catch drift. `actionlint` +
-  `shellcheck` are in the devenv — run them after touching workflows or
-  release scripts.
+  the bump directly. After the merge, `.github/workflows/tag-release.yml` reads
+  the new version, tags `vX.Y.Z` and dispatches `.github/workflows/release.yml`
+  (tarball + deb + rpm); tags pushed by CI do not fire `push: tags`, hence the
+  explicit dispatch. `scripts/check-versions.sh` runs in CI to catch drift.
+  `actionlint` + `shellcheck` are in the devenv — run them after touching
+  workflows or release scripts.
 - When a milestone is completed, check it off above and note any spec deviations in `SPEC.md` §9.

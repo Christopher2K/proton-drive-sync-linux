@@ -20,21 +20,21 @@ priority: optional
 maintainer: Christopher N. Katoyi Kaba <me@christopher2k.dev>
 description: >
   Sync a local folder with Proton Drive (unofficial).
-  Native Linux desktop app (GPUI) and headless `pds` CLI; all Drive API
-  traffic goes through a bundled Node.js sidecar running the official
-  Proton Drive SDK. Third-party application, not officially supported
-  by Proton.
+  Native Linux desktop app (MyGo shell) and headless Go sync engine;
+  all Drive API traffic goes through a bundled Node.js sidecar running
+  the official Proton Drive SDK. Third-party application, not officially
+  supported by Proton.
 homepage: https://github.com/Christopher2K/proton-drive-sync-linux
 license: MIT
 
 contents:
-  # Binaries (FHS layout: /usr/bin, sidecar under /usr/share — the app's
-  # discovery path `<exe dir>/../share/proton-drive-sync/sidecar` resolves
-  # to /usr/share/proton-drive-sync/sidecar).
+  # Binaries (FHS layout: /usr/bin, sidecar under /usr/share — the shell's
+  # engine discovery checks the executable's own dir first, so the engine
+  # must sit beside the shell here).
   - src: ./staging/bin/proton-drive-sync
     dst: /usr/bin/proton-drive-sync
-  - src: ./staging/bin/pds
-    dst: /usr/bin/pds
+  - src: ./staging/bin/pds-engine-go
+    dst: /usr/bin/pds-engine-go
 
   # Node sidecar with its complete (patched) dependency tree vendored; it
   # runs from TypeScript via tsx, so devDependencies are runtime deps here.
@@ -49,7 +49,7 @@ contents:
     dst: /usr/share/doc/proton-drive-sync/LICENSE
 
 # The sidecar needs node + npx on PATH (>= 20 per sidecar/package.json).
-# FUSE is only required for `pds mount` placeholders. Dependency version
+# FUSE is only required for on-demand placeholders. Dependency version
 # syntax differs between deb and rpm, so versioned deps live under
 # overrides (top-level deb:/rpm: sections don't take depends/recommends).
 recommends:

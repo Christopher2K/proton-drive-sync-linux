@@ -2,132 +2,133 @@
   lib,
   pkgs,
   stdenv,
-  makeRustPlatform,
-  rust-bin,
-  nodejs_22,
-  cmake,
-  pkg-config,
   makeWrapper,
+  nodejs_22,
   sidecar,
   self,
 
-  # Native libraries gpui links or dlopen()s at runtime (Linux desktop stack).
+  # Native libraries the MyGo shell dlopens at runtime (GTK/X stack, GL).
+  alsa-lib,
+  dbus,
   fontconfig,
   freetype,
-  alsa-lib,
-  wayland,
-  libxkbcommon,
+  gtk3,
+  libx11,
   libxcb,
-  libX11,
   libXcursor,
-  libXi,
   libXrandr,
+  libXi,
+  libxkbcommon,
   libGL,
-  vulkan-loader,
+  libepoxy,
+  wayland,
+  wayland-protocols,
 }:
 
 let
-  # Same compiler as devenv and CI (rust-toolchain.toml is the single source
-  # of truth). Oxalica's toolchain is a single rustup-style derivation holding
-  # cargo and rustc, so it fills both roles.
-  toolchain = rust-bin.fromRustupToolchainFile ../rust-toolchain.toml;
-  rustPlatform = makeRustPlatform {
-    cargo = toolchain;
-    rustc = toolchain;
-  };
-
-  # gpui/blade load these at runtime via dlopen (Vulkan, EGL/GL, Wayland,
-  # X11/xkbcommon), so plain linkage rpath is not enough — appended after the
-  # link step, same recipe as nixpkgs' zed-editor packaging.
-  runtimeLibs = [
-    libGL
-    vulkan-loader
-    wayland
-    libxkbcommon
-    libX11
-    libxcb
-    libXcursor
-    libXi
-    libXrandr
-    alsa-lib
-  ];
-in
-rustPlatform.buildRustPackage {
-  pname = "proton-drive-sync";
+  # Single product version (mirrored to sidecar/package.json,
+  # nix/sidecar.nix and the sidecar APP_VERSION by scripts/release.sh;
+  # scripts/check-versions.sh enforces it).
   version = "0.5.9";
 
-  src = self;
+  # The mygo module requires Go >= 1.27.3 (see mygo-shell/go.mod), so the
+  # shell derivation uses the latest-Go-module builder (go_1_27, 1.27.3 in
+  # the pinned nixpkgs). The engine declares go 1.26.0 and uses the default
+  # builder / toolchain like devenv.
 
-  # Deps are vendored straight from Cargo.lock (no git dependencies), so no
-  # vendor hash to maintain when the lockfile changes.
-  cargoLock.lockFile = ../Cargo.lock;
+  # MyGo desktop app (mygo-shell module: package main at the module root).
+  shell = pkgs.buildGoLatestModule {  # Go 1.27 toolchain (mygo needs >= 1.27.3)
+    pname = "proton-drive-sync";
+    inherit version;
+    src = "${self}/mygo-shell";
+    vendorHash = "sha256-Ra1Pb1zLDOBuIT2ENx5UUz6ZfV/mOg9GgTefbRS7EVY=";
+    ldflags = [ "-s" "-w" ];
+    env.CGO_ENABLED = "0";
+    doCheck = false;
+    subPackages = [ "." ];
+  };
 
-  nativeBuildInputs = [
-    cmake
-    pkg-config
-    makeWrapper
-    pkgs.patchelf
-  ];
+  # Headless Go sync engine (engine-go module, cmd is the only binary).
+  engine = pkgs.buildGoModule {
+    pname = "pds-engine-go";
+    inherit version;
+    src = "${self}/engine-go";
+    vendorHash = "sha256-i03QaLgcKLCk6Dztwod6Pu1jL/+zW+dndwmy3Hy7GhM=";
+    ldflags = [ "-s" "-w" ];
+    env.CGO_ENABLED = "0";
+    doCheck = false;
+    subPackages = [ "cmd/pds-engine-go" ];
+  };
 
-  buildInputs = [
+  # Libraries the shell dlopens at runtime (purego): GTK3 and friends.
+  runtimeLibs = [
+    alsa-lib
+    dbus
     fontconfig
     freetype
-    alsa-lib
-    wayland
-    libxkbcommon
+    gtk3
+    libx11
     libxcb
-    libX11
     libXcursor
-    libXi
     libXrandr
+    libXi
+    libxkbcommon
+    libGL
+    libepoxy
+    wayland
+    wayland-protocols
   ];
+in
+stdenv.mkDerivation {
+  pname = "proton-drive-sync";
+  inherit version;
+
+  dontUnpack = true;
+
+  nativeBuildInputs = [ makeWrapper ];
 
   installPhase = ''
     runHook preInstall
 
-    # Native builds land in target/release; cargo may use the triple
-    # subdirectory depending on how buildRustPackage invokes it.
-    release="target/release"
-    if [ ! -f "$release/proton-drive-sync" ]; then
-      release="target/${stdenv.hostPlatform.rust.cargoShortTarget}/release"
-    fi
-    install -Dm755 "$release/proton-drive-sync" "$out/bin/proton-drive-sync"
-    install -Dm755 "$release/pds" "$out/bin/pds"
+    mkdir -p "$out/bin" \
+             "$out/share/applications" \
+             "$out/share/icons/hicolor/scalable/apps"
+    install -Dm755 "${shell}/bin/mygo-shell" "$out/bin/proton-drive-sync"
+    install -Dm755 "${engine}/bin/pds-engine-go" "$out/bin/pds-engine-go"
 
-    install -Dm644 packaging/linux/proton-drive-sync.desktop \
+    install -Dm644 "${self}/packaging/linux/proton-drive-sync.desktop" \
       "$out/share/applications/proton-drive-sync.desktop"
-    install -Dm644 packaging/linux/icon.svg \
+    install -Dm644 "${self}/packaging/linux/icon.svg" \
       "$out/share/icons/hicolor/scalable/apps/proton-drive-sync.svg"
 
     runHook postInstall
   '';
 
   postFixup = ''
-    for exe in "$out/bin/proton-drive-sync" "$out/bin/pds"; do
-      patchelf --add-rpath "${lib.makeLibraryPath runtimeLibs}" "$exe"
-    done
-
-    # Point the sidecar discovery (crates/sidecar-client/src/spawn.rs) at the
-    # packaged sidecar; `node`/`npx` come from the wrapper PATH so the
-    # TypeScript entry can run (`npx tsx src/index.ts`).
-    for exe in proton-drive-sync pds; do
+    # The shell spawns the Go engine beside its own executable, and the
+    # engine spawns the sidecar. Point both at the packaged sidecar; node
+    # and npx come from the wrapper PATH so the TypeScript entry can run
+    # (`npx tsx src/index.ts`).
+    for exe in proton-drive-sync pds-engine-go; do
       wrapProgram "$out/bin/$exe" \
         --set-default PDS_SIDECAR_DIR "${sidecar}/lib/node_modules/proton-drive-sync-sidecar" \
-        --suffix PATH : ${lib.makeBinPath [ nodejs_22 ]}
+        --suffix PATH : ${lib.makeBinPath [ nodejs_22 ]} \
+        --prefix LD_LIBRARY_PATH : "${lib.makeLibraryPath runtimeLibs}"
     done
   '';
 
-  # Build-only guard: the sidecar derivation typechecks the TypeScript; the
-  # Rust test suite runs via flake checks (doCheck there).
+  # Go tests run via `devenv test` (see devenv.nix enterTest), not in the
+  # nix sandbox.
   doCheck = false;
 
   meta = {
-    description = "Sync a local folder with Proton Drive (unofficial Linux desktop app + CLI)";
+    description = "Sync a local folder with Proton Drive (unofficial Linux desktop app — MyGo shell + Go sync engine + Node sidecar)";
     longDescription = ''
-      proton-drive-sync is a Linux desktop app (GPUI) and headless CLI that
-      keep a local folder in sync with Proton Drive. All Drive API traffic
-      goes through a Node.js sidecar running the official Proton SDK.
-      This is a third-party application not officially supported by Proton.
+      proton-drive-sync is a Linux desktop app (MyGo shell) and headless
+      Go sync engine that keep a local folder in sync with Proton Drive.
+      All Drive API traffic goes through a Node.js sidecar running the
+      official Proton SDK. This is a third-party application not officially
+      supported by Proton.
     '';
     homepage = "https://github.com/Christopher2K/proton-drive-sync-linux";
     license = lib.licenses.mit;

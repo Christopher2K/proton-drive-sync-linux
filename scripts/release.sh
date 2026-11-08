@@ -8,18 +8,20 @@
 # What it does:
 #   1. Verifies a clean tree on `main`, in sync with `origin/main`.
 #   2. Computes the next version and rewrites every version site
-#      (workspace Cargo.toml, sidecar package.json + APP_VERSION, Nix).
+#      (sidecar package.json — the source of truth — plus the Proton
+#      compliance APP_VERSION string in sidecar/src/config.ts, and the
+#      Nix derivations).
 #   3. Regenerates CHANGELOG.md with git-cliff from conventional commits.
 #   4. Commits `chore(release: vX.Y.Z)` on `release/vX.Y.Z`, pushes the branch
 #      and opens the PR (squash-merge it like any other change).
 #   5. After the merge, .github/workflows/tag-release.yml sees the new
-#      workspace version on main, tags `vX.Y.Z` and dispatches the release
-#      build (.github/workflows/release.yml: tarball, .deb, .rpm, GitHub
-#      Release).
+#      product version on main, tags `vX.Y.Z` and dispatches the release
+#      build (.github/workflows/release.yml: Go binaries + vendored sidecar,
+#      tarball, .deb, .rpm, GitHub Release).
 #
-# Requires: git, cargo, git-cliff, gh (all in devenv; gh must be authenticated
-# — `gh auth status`). Without gh the branch is still pushed and the script
-# prints the URL for opening the PR by hand.
+# Requires: git, git-cliff, gh (all in devenv; gh must be authenticated
+# — `gh auth status`). Without gh the branch is still pushed and the
+# script prints the URL for opening the PR by hand.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -39,8 +41,8 @@ git merge-base --is-ancestor origin/main HEAD \
   || { echo "release: main is behind origin/main (pull first)" >&2; exit 1; }
 
 # --- compute the next version ------------------------------------------------
-version="$(sed -n '/^\[workspace\.package\]/,/^\[/ s/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n1)"
-[ -n "$version" ] || { echo "release: could not read workspace version" >&2; exit 1; }
+version="$(sed -n 's/.*"version": *"\([^"]*\)".*/\1/p' sidecar/package.json | head -n1)"
+[ -n "$version" ] || { echo "release: could not read version from sidecar/package.json" >&2; exit 1; }
 
 major=${version%%.*}
 rest=${version#*.}
@@ -66,12 +68,11 @@ rewrite() { # <file> <sed-expression>
   sed "$2" "$1" > "$1.tmp" && mv "$1.tmp" "$1"
 }
 
-# 1. Workspace version (the five crates inherit via version.workspace = true).
-rewrite Cargo.toml "s/^version = \"$version\"/version = \"$next\"/"
-
-# 2. Sidecar package.json + the Proton-compliance APP_VERSION string
-#    (x-pm-appversion, `external-drive-{name}@{semver}-{channel}`).
+# 1. Sidecar package.json — the source of truth for the product version.
 rewrite sidecar/package.json "s/\"version\": \"$version\"/\"version\": \"$next\"/"
+
+# 2. Sidecar src/config.ts — the Proton-compliance APP_VERSION string
+#    (x-pm-appversion, `external-drive-{name}@{semver}-{channel}`).
 rewrite sidecar/src/config.ts \
   "s|external-drive-proton_drive_sync@$version-alpha|external-drive-proton_drive_sync@$next-alpha|"
 
@@ -79,10 +80,7 @@ rewrite sidecar/src/config.ts \
 rewrite nix/package.nix "s/^  version = \"$version\"/  version = \"$next\"/"
 rewrite nix/sidecar.nix "s/^  version = \"$version\"/  version = \"$next\"/"
 
-# 4. Refresh Cargo.lock (the workspace crates carry the version).
-cargo update -w >/dev/null
-
-# 5. Verify nothing drifted, then generate the changelog. The release commit
+# 4. Verify nothing drifted, then generate the changelog. The release commit
 #    is not tagged yet, so label the unreleased section with the new tag.
 #    --prepend (not -o) is required: `-o` truncates the file and `--unreleased`
 #    only renders commits since the last tag, so every earlier release section
@@ -100,7 +98,7 @@ fi
 
 # --- commit on a release branch ----------------------------------------------
 git switch -c "$release_branch"
-git add Cargo.toml Cargo.lock sidecar/package.json sidecar/src/config.ts \
+git add sidecar/package.json sidecar/src/config.ts \
   nix/package.nix nix/sidecar.nix CHANGELOG.md
 git commit -m "chore(release: v$next): bump version and changelog" --quiet
 
@@ -120,9 +118,8 @@ pr_body="Release v$next.
 
 ${release_notes}
 
-Merging this PR bumps the workspace version on \`main\`; the Tag Release
+Merging this PR bumps the product version on \`main\`; the Tag Release
 workflow then tags \`v$next\` and dispatches the release build."
-
 if command -v gh >/dev/null 2>&1 && gh auth status >/dev/null 2>&1; then
   pr_url="$(gh pr create --base main --head "$release_branch" \
     --title "chore(release: v$next)" --body "$pr_body")"

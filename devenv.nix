@@ -5,9 +5,11 @@
 }:
 
 let
-  # Everything the Linux build needs. Kept behind stdenv.isLinux so the
-  # environment still evaluates on the macOS host (which is not a build
-  # target anymore — see AGENT.md).
+  # Everything the Linux desktop app needs. Kept behind stdenv.isLinux so
+  # the environment still evaluates on the macOS host (which is not a build
+  # target anymore — see AGENT.md). The MyGo shell dlopens the GTK/X11
+  # stack at runtime; the Go engine uses go-fuse (pure Go, FUSE via
+  # `/dev/fuse` + `fusermount3` at runtime).
   linuxPackages = with pkgs; [
     alsa-lib
     dbus
@@ -21,25 +23,23 @@ let
     libXrandr
     libXi
     libxkbcommon
-    udev
-    vulkan-loader
     wayland
     wayland-protocols
   ];
 in
 {
-  # Rust comes from rust-toolchain.toml (via rust-overlay), so rustup users
-  # and the Nix shell get exactly the same compiler.
-  languages.rust = {
-    enable = true;
-    toolchainFile = ./rust-toolchain.toml;
-  };
+  # No Rust toolchain any more: the sync engine is Go (`engine-go/`), the
+  # UI is the MyGo shell (`mygo-shell/`), and the Node sidecar runs the
+  # official SDK. (The Rust workspace was removed once the Go engine
+  # reached parity — see `docs/research/go-engine-migration.md`.)
 
   packages =
     with pkgs;
     [
-      cmake
       git
+      # Go toolchain for engine-go (module declares go 1.26). Pinned minor
+      # so devenv and CI use the same compiler with no GOTOOLCHAIN download.
+      go_1_27
       # Release/CI tooling: git-cliff generates CHANGELOG.md from conventional
       # commits (scripts/release.sh); actionlint + shellcheck validate the
       # workflows and release scripts; gh opens the release PR.
@@ -47,43 +47,29 @@ in
       gh
       git-cliff
       nodejs_22
-      openssl
-      pkg-config
       shellcheck
       sqlite
-      zstd
     ]
     ++ lib.optionals pkgs.stdenv.isLinux linuxPackages;
 
   env = {
-    RUST_BACKTRACE = "1";
     SSL_CERT_FILE = "${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt";
-    # gpui/blade dlopen Vulkan and the other desktop libraries at runtime.
-    # NixOS does not expose libvulkan.so.1 on the default loader path, and the
-    # dev shell's generated LD_LIBRARY_PATH only covers wayland, so a plain
-    # `cargo run -p pds-app` panics with "libvulkan.so.1: cannot open shared
-    # object file". Make the full runtime library set visible.
+    # The MyGo shell dlopens the GTK/X/pango stack at runtime (like the old
+    # GPUI app did with Vulkan). NixOS does not expose those .so files on
+    # the default loader path, so make the full runtime library set visible
+    # via LD_LIBRARY_PATH.
     LD_LIBRARY_PATH = lib.makeLibraryPath linuxPackages;
   };
 
   enterShell = ''
-    # Nix store binaries cannot be setuid, so the FUSE e2e test needs the
-    # host's privileged fusermount3. Point fuser at it explicitly.
-    if [ -z "''${FUSERMOUNT_PATH:-}" ]; then
-      for candidate in /run/wrappers/bin/fusermount3 /usr/bin/fusermount3 /bin/fusermount3; do
-        if [ -x "$candidate" ]; then
-          export FUSERMOUNT_PATH="$candidate"
-          break
-        fi
-      done
-    fi
-
-    echo "proton-drive-sync devenv (rust $(rustc --version | cut -d' ' -f2), node $(node --version))"
+    echo "proton-drive-sync devenv (node $(node --version), go $(go version | cut -d' ' -f3))"
   '';
 
   scripts = {
-    pds-test.exec = ''
-      cargo test --locked --workspace --all-targets --no-fail-fast
+    # Go engine leg: same command `devenv test` runs via enterTest below.
+    # -short skips the kernel-FUSE e2e and live-backend tests (~90s battery).
+    engine-go-test.exec = ''
+      (cd "$DEVENV_ROOT/engine-go" && go vet ./... && go test ./... -short)
     '';
 
     sidecar-install.exec = ''
@@ -95,9 +81,10 @@ in
     '';
   };
 
-  # `devenv test` — used locally and by CI.
+  # `devenv test` — used locally and by CI. Runs the Go engine leg and the
+  # sidecar typecheck/tests in the pinned environment.
   enterTest = ''
-    cargo test --locked --workspace --all-targets --no-fail-fast
+    (cd engine-go && go vet ./... && go test ./... -short)
     (cd sidecar && npm ci --no-audit --no-fund && npm run typecheck && npm test)
   '';
 }

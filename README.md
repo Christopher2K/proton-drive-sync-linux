@@ -1,15 +1,27 @@
-# proton-drive-sync
+# Proton Drive Sync
 
 > **Experimental, unofficial, and used at your own risk.** Not affiliated with
 > Proton. Built for my own personal use case; I am not responsible for any data
 > loss. See [Read this first](#read-this-first-important).
 
-A **Linux** desktop app that syncs a folder with [Proton Drive](https://proton.me/drive) — the app defaults to **on-demand placeholders**: your whole Drive appears in `~/ProtonDrive` at ~0 bytes, files hydrate when opened, and a capped local cache keeps SSD usage near zero. Prefer everything offline? A Settings toggle switches the same folder to full **mirror** mode. Deletions stay conservative either way (remote deletes go to Trash, with a mass-delete guard).
+A **Linux** desktop app that syncs a folder with [Proton Drive](https://proton.me/drive).
+
+![Sign in screen](docs/screenshots/mygo-shell-login-runtime.png)
+
+- Your whole Drive appears in `~/ProtonDrive` at ~0 bytes.
+- Files hydrate when opened.
+- A capped local cache keeps SSD usage near zero.
+- Prefer everything offline? A Settings toggle switches the same folder to full **mirror** mode.
+
+| | |
+|---|---|
+| ![Overview](docs/screenshots/mygo-shell-overview-runtime.png) | ![Settings](docs/screenshots/mygo-shell-settings-runtime.png) |
+| ![Activity](docs/screenshots/mygo-shell-activity-runtime.png) | ![Conflicts](docs/screenshots/mygo-shell-conflicts-runtime.png) |
 
 - **Product spec:** [SPEC.md](SPEC.md) — source of truth
 - **Agent notes:** [AGENT.md](AGENT.md)
 
-Stack: Rust + GPUI (native Linux desktop UI) · Node.js sidecar running the official [Proton Drive SDK](https://github.com/ProtonDriveApps/sdk) · SQLite state. (macOS and Windows were supported in an earlier iteration and have been dropped.)
+Stack: MyGo-native Linux UI shell (`mygo-shell/`) · Go sync engine (`engine-go/`, binary `pds-engine-go`) · Node.js sidecar running the official [Proton Drive SDK](https://github.com/ProtonDriveApps/sdk) · SQLite state. (macOS and Windows were supported in an earlier iteration and have been dropped.)
 
 ## Read this first (important)
 
@@ -30,32 +42,105 @@ Stack: Rust + GPUI (native Linux desktop UI) · Node.js sidecar running the offi
 If any of that is a dealbreaker, please use the official Proton Drive apps
 instead.
 
-## Features (M1–M4)
+## Features
 
-- Browser-based Proton sign-in (session-fork; no password handling in the app)
-- **On-demand placeholders by default (F5):** the sync root is a FUSE view of
-  your Drive — every file visible at ~0 bytes, hydrating on open, with an
-  LRU-capped local cache (default 10 GiB). Nothing downloads until you use it.
-- **Settings → Sync mode:** switch the same folder between *On demand* and
-  *Mirror everything* at any time. Switching moves existing content (no
-  re-download) and never deletes from Drive.
-- Two-way sync of one local root (`~/ProtonDrive` by default) with your Drive
-- Upload on new/changed files; trash-on-delete
-- Mass-deletion guard: bulk deletes pause sync until you confirm
-- Pause / resume; conflict handling keeps both versions (`name (conflict …).ext`)
-- Native GPUI window: Overview, Activity, Conflicts, and Settings pages
-- **Runs in the background:** optional start-at-login (XDG autostart) plus a
-  tray icon with live status; closing the dashboard hides it to the tray, and
-  a later launch simply reopens the running instance
+### On-demand placeholders by default
 
-In **mirror** mode the sync root is a fully materialized folder instead (the
-pre-placeholder behavior, still available for `pds sync` via `PDS_SYNC_MODE`).
+The sync root is a FUSE view of your Drive. Every file is visible at ~0 bytes,
+hydrating on open, with an LRU-capped local cache (default 10 GiB). Nothing
+downloads until you use it.
+
+### Switch to mirror mode at any time
+
+**Settings → Sync mode** switches the same folder between *On demand* and
+*Mirror everything*. Switching moves existing content (no re-download) and never
+deletes from Drive.
+
+### Two-way sync with conservative deletes
+
+- Upload on new/changed files.
+- Local deletes are sent to the Proton Drive Trash, never permanently deleted.
+- A mass-deletion guard pauses sync when too many files are deleted at once.
+
+### Native desktop integration
+
+- Single MyGo-native main window with **Overview**, **Activity**, **Conflicts**, and **Settings** pages.
+- Optional **start at login** via the platform login-items / XDG autostart API.
+- **Tray icon** with status dot, pause/resume, open folder, preferences, and quit.
+- Closing the dashboard hides the app to the tray; sync keeps running.
+
+### Headless engine
+
+The sync engine (`pds-engine-go`) is headless-only: it runs as a child process of the MyGo shell, which controls it over a Unix socket. (The old `pds` CLI was removed with the Rust workspace.)
+
+## Install
+
+### Nix (recommended on NixOS or Nix-enabled distros)
+
+```sh
+# Try without installing
+nix run .#proton-drive-sync
+
+# Install app + CLI + sidecar into a profile
+nix profile install .#default
+```
+
+Or install straight from GitHub:
+
+```sh
+nix profile install github:Christopher2K/proton-drive-sync-linux
+```
+
+### From source
+
+```sh
+# 1. Enter the pinned development environment
+devenv shell
+
+# 2. Build the Go sync engine
+(cd engine-go && go build -o pds-engine-go ./cmd/pds-engine-go)
+
+# 3. Build the MyGo UI shell (needs Go >= 1.27.3; in devenv this pulls the
+#    1.27.3 toolchain via GOTOOLCHAIN on first run — see AGENT.md)
+cd mygo-shell
+go build -o proton-drive-sync .
+cd ..
+
+# 4. Install system-wide (or PREFIX=$HOME/.local for a user install)
+sudo packaging/linux/install.sh
+```
+
+### From a release tarball
+
+Download `proton-drive-sync-<version>-<arch>.tar.xz` from
+[GitHub Releases](https://github.com/Christopher2K/proton-drive-sync-linux/releases),
+then run:
+
+```sh
+tar -xJf proton-drive-sync-*.tar.xz
+sudo proton-drive-sync-*/install.sh
+```
+
+`.deb` and `.rpm` packages are also published on releases (require `nodejs >= 20`
+and `npm` at runtime).
+
+## First launch
+
+1. Open **Proton Drive Sync** from your application menu.
+2. Click **Sign in with Proton**. Your browser handles login; the app never sees
+   your password.
+3. Choose your sync folder (default: `~/ProtonDrive`).
+4. The app starts syncing in the background. Close the window to keep it in the
+   tray.
+
+![Sign in screen](docs/screenshots/mygo-shell-login-runtime.png)
 
 ## Development environment (devenv)
 
-The Rust toolchain (pinned in `rust-toolchain.toml`), Node.js, and every native
-library GPUI/FUSE need are declared in `devenv.nix` and locked in
-`devenv.lock`, so local development and CI build against the same environment.
+The Go toolchain (see the `go` version note in [AGENT.md](AGENT.md)), Node.js,
+and every native library the MyGo shell/FUSE need are declared in `devenv.nix`
+and locked in `devenv.lock`, so local development and CI build against the same
+environment.
 
 Install [Nix](https://nixos.org/download) and [devenv](https://devenv.sh/getting-started/)
 once, then from the repository root:
@@ -65,23 +150,31 @@ devenv shell        # enter the environment
 # or, with direnv installed: direnv allow
 ```
 
-`devenv test` builds the environment and runs the full test suite. FUSE tests
-additionally need the host's setuid `fusermount3` (package `fuse3`), which Nix
-cannot provide; the shell points `fuser` at the host binary automatically.
+`devenv test` builds the environment and runs the full test suite (Go engine
+tests + sidecar typecheck/tests). FUSE tests additionally need the host's setuid
+`fusermount3` (package `fuse3`), which Nix cannot provide.
 
 ## Build (Linux)
 
 ```sh
-cargo build --release -p pds-app -p pds-cli
+# Go sync engine
+(cd engine-go && go build -o pds-engine-go ./cmd/pds-engine-go)
+
+# MyGo UI shell (needs Go >= 1.27.3 — see AGENT.md)
+(cd mygo-shell && go build -o proton-drive-sync .)
 ```
 
-A GPU stack for GPUI (Vulkan/Mesa; under a Wayland or X11 session this is
-already present) is not part of devenv — it is host-specific.
+The MyGo shell needs the Go toolchain (in `devenv.nix`) and GTK/WebKit libraries
+present on the host; it is otherwise self-contained.
 
-Run from the repository root (dev mode — the sidecar is found relative to the repo):
+Run from the repository root (dev mode — the engine and sidecar are found
+relative to the repo):
 
 ```sh
-cargo run -p pds-app
+cd mygo-shell
+./proton-drive-sync
+# or start minimized to the tray
+./proton-drive-sync --minimized
 ```
 
 Environment knobs:
@@ -93,35 +186,20 @@ Environment knobs:
 | `PDS_CACHE_CAP` | Backing-cache cap: bytes with an optional `K`/`M`/`G`/`T` suffix (`500M`, `10G`) or `unlimited`; session-only override of the persisted Settings choice (never rewrites it). `pds mount --cache-cap <SIZE>` overrides both for one invocation |
 | `PDS_SIDECAR_CMD` | Sidecar command override, e.g. `node sidecar/dist/index.js` |
 | `PDS_SIDECAR_DIR` | Sidecar directory override for auto-discovery |
-| `RUST_LOG` | Log filter (default `info,pds_core=debug`), logs go to stderr |
-
-## Install (system-wide)
-
-```sh
-cargo build --release -p pds-app -p pds-cli
-sudo packaging/linux/install.sh            # PREFIX=/usr/local by default
-# or, user-local (no root):
-PREFIX=$HOME/.local packaging/linux/install.sh
-```
-
-This installs the `proton-drive-sync` binary, the `pds` CLI, the sidecar (with vendored npm deps), a `.desktop` entry, and an icon. The app then appears in your application menu.
 
 ## Background service and tray
 
-The app **is** the sync service: the engine, the on-demand mount, and the tray
-live in one long-running process, so closing the dashboard never interrupts a
-transfer.
+The app **is** the sync service: the MyGo dashboard launches the Go engine
+(`pds-engine-go`) as a child process, and the tray outlives the window, so
+closing the dashboard never interrupts a transfer.
 
 - **Start at login** is on by default for installed builds (development
-  builds from `target/` stay opt-in). `Settings → Startup` toggles it. The app
-  writes the standard XDG entry
-  `~/.config/autostart/proton-drive-sync.desktop`, launching
-  `proton-drive-sync --minimized` a few seconds after you sign in to your
-  desktop session. `--minimized` always wins: a login start never opens a
+  builds stay opt-in). `Settings → Startup` toggles it. The MyGo runtime writes
+  the standard XDG entry `~/.config/autostart/proton-drive-sync.desktop`,
+  launching `proton-drive-sync --minimized` a few seconds after you sign in to
+  your desktop session. `--minimized` always wins: a login start never opens a
   window, even if the panel (and its tray host) has not come up yet. The
-  dashboard opens only when you ask for it. Your choice is remembered in
-  `~/.config/proton-drive-sync/app.conf`; toggling it off removes the entry
-  and a later launch will not re-enable it.
+  dashboard opens only when you ask for it.
 - **Tray icon** (StatusNotifierItem): a coloured dot shows syncing, paused,
   delete-guard, signed-out, or stopped. The menu has *Open Dashboard*,
   *Pause/Resume syncing*, *Open Sync Folder*, *Preferences…*, and *Quit*;
@@ -135,33 +213,9 @@ transfer.
   `proton-drive-sync`) to open the dashboard, and closing the window then
   stops the service because there is no icon to bring it back.
 - **One instance only:** launching `proton-drive-sync` again does not start a
-  second engine — it asks the running instance to show its dashboard
-  (`$XDG_RUNTIME_DIR/proton-drive-sync.sock`) and exits. This protects the
-  SQLite state and the FUSE mount from two writers.
-
-## Install (Nix)
-
-On Nix-based Linux systems (NixOS or any distro with Nix), build and install straight from this repository:
-
-```sh
-# try the app without installing (apps: proton-drive-sync, pds)
-nix run .#proton-drive-sync
-
-# install the app + CLI + sidecar into a profile
-nix profile install .#default
-```
-
-Or from a remote machine directly:
-
-```sh
-nix profile install github:Christopher2K/proton-drive-sync-linux
-```
-
-The flake exposes `packages.proton-drive-sync` (app + CLI + sidecar, wrapped so
-the binaries find their sidecar in the Nix store), `packages.sidecar`, and a
-`nix develop` shell mirroring `devenv.nix`. Only Linux systems are supported —
-the GPUI shell does not build on macOS. The Rust tests run via
-`nix flake check` (the FUSE e2e test self-skips without `/dev/fuse`).
+  second engine — MyGo's single-instance lock asks the running instance to show
+  its dashboard and exits. This protects the SQLite state and the FUSE mount
+  from two writers.
 
 ## Releases
 
@@ -170,7 +224,7 @@ pre-1.0: breaking changes bump the minor). One version is shared by the app,
 CLI, sidecar, and Nix packages — `scripts/check-versions.sh` enforces this in
 CI.
 
-To cut a release (inside the devenv shell, so `git-cliff`, `cargo` and `gh` are
+To cut a release (inside the devenv shell, so `git-cliff` and `gh` are
 available):
 
 ```sh
@@ -191,22 +245,16 @@ conventional commits, and opens a `release/vX.Y.Z` PR titled
 - `.deb` / `.rpm` packages (require `nodejs >= 20` and `npm` at runtime)
 - `checksums.txt` (sha256)
 
-Install from a tarball without cloning the repository:
-
-```sh
-tar -xJf proton-drive-sync-*.tar.xz
-sudo proton-drive-sync-*/install.sh
-```
-
-## CLI companion
-
-`pds sync` runs the engine headless; `pds status|pause|resume` control a running engine; `pds conflicts` lists the conflict inbox. `pds mount <folder> <mountpoint>` serves a **placeholder view** of a sync root (requires `/dev/fuse`): files hydrate from Drive on first open, files/folders you create through the mount upload to Drive on close, and edits to existing files upload as new revisions of the same Drive file (M3). Hydrated content is an LRU cache capped at 10 GiB by default — `pds mount --cache-cap <SIZE>` (e.g. `500M`, `10G`, `unlimited`) changes it for one invocation, `$PDS_CACHE_CAP` and the persisted Settings choice cover the rest. `pds pin <folder> <path>` keeps a file (or folder, recursively) offline-safe, `pds unpin` releases it. See `pds --help`.
-
 ## Testing
 
 ```sh
-devenv test                     # Rust workspace + sidecar typecheck/tests
-devenv shell -- cargo test --workspace   # Rust only, inside the env
+devenv test                     # Go engine tests + sidecar typecheck/tests
+(cd engine-go && go vet ./... && go test ./... -short)   # Go engine only
+(cd mygo-shell && go test ./...)                          # MyGo shell unit tests (needs Go >= 1.27.3)
 ```
 
 Notes for VM development (OrbStack et al.): inotify over shared folders is unreliable — run the engine tests on VM-native disk. See [AGENT.md](AGENT.md) for details.
+
+## License
+
+[MIT](LICENSE)
