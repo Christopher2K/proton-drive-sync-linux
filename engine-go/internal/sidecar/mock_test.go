@@ -3,6 +3,7 @@ package sidecar
 import (
 	"context"
 	"os"
+	"path/filepath"
 	"testing"
 	"time"
 )
@@ -26,10 +27,11 @@ func TestMockConnectBasics(t *testing.T) {
 	}
 
 	// Upload round trip.
-	if err := os.WriteFile("/tmp/opencode/mock-upload.txt", []byte("hi"), 0o644); err != nil {
+	upPath := filepath.Join(t.TempDir(), "mock-upload.txt")
+	if err := os.WriteFile(upPath, []byte("hi"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	params := &UploadParams{ParentUID: sp2("root"), Name: "up.txt", Path: "/tmp/opencode/mock-upload.txt", Size: 2, SHA1: "x", Mtime: 5}
+	params := &UploadParams{ParentUID: sp2("root"), Name: "up.txt", Path: upPath, Size: 2, SHA1: "x", Mtime: 5}
 	tid, err := client.Upload(ctx, params)
 	if err != nil || tid == "" {
 		t.Fatalf("upload: %v %q", err, tid)
@@ -78,10 +80,8 @@ func TestMockScriptedFailureAndCrash(t *testing.T) {
 
 	uid, _ := handle.FindUID("root", "hello.txt")
 	handle.InjectUploadFailures(uid, [][]any{{int64(1005), "no longer up to date", false}})
-	if err := writeTmp(t, "/tmp/opencode/mock-rev.txt", "rev"); err != nil {
-		t.Fatal(err)
-	}
-	params := &UploadParams{NodeUID: &uid, Name: "hello.txt", Path: "/tmp/opencode/mock-rev.txt", Size: 3, SHA1: "y", Mtime: 1}
+	revPath := tmpUp(t, "mock-rev.txt", "rev")
+	params := &UploadParams{NodeUID: &uid, Name: "hello.txt", Path: revPath, Size: 3, SHA1: "y", Mtime: 1}
 	if _, err := client.Upload(ctx, params); err != nil {
 		t.Fatalf("upload start: %v", err)
 	}
@@ -111,6 +111,15 @@ func TestMockScriptedFailureAndCrash(t *testing.T) {
 func writeTmp(t *testing.T, path, content string) error {
 	t.Helper()
 	return os.WriteFile(path, []byte(content), 0o644)
+}
+
+func tmpUp(t *testing.T, name, content string) string {
+	t.Helper()
+	p := filepath.Join(t.TempDir(), name)
+	if err := os.WriteFile(p, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return p
 }
 
 func sp2(s string) *string { return &s }
