@@ -13,17 +13,9 @@ concurrency:
 permissions:
   contents: read
 
-env:
-  CARGO_TERM_COLOR: always
-  RUST_BACKTRACE: 1
-  # Keep the debug target small on the 14 GB runner disk. Changing these
-  # invalidates the cached target, so keep them stable.
-  CARGO_PROFILE_DEV_DEBUG: 0
-  CARGO_PROFILE_TEST_DEBUG: 0
-
 jobs:
-  # Version sites must never drift: every crate inherits the workspace
-  # version and scripts/release.sh mirrors it to the sidecar + Nix.
+  # Version sites must never drift: sidecar/package.json is the source of
+  # truth and scripts/release.sh mirrors it to config.ts + the Nix files.
   versions:
     name: version consistency
     runs-on: ubuntu-latest
@@ -35,15 +27,16 @@ jobs:
   tests:
     name: devenv tests
     runs-on: ubuntu-24.04
-    # A from-scratch build is ~3 min on the 4-core runner; the FUSE e2e test
-    # self-bounds at ~3 min worst case. The Go engine battery adds ~90s
-    # (cold module/build longer). 20 min leaves ample headroom.
+    # The Go engine battery is ~90s (longer cold, via the module cache
+    # below); the sidecar leg is npm ci + typecheck + tests. 20 min
+    # leaves ample headroom.
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v5
 
-      # Nix packages cannot be setuid, so the FUSE e2e test uses the host's
-      # privileged fusermount3. Everything else comes from devenv.
+      # Nix packages cannot be setuid, so the engine-go FUSE e2e tests
+      # use the host's privileged fusermount3. Everything else comes
+      # from devenv.
       - name: Install FUSE helper
         run: |
           sudo apt-get update
@@ -60,35 +53,6 @@ jobs:
       - name: Install devenv
         run: nix profile add nixpkgs#devenv
 
-      # The toolchain only exists inside the devenv shell, so use a plain
-      # target/registry cache keyed on the lockfiles instead of rust-cache.
-      - name: Restore Cargo cache
-        id: cargo-cache
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock', 'devenv.lock', 'rust-toolchain.toml') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-
-
-      # Build first and save the cache before running tests, so a failing test
-      # cannot throw away the compiled artifacts.
-      - name: Build test binaries
-        run: devenv shell -- cargo test --locked --workspace --all-targets --no-run
-
-      - name: Save Cargo cache
-        if: steps.cargo-cache.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock', 'devenv.lock', 'rust-toolchain.toml') }}
-
       # Go module + build cache for the engine-go leg (default GOPROXY,
       # online runners fetch on first run; warm cache thereafter).
       - name: Restore Go cache
@@ -102,8 +66,8 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-go-
 
-      # Runs the same enterTest as `devenv test` locally: cargo tests, the
-      # Go engine leg (go vet + go test -short in engine-go/), sidecar
+      # Runs the same enterTest as `devenv test` locally: the Go engine
+      # leg (go vet + go test -short in engine-go/) and the sidecar
       # typecheck/tests.
       - name: Run tests
         run: devenv test

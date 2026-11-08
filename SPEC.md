@@ -2,7 +2,7 @@
 
 ## 1. Product summary
 
-A **Linux** desktop app that syncs a Proton Drive account into a local folder. Built in **Rust with a GPUI user interface**, driving the **official Proton Drive TypeScript SDK** running in an embedded Node.js sidecar. (macOS and Windows were dropped in v0.2; the desktop app defaults to **on-demand placeholders** — the sync root is a FUSE view that hydrates on open — with a full materialized mirror available in Settings, see F5.)
+A **Linux** desktop app that syncs a Proton Drive account into a local folder. Built as a **MyGo (Go) desktop shell** (`mygo-shell/`) driving a **Go sync engine** (`engine-go/`), which calls the **official Proton Drive TypeScript SDK** running in an embedded Node.js sidecar. (macOS and Windows were dropped in v0.2; the desktop app defaults to **on-demand placeholders** — the sync root is a FUSE view that hydrates on open — with a full materialized mirror available in Settings, see F5.)
 
 ## 2. Goals / non-goals
 
@@ -25,15 +25,16 @@ Three components:
 
 | Component | Tech | Role |
 |---|---|---|
-| **Host app (UI + orchestrator)** | Rust + GPUI (native Linux desktop window) | Single main window, owns state DB, sync engine, upload/download queues |
+| **Host app (UI + orchestrator)** | MyGo shell (`mygo-shell/`, Go; MyGo UI toolkit) | Single main window, drives the engine over a JSON-line Unix socket, tray/autostart/single-instance |
+| **Sync engine** | Go (`engine-go/`, binary `pds-engine-go`) | Owns state DB, sync engine, upload/download queues, VFS store |
 | **SDK sidecar** | Node.js + `ProtonDriveApps/sdk` (client module) | All Drive traffic: auth session, listing, up/download, trash, event stream |
-| **VFS (M3 ✅)** | Rust FUSE daemon (`fuser` crate) | Placeholder view of the remote tree — mounted at the sync root by the desktop app, or at a separate mountpoint by `pds mount`; reads hydrate, writes queue uploads |
+| **VFS (M3 ✅)** | Go, go-fuse (`engine-go/internal/vfs/`) | Placeholder view of the remote tree — mounted at the sync root by the engine, or at a separate mountpoint by the shell; reads hydrate, writes queue uploads |
 
-- **IPC:** JSON-RPC over stdio between host ↔ Node sidecar.
-- **State:** SQLite in the host — node map (local path ↔ Drive node UID), pins, tombstones, transfer queue, eviction metadata, event cursor (resume token).
+- **IPC:** shell ↔ engine over a JSON-line Unix socket; engine ↔ Node sidecar over JSON-RPC on stdio.
+- **State:** SQLite in the engine — node map (local path ↔ Drive node UID), pins, tombstones, transfer queue, eviction metadata, event cursor (resume token).
 - **Auth:** The SDK *deliberately excludes* login. The sidecar implements Proton auth (browser session-fork; SRP kept behind `PDS_AUTH=srp`) against official endpoints, modeled on how first-party clients wire it. The session is a `0600` file (`session.json`) under `$XDG_DATA_HOME/proton-drive-sync/`. Login screen shows the mandated disclosure: *"This is a third-party application not officially supported by Proton."*
 
-**Why the sidecar:** the official SDK is the only implementation guaranteed to track the **2026/27 cryptographic migration**. Upgrading the sidecar's npm dependency is our migration strategy — no Rust crypto to rewrite.
+**Why the sidecar:** the official SDK is the only implementation guaranteed to track the **2026/27 cryptographic migration**. Upgrading the sidecar's npm dependency is our migration strategy — no client-side crypto to rewrite.
 
 ## 4. Feature specifications
 

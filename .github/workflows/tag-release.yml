@@ -1,11 +1,15 @@
 name: Tag Release
 
-# Runs after every push to main. When the workspace version has no matching
-# `v*` tag yet — i.e. a release PR (scripts/release.sh) just merged — it tags
-# that commit and dispatches the release build.
+# Runs after every push to main. When the product version has no matching
+# `v*` tag yet — i.e. a release PR (scripts/release.sh) just merged — it
+# tags that commit and dispatches the release build.
 #
-# The dispatch is explicit because tags pushed with GITHUB_TOKEN do not fire
-# `on: push: tags` workflows (GitHub suppresses events caused by the token).
+# The dispatch is explicit because tags pushed with GITHUB_TOKEN do not
+# fire `on: push: tags` workflows (GitHub suppresses events caused by the
+# token).
+#
+# The product version comes from sidecar/package.json, the single source
+# of truth mirrored by scripts/check-versions.sh.
 
 on:
   push:
@@ -28,15 +32,16 @@ jobs:
     steps:
       - uses: actions/checkout@v5
         with:
-          # Tags are needed to tell an already-released version from a new one.
+          # Tags are needed to tell an already-released version from a
+          # new one.
           fetch-depth: 0
 
-      - name: Read the workspace version
+      - name: Read the product version
         id: version
         run: |
-          version="$(sed -n '/^\[workspace\.package\]/,/^\[/ s/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n1)"
+          version="$(sed -n 's/.*"version": *"\([^"]*\)".*/\1/p' sidecar/package.json | head -n1)"
           [ -n "$version" ] || {
-            echo "::error::could not read the workspace version from Cargo.toml"
+            echo "::error::could not read the version from sidecar/package.json"
             exit 1
           }
           echo "version=$version" >> "$GITHUB_OUTPUT"
@@ -60,8 +65,9 @@ jobs:
           echo "::notice::tagged $GITHUB_SHA as v$version"
           echo "created=true" >> "$GITHUB_OUTPUT"
 
-      # `--ref main` + `-f tag=`: release.yml checks out the tag itself, and
-      # avoids racing the just-pushed tag ref when resolving the dispatch.
+      # `--ref main` + `-f tag=`: release.yml checks out the tag itself,
+      # and avoids racing the just-pushed tag ref when resolving the
+      # dispatch.
       - name: Dispatch the release build
         if: steps.tag.outputs.created == 'true'
         env:
