@@ -139,6 +139,13 @@ func Open(path string) (*Db, error) {
 		conn.Close()
 		return nil, err
 	}
+	// Backend mode-switch/sign-out restarts reopen this file immediately;
+	// without a busy timeout the new connection races the dying one out of
+	// the WAL and gets SQLITE_BUSY (found by the backend -race suite).
+	if _, err := conn.Exec("PRAGMA busy_timeout = 5000"); err != nil {
+		conn.Close()
+		return nil, err
+	}
 	if _, err := conn.Exec(schema); err != nil {
 		conn.Close()
 		return nil, err
