@@ -19,6 +19,7 @@ import (
 	"bufio"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -423,12 +424,77 @@ func TestFuseRenameOverDestinationConverges(t *testing.T) {
 }
 
 // Open-fd half of TG-26.3 (POSIX: an fd keeps the inode it opened even
-// after its path is replaced). Skipped: go-fuse pathfs's RmChild drops the
-// destination inode's open handles on rename-over, so the descriptor does
-// not survive (verified ENOENT on read after rename). Retaining it needs a
-// non-pathfs (nodefs) tree lifecycle in internal/vfs — follow-up delegate.
-func TestFuseRenameOverOpenKeepsFdPendingStep5(t *testing.T) {
-	t.Skip("step 5 engine wiring pending: production seam missing — go-fuse pathfs drops open handles on rename-over (RmChild), so fd-keeps-inode cannot be exercised; needs a nodefs tree (see report)")
+// after its path is replaced). The open file is retained until Release
+// and getattr(2) is answered through the fd itself, so the descriptor
+// survives RmChild just like a native removed-file fd.
+func TestFuseRenameOverOpenKeepsFd(t *testing.T) {
+	src := e2eFile("src.txt", 17)
+	src.ContentReady = true
+	dst := e2eFile("dst.txt", 3)
+	dst.ContentReady = true
+	em := mountE2E(t, e2eSnapshot(1, src, dst))
+	em.st.hydrate(t, "src.txt", "brand new content")
+	em.st.hydrate(t, "dst.txt", "old")
+
+	oldFD, err := os.Open(filepath.Join(em.mnt, "dst.txt"))
+	if err != nil {
+		t.Fatalf("open dst before rename-over: %v", err)
+	}
+	defer oldFD.Close()
+
+	if err := os.Rename(filepath.Join(em.mnt, "src.txt"), filepath.Join(em.mnt, "dst.txt")); err != nil {
+		t.Fatalf("rename over open destination: %v", err)
+	}
+
+	// The fd still names the old inode. Kernel revalidates via
+	// GETATTR first; that must succeed through the fd, then READ
+	// serves the old bytes.
+	if _, err := oldFD.Stat(); err != nil {
+		t.Fatalf("stat via old fd after rename-over: %v", err)
+	}
+	oldBytes, err := io.ReadAll(oldFD)
+	if err != nil {
+		t.Fatalf("read old fd after rename-over: %v", err)
+	}
+	if string(oldBytes) != "old" {
+		t.Fatalf("old fd after rename-over = %q, want %q (POSIX fd-keeps-inode)", oldBytes, "old")
+	}
+
+	// Queue half: the replace is still one overwrite-rename, never a
+	// plain rename or delete pair.
+	em.st.mu.Lock()
+	renames, overwrites := len(em.st.renames), append([][3]string(nil), em.st.overwrites...)
+	em.st.mu.Unlock()
+	if renames != 0 {
+		t.Fatalf("replace must not queue a plain rename (%d)", renames)
+	}
+	if len(overwrites) != 1 || overwrites[0] != [3]string{"dst.txt", "src.txt", "dst.txt"} {
+		t.Fatalf("overwrite queue = %v", overwrites)
+	}
+
+	// Convergence half: once the engine republishes, the path serves
+	// the moved source content and the old path is gone.
+	newDst := e2eFile("dst.txt", 17)
+	newDst.ContentReady = true
+	e2ePublish(em.st, 2, newDst)
+	waitFor(t, 15*time.Second, func() bool {
+		got, err := os.ReadFile(filepath.Join(em.mnt, "dst.txt"))
+		return err == nil && string(got) == "brand new content"
+	}, "dst path never converged on the moved content")
+	waitFor(t, 15*time.Second, func() bool {
+		_, err := os.Stat(filepath.Join(em.mnt, "src.txt"))
+		return err != nil
+	}, "old rename path still visible")
+
+	// Closing the old fd must not queue a write of its stale bytes.
+	before := e2eWriteCount(em.st, "dst.txt")
+	if err := oldFD.Close(); err != nil {
+		t.Fatalf("close old dst fd: %v", err)
+	}
+	time.Sleep(50 * time.Millisecond)
+	if after := e2eWriteCount(em.st, "dst.txt"); after != before {
+		t.Fatalf("old fd close queued %d writes, want 0 (got %d, before %d)", after-before, after, before)
+	}
 }
 
 // Unlink (TG-26.4, queue/convergence half): the delete queues once, the path
@@ -476,12 +542,77 @@ func TestFuseUnlinkQueuesDeleteAndRecreateIsNewNode(t *testing.T) {
 }
 
 // Open-fd half of TG-26.4 (POSIX: the fd stays readable after unlink, and
-// its close cannot clobber the recreated node). Skipped: go-fuse pathfs
-// drops open handles on unlink (RmChild), so reads on the fd fail ENOENT
-// (verified). Retaining them needs a non-pathfs (nodefs) tree lifecycle in
-// internal/vfs — follow-up delegate.
-func TestFuseUnlinkWhileOpenKeepsFdPendingStep5(t *testing.T) {
-	t.Skip("step 5 engine wiring pending: production seam missing — go-fuse pathfs drops open handles on unlink (RmChild), so fd-keeps-inode cannot be exercised; needs a nodefs tree (see report)")
+// its close cannot clobber the recreated node). The open backing file is
+// retained until Release and getattr(2) is answered through the fd, so
+// RmChild on unlink does not strand the descriptor.
+func TestFuseUnlinkWhileOpenKeepsFd(t *testing.T) {
+	n := e2eFile("unlink.txt", 7)
+	n.ContentReady = true
+	em := mountE2E(t, e2eSnapshot(1, n))
+	em.st.hydrate(t, "unlink.txt", "keep me")
+
+	oldFD, err := os.Open(filepath.Join(em.mnt, "unlink.txt"))
+	if err != nil {
+		t.Fatalf("open unlink.txt before unlink: %v", err)
+	}
+
+	if err := os.Remove(filepath.Join(em.mnt, "unlink.txt")); err != nil {
+		t.Fatalf("unlink through the mount: %v", err)
+	}
+
+	// Fd still readable after unlink (native removed-file semantics).
+	if _, err := oldFD.Stat(); err != nil {
+		t.Fatalf("stat via old fd after unlink: %v", err)
+	}
+	got, err := io.ReadAll(oldFD)
+	if err != nil {
+		t.Fatalf("read old fd after unlink: %v", err)
+	}
+	if string(got) != "keep me" {
+		t.Fatalf("old fd after unlink = %q, want %q", got, "keep me")
+	}
+
+	// Queue half: the delete queues once.
+	waitFor(t, 15*time.Second, func() bool {
+		em.st.mu.Lock()
+		defer em.st.mu.Unlock()
+		for _, d := range em.st.deletes {
+			if d == "unlink.txt" {
+				return true
+			}
+		}
+		return false
+	}, "delete never queued")
+
+	// Tombstone drained: path disappears after republish.
+	e2ePublish(em.st, 2)
+	waitFor(t, 15*time.Second, func() bool {
+		_, err := os.Stat(filepath.Join(em.mnt, "unlink.txt"))
+		return err != nil
+	}, "unlink path never disappeared")
+
+	// Recreate: a fresh node that uploads exactly once.
+	if err := os.WriteFile(filepath.Join(em.mnt, "unlink.txt"), []byte("new file"), 0o644); err != nil {
+		t.Fatalf("recreate unlink.txt: %v", err)
+	}
+	waitFor(t, 15*time.Second, func() bool { return e2eWriteCount(em.st, "unlink.txt") == 1 }, "recreate upload never queued")
+	if got := e2eWriteCount(em.st, "unlink.txt"); got != 1 {
+		t.Fatalf("recreate upload count = %d, want 1", got)
+	}
+
+	// Closing the old fd must not upload its stale bytes over the new node.
+	if err := oldFD.Close(); err != nil {
+		t.Fatalf("close old fd: %v", err)
+	}
+	time.Sleep(100 * time.Millisecond)
+	if got := e2eWriteCount(em.st, "unlink.txt"); got != 1 {
+		t.Fatalf("old fd close clobbered the recreated file (writes = %d, want 1)", got)
+	}
+	content, err := os.ReadFile(filepath.Join(em.mnt, "unlink.txt"))
+	if err != nil || string(content) != "new file" {
+		t.Fatalf("recreated file after old close = %q, err=%v", content, err)
+	}
+	defer oldFD.Close()
 }
 
 // TG-26.5: truncate() larger (sparse grow) reads as zeros, a later write
@@ -676,13 +807,18 @@ func TestFuseMountOverNonemptyRootShadowsAndPreservesLeftovers(t *testing.T) {
 	}, "remote tree never listed through the mount")
 
 	// The `.pds` proxy is advertised AND resolvable (getattr), or `ls`
-	// shows a phantom entry that cannot be stated or entered.
-	// NOTE (production gap, follow-up): entering `.pds` with readdir fails
-	// ENOTDIR — Tree.Children has no synthetic node for StateProxyIno, so
-	// fs.OpenDir(".pds") cannot list it. Lookup/stat works (asserted).
+	// shows a phantom entry that cannot be stated or entered. The
+	// synthetic proxy dir lists empty (Rust parity: read_dir(.pds) == 0).
 	proxyMeta, err := os.Stat(filepath.Join(root, ".pds"))
 	if err != nil || !proxyMeta.IsDir() {
 		t.Fatalf(".pds proxy: err=%v", err)
+	}
+	proxyEntries, err := os.ReadDir(filepath.Join(root, ".pds"))
+	if err != nil {
+		t.Fatalf("readdir .pds proxy: %v", err)
+	}
+	if len(proxyEntries) != 0 {
+		t.Fatalf(".pds proxy must be empty, got %v", proxyEntries)
 	}
 
 	// Leftover real content is shadowed, not merged.
@@ -986,11 +1122,12 @@ func TestFuseSymlinkCreateIsRefusedCleanly(t *testing.T) {
 // engine + MockSidecar + kernel mount, asserting remote upload_attempts /
 // trashed_uids / renames and the copy_file_range server-side-copy log line)
 // cannot be expressed in internal/vfs alone: the engine's placeholder store
-// wiring (hydration pump, write/rename/delete drains) is the step 5
-// workstream, and this package has no engine or MockSidecar. Those scenarios
-// stay skipped until an engine+store+VFS integration test can drive them;
-// the VFS-level behaviors above (hydration-on-read, one-upload write
-// sequences, overlay + POSIX semantics, mount safety) are covered for real.
+// wiring (hydration pump, write/rename/delete drains) is outside this
+// package, which has no engine or MockSidecar. Those scenarios stay skipped
+// until an engine+store+VFS integration test can drive them. The VFS-level
+// behaviors above (hydration-on-read, one-upload write sequences, overlay
+// + POSIX semantics incl. open-fd retention and .pds proxy readdir, mount
+// safety) are covered for real.
 func TestFuseFullEngineBatteryPendingStep5(t *testing.T) {
 	scenarios := []string{
 		"mount-serves-placeholders-and-hydrates engine flow",
@@ -1000,7 +1137,7 @@ func TestFuseFullEngineBatteryPendingStep5(t *testing.T) {
 	}
 	for _, s := range scenarios {
 		t.Run(s, func(t *testing.T) {
-			t.Skip("step 5 engine wiring pending: the full-engine kernel battery (engine+MockSidecar+store through the mount) stays deferred follow-up — vfs-only port cannot assert MockSidecar remote state; in-process placeholder coverage lives in engine_placeholder_test.go")
+			t.Skip("vfs-only: full-engine battery needs engine+MockSidecar+store through the mount; VFS-level POSIX/hydration coverage lives in the tests above and in engine_placeholder_test.go")
 		})
 	}
 }

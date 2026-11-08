@@ -625,7 +625,7 @@ func (f *PdsFs) Open(name string, flags uint32, context *fuse.Context) (nodefs.F
 	if tracked {
 		f.st.AddOpenHandle(rel)
 	}
-	h := &readHandle{rel: rel, file: file, tracked: tracked, fs: f}
+	h := &readHandle{rel: rel, file: file, ino: f.inoForAttr(rel, false), tracked: tracked, fs: f}
 	return newReadFile(h), fuse.OK
 }
 
@@ -885,6 +885,21 @@ func (f *PdsFs) Truncate(name string, size uint64, context *fuse.Context) fuse.S
 }
 
 func (f *PdsFs) truncateCommon(name string, size uint64, fh *writeHandle) fuse.Status {
+	if fh != nil {
+		// Truncate through an open fd (ftruncate / deferred O_TRUNC):
+		// the fd's inode is authoritative — it stays valid after the path
+		// is unlinked or replaced, where the path lookup would miss.
+		if err := fh.file.Truncate(int64(size)); err != nil {
+			f.logger.Printf("truncate via handle failed: %s: %v", name, err)
+			return fuse.EIO
+		}
+		// One revision for the whole write sequence: defer upload to
+		// release/fsync; go-fuse never negotiates ATOMIC_O_TRUNC.
+		f.handleMu.Lock()
+		fh.dirty = true
+		f.handleMu.Unlock()
+		return fuse.OK
+	}
 	isDir, _, _, _, ok := f.nodeMeta(name)
 	if !ok {
 		return fuse.ENOENT
@@ -914,20 +929,10 @@ func (f *PdsFs) truncateCommon(name string, size uint64, fh *writeHandle) fuse.S
 	if !isOverlay {
 		f.setPendingSize(name, size)
 	}
-	if fh != nil {
-		// Truncation through an open write handle: defer the upload to
-		// release/fsync — one revision for the whole write sequence, no
-		// empty intermediate (open(O_TRUNC) pattern; go-fuse never
-		// negotiates ATOMIC_O_TRUNC either, the kernel sends a separate
-		// SETATTR(size, fh) after open).
-		f.handleMu.Lock()
-		fh.dirty = true
-		f.handleMu.Unlock()
-	} else {
-		// Truncate outside a handle (truncate(2)): queue the revision
-		// upload directly (re-hash-deduped by the store).
-		f.st.RecordWrite(name)
-	}
+	// Truncate outside a handle (truncate(2)): queue the revision
+	// upload directly (re-hash-deduped by the store). Via-handle
+	// truncate returned early above (deferred to release/fsync).
+	f.st.RecordWrite(name)
 	return fuse.OK
 }
 

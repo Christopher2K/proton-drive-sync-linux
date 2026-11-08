@@ -217,6 +217,11 @@ func (t *Tree) Children(ino INodeNo) ([]string, bool) {
 	if !ok {
 		return nil, false
 	}
+	if rel == StateProxy {
+		// Synthetic proxy directory: present as a dir, empty listing.
+		// Rust returns 0 entries for <mnt>/.pds (not a real directory scan).
+		return nil, true
+	}
 	if rel != "" {
 		n, ok := t.inner.byPath[rel]
 		if !ok || !n.IsDir {

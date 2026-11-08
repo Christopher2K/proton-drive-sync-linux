@@ -18,6 +18,7 @@ type writeHandle struct {
 	fs      *PdsFs
 	rel     string
 	file    *os.File
+	ino     uint64 // inode at open: stable across rename/unlink for GetAttr
 	dirty   bool
 	overlay bool
 	// discarded: the path was unlinked (or replaced by a rename) while
@@ -33,6 +34,7 @@ type writeHandle struct {
 type readHandle struct {
 	rel  string
 	file *os.File
+	ino  uint64 // inode at open: stable across rename/unlink for GetAttr
 	// tracked: whether this handle registered with the store's
 	// open-handle guard (snapshot-backed files only; overlay files are
 	// not evictable).
@@ -41,12 +43,19 @@ type readHandle struct {
 }
 
 func (f *PdsFs) newWriteHandle(rel string, file *os.File, dirty, overlay bool) *writeHandle {
+	ino := f.inoForAttr(rel, false)
 	f.handleMu.Lock()
 	defer f.handleMu.Unlock()
 	f.nextFh++
-	h := &writeHandle{fs: f, rel: rel, file: file, dirty: dirty, overlay: overlay}
+	h := &writeHandle{fs: f, rel: rel, file: file, ino: ino, dirty: dirty, overlay: overlay}
 	f.handles[f.nextFh] = h
 	return h
+}
+
+func (h *writeHandle) relSnapshot() string {
+	h.fs.handleMu.Lock()
+	defer h.fs.handleMu.Unlock()
+	return h.rel
 }
 
 // rekeyHandles: re-key open handles after a rename/move — an fd stays
@@ -137,6 +146,7 @@ func (w *writeFile) Write(data []byte, off int64) (uint32, fuse.Status) {
 	if err != nil && n == 0 {
 		return 0, fuse.ToStatus(err)
 	}
+	rel := w.h.relSnapshot()
 	w.fs.handleMu.Lock()
 	w.h.dirty = true
 	w.fs.handleMu.Unlock()
@@ -146,9 +156,9 @@ func (w *writeFile) Write(data []byte, off int64) (uint32, fuse.Status) {
 	if info, err := w.h.file.Stat(); err == nil {
 		size := uint64(info.Size())
 		w.fs.mu.Lock()
-		if e, ok := w.fs.overlay.byRel[w.h.rel]; ok && e.size < size {
+		if e, ok := w.fs.overlay.byRel[rel]; ok && e.size < size {
 			e.size = size
-			w.fs.overlay.byRel[w.h.rel] = e
+			w.fs.overlay.byRel[rel] = e
 		}
 		w.fs.mu.Unlock()
 	}
@@ -164,18 +174,23 @@ func (w *writeFile) Flush() fuse.Status {
 // and drop open-handle protection for revision handles.
 func (w *writeFile) Release() {
 	h := w.h
+	// Capture handle state under handleMu: rekey/discard may race with
+	// the final close, so read rel/dirty/discarded/overlay together.
+	w.fs.handleMu.Lock()
+	rel, dirty, discarded, overlay := h.rel, h.dirty, h.discarded, h.overlay
+	w.fs.handleMu.Unlock()
 	w.fs.removeWriteHandle(h)
-	if h.dirty && !h.discarded {
+	if dirty && !discarded {
 		var size uint64
 		if info, err := h.file.Stat(); err == nil {
 			size = uint64(info.Size())
 		}
 		h.file.Sync()
-		w.fs.finalizeWrite(h.rel, size)
+		w.fs.finalizeWrite(rel, size)
 	}
-	if !h.overlay {
+	if !overlay {
 		// Revision handles are open-tracked; drop the protection.
-		w.fs.st.RemoveOpenHandle(h.rel)
+		w.fs.st.RemoveOpenHandle(rel)
 	}
 	h.file.Close()
 }
@@ -200,11 +215,12 @@ func (w *writeFile) Fsync(flags int) fuse.Status {
 }
 
 func (w *writeFile) Truncate(size uint64) fuse.Status {
-	return w.fs.truncateCommon(w.h.rel, size, w.h)
+	return w.fs.truncateCommon(w.h.relSnapshot(), size, w.h)
 }
 
 func (w *writeFile) GetAttr(out *fuse.Attr) fuse.Status {
-	isDir, _, mtime, _, ok := w.fs.nodeMeta(w.h.rel)
+	rel := w.h.relSnapshot()
+	isDir, _, mtime, _, ok := w.fs.nodeMeta(rel)
 	if !ok {
 		isDir, mtime = false, w.fs.nowSecs()
 	}
@@ -213,7 +229,13 @@ func (w *writeFile) GetAttr(out *fuse.Attr) fuse.Status {
 	if err == nil {
 		size = uint64(info.Size())
 	}
-	*out = *w.fs.attrFor(w.fs.inoForAttr(w.h.rel, isDir), isDir, size, mtime)
+	// ino is pinned at open: a re-derived ino would follow a recycled
+	// path after rename-over/unlink, while POSIX keeps the fd's inode.
+	ino := w.h.ino
+	if ino == 0 {
+		ino = w.fs.inoForAttr(rel, isDir)
+	}
+	*out = *w.fs.attrFor(ino, isDir, size, mtime)
 	return fuse.OK
 }
 
@@ -221,10 +243,11 @@ func (w *writeFile) Chmod(perms uint32) fuse.Status {
 	if err := w.h.file.Chmod(os.FileMode(perms & 0o777)); err != nil {
 		return fuse.ToStatus(err)
 	}
+	rel := w.h.relSnapshot()
 	w.fs.mu.Lock()
-	if e, ok := w.fs.overlay.byRel[w.h.rel]; ok {
+	if e, ok := w.fs.overlay.byRel[rel]; ok {
 		e.mode = perms & 0o777
-		w.fs.overlay.byRel[w.h.rel] = e
+		w.fs.overlay.byRel[rel] = e
 	}
 	w.fs.mu.Unlock()
 	return fuse.OK
@@ -236,10 +259,11 @@ func (w *writeFile) Chown(uid uint32, gid uint32) fuse.Status {
 
 func (w *writeFile) Utimens(atime *time.Time, mtime *time.Time) fuse.Status {
 	if mtime != nil {
+		rel := w.h.relSnapshot()
 		w.fs.mu.Lock()
-		if e, ok := w.fs.overlay.byRel[w.h.rel]; ok {
+		if e, ok := w.fs.overlay.byRel[rel]; ok {
 			e.mtime = mtime.Unix()
-			w.fs.overlay.byRel[w.h.rel] = e
+			w.fs.overlay.byRel[rel] = e
 		}
 		w.fs.mu.Unlock()
 	}
@@ -273,6 +297,24 @@ func (r *readFile) Release() {
 		r.h.fs.st.RemoveOpenHandle(r.h.rel)
 	}
 	r.h.file.Close()
+}
+
+func (r *readFile) GetAttr(out *fuse.Attr) fuse.Status {
+	isDir, _, mtime, _, ok := r.h.fs.nodeMeta(r.h.rel)
+	if !ok {
+		isDir, mtime = false, r.h.fs.nowSecs()
+	}
+	info, err := r.h.file.Stat()
+	size := uint64(0)
+	if err == nil {
+		size = uint64(info.Size())
+	}
+	ino := r.h.ino
+	if ino == 0 {
+		ino = r.h.fs.inoForAttr(r.h.rel, isDir)
+	}
+	*out = *r.h.fs.attrFor(ino, isDir, size, mtime)
+	return fuse.OK
 }
 
 var _ nodefs.File = (*writeFile)(nil)
