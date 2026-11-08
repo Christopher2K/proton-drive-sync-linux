@@ -29,7 +29,7 @@ let
   # Single product version (mirrored to sidecar/package.json,
   # nix/sidecar.nix and the sidecar APP_VERSION by scripts/release.sh;
   # scripts/check-versions.sh enforces it).
-  version = "0.5.9";
+  version = "0.6.0";
 
   # The mygo module requires Go >= 1.27.3 (see mygo-shell/go.mod), so the
   # shell derivation uses the latest-Go-module builder (go_1_27, 1.27.3 in

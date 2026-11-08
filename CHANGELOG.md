@@ -5,6 +5,72 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## v0.6.0 - 2026-11-08
+
+
+### Added
+
+- Full MyGo UI replacement and headless engine promotion
+- Change the sync folder from Settings
+- Phase 2 skeleton — protocol-compatible Go engine socket server
+- Port guard, conflict naming, and state DB with test batteries
+- Port VFS store with hydration, write queues, LRU, and overlay
+- Port mode — sync mode, root-key hashing, cache cap
+- Port sidecar client — JSON-RPC stdio, spawn discovery, mock
+- Port vfs-linux — FUSE placeholder view on go-fuse
+- Port sync engine core — mirror-mode pipeline, watcher, backend wiring
+- Placeholder-mode orchestration — layout conversion, FUSE probe/mount, session loop
+- Implement placeholder-mode hydration, eviction, pins, and write-through
+- Default to Go engine with Rust fallback
+
+### Changed
+
+- Clippy cleanups
+- Split main.go into component-based files
+
+### Documentation
+
+- Add runtime MyGo shell screenshots
+- Capture app screenshots per-window without stealing focus
+- Add headless UI testing skill; cross-link Tester and screenshots
+- Live-account E2E runbook for the Go engine
+- Correct runbook finding on empty event cursor
+- Live upload+trash paths proven against the real account
+- Refresh runtime shots with populated sync state
+
+### Fixed
+
+- Runtime layout and truncation issues
+- Match the GPUI shell design 1:1
+- Tray deadlock, settings scrolling, engine state casing, login card layout
+- Open sync folder in file manager instead of terminal
+- Failure and splash screens match the GPUI card layout
+- Add busy_timeout so engine restarts survive the WAL handoff
+- Retain open fds across unlink/rename-over and fix .pds readdir
+- Apply dir rename pairs parents-first (sortByDepth was a stub)
+
+### Miscellaneous
+
+- Add opencode skills for mygo UI work and screenshot verification
+- Mark fsnotify as a direct dependency
+- Add Go engine test leg alongside the Rust suite
+- Remove the Rust engine after the Go port
+- Remove the Rust cross-compat test; bump devenv Go to 1.27
+- Consolidate to the runtime shot set
+
+### Other
+
+- Phase 1 mygo migration poc
+
+### Testing
+
+- Drive the change-folder UI headlessly with mygo Tester
+- Port remaining Rust engine battery
+- Port FUSE e2e battery and soak suite
+- Full-engine kernel battery plus placeholder soak and conversion unskips
+- Widen waitFor timeout for loaded hosts
+- Tempdir for sidecar mock upload fixtures
+
 ## v0.5.9 - 2026-11-04
 
 
