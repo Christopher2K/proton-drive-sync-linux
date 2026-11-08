@@ -1,6 +1,5 @@
 {
   pkgs,
-  rust-bin,
 }:
 
 # Minimal contributor shell mirroring devenv.nix (the dev environment remains
@@ -9,18 +8,15 @@
 pkgs.mkShell {
   packages =
     [
-      # Same compiler as devenv and CI.
-      (rust-bin.fromRustupToolchainFile ../rust-toolchain.toml)
+      # Same compiler as devenv and CI (engine-go declares go 1.26).
+      pkgs.go_1_27
 
-      pkgs.cmake
       pkgs.git
       pkgs.nodejs_22
-      pkgs.openssl
-      pkgs.pkg-config
       pkgs.sqlite
-      pkgs.zstd
 
-      # Native libraries gpui/FUSE link or dlopen.
+      # Native libraries the MyGo shell dlopens at runtime (GTK/X stack) and
+      # go-fuse needs for FUSE mounts.
       pkgs.alsa-lib
       pkgs.dbus
       pkgs.fontconfig
@@ -33,11 +29,7 @@ pkgs.mkShell {
       pkgs.libXrandr
       pkgs.libXi
       pkgs.libxkbcommon
-      pkgs.udev
-      pkgs.vulkan-loader
       pkgs.wayland
       pkgs.wayland-protocols
     ];
-
-  env.RUST_BACKTRACE = "1";
 }

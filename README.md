@@ -21,7 +21,7 @@ A **Linux** desktop app that syncs a folder with [Proton Drive](https://proton.m
 - **Product spec:** [SPEC.md](SPEC.md) — source of truth
 - **Agent notes:** [AGENT.md](AGENT.md)
 
-Stack: MyGo-native Linux UI shell (`mygo-shell/`) · Rust headless sync engine (`crates/engine-headless/`) · Node.js sidecar running the official [Proton Drive SDK](https://github.com/ProtonDriveApps/sdk) · SQLite state. (macOS and Windows were supported in an earlier iteration and have been dropped; the previous GPUI app is preserved in-tree as a reference.)
+Stack: MyGo-native Linux UI shell (`mygo-shell/`) · Go sync engine (`engine-go/`, binary `pds-engine-go`) · Node.js sidecar running the official [Proton Drive SDK](https://github.com/ProtonDriveApps/sdk) · SQLite state. (macOS and Windows were supported in an earlier iteration and have been dropped.)
 
 ## Read this first (important)
 
@@ -69,11 +69,9 @@ deletes from Drive.
 - **Tray icon** with status dot, pause/resume, open folder, preferences, and quit.
 - Closing the dashboard hides the app to the tray; sync keeps running.
 
-### CLI companion
+### Headless engine
 
-`pds sync` runs the engine headless; `pds status|pause|resume` control a running
-engine; `pds mount <folder> <mountpoint>` serves a placeholder view anywhere. See
-`pds --help`.
+The sync engine (`pds-engine-go`) is headless-only: it runs as a child process of the MyGo shell, which controls it over a Unix socket. (The old `pds` CLI was removed with the Rust workspace.)
 
 ## Install
 
@@ -99,10 +97,11 @@ nix profile install github:Christopher2K/proton-drive-sync-linux
 # 1. Enter the pinned development environment
 devenv shell
 
-# 2. Build the Rust headless engine
-cargo build --release -p pds-engine-headless -p pds-cli
+# 2. Build the Go sync engine
+(cd engine-go && go build -o pds-engine-go ./cmd/pds-engine-go)
 
-# 3. Build the MyGo UI shell
+# 3. Build the MyGo UI shell (needs Go >= 1.27.3; in devenv this pulls the
+#    1.27.3 toolchain via GOTOOLCHAIN on first run — see AGENT.md)
 cd mygo-shell
 go build -o proton-drive-sync .
 cd ..
@@ -138,9 +137,10 @@ and `npm` at runtime).
 
 ## Development environment (devenv)
 
-The Rust toolchain (pinned in `rust-toolchain.toml`), Node.js, and every native
-library GPUI/FUSE need are declared in `devenv.nix` and locked in
-`devenv.lock`, so local development and CI build against the same environment.
+The Go toolchain (see the `go` version note in [AGENT.md](AGENT.md)), Node.js,
+and every native library the MyGo shell/FUSE need are declared in `devenv.nix`
+and locked in `devenv.lock`, so local development and CI build against the same
+environment.
 
 Install [Nix](https://nixos.org/download) and [devenv](https://devenv.sh/getting-started/)
 once, then from the repository root:
@@ -150,19 +150,18 @@ devenv shell        # enter the environment
 # or, with direnv installed: direnv allow
 ```
 
-`devenv test` builds the environment and runs the full test suite. FUSE tests
-additionally need the host's setuid `fusermount3` (package `fuse3`), which Nix
-cannot provide; the shell points `fuser` at the host binary automatically.
+`devenv test` builds the environment and runs the full test suite (Go engine
+tests + sidecar typecheck/tests). FUSE tests additionally need the host's setuid
+`fusermount3` (package `fuse3`), which Nix cannot provide.
 
 ## Build (Linux)
 
 ```sh
-# Headless engine + CLI
-cargo build --release -p pds-engine-headless -p pds-cli
+# Go sync engine
+(cd engine-go && go build -o pds-engine-go ./cmd/pds-engine-go)
 
-# MyGo UI shell
-cd mygo-shell
-go build -o proton-drive-sync .
+# MyGo UI shell (needs Go >= 1.27.3 — see AGENT.md)
+(cd mygo-shell && go build -o proton-drive-sync .)
 ```
 
 The MyGo shell needs the Go toolchain (in `devenv.nix`) and GTK/WebKit libraries
@@ -187,13 +186,12 @@ Environment knobs:
 | `PDS_CACHE_CAP` | Backing-cache cap: bytes with an optional `K`/`M`/`G`/`T` suffix (`500M`, `10G`) or `unlimited`; session-only override of the persisted Settings choice (never rewrites it). `pds mount --cache-cap <SIZE>` overrides both for one invocation |
 | `PDS_SIDECAR_CMD` | Sidecar command override, e.g. `node sidecar/dist/index.js` |
 | `PDS_SIDECAR_DIR` | Sidecar directory override for auto-discovery |
-| `RUST_LOG` | Log filter (default `info,pds_core=debug`), logs go to stderr |
 
 ## Background service and tray
 
-The app **is** the sync service: the MyGo dashboard launches the headless Rust
-engine as a child process, and the tray outlives the window, so closing the
-dashboard never interrupts a transfer.
+The app **is** the sync service: the MyGo dashboard launches the Go engine
+(`pds-engine-go`) as a child process, and the tray outlives the window, so
+closing the dashboard never interrupts a transfer.
 
 - **Start at login** is on by default for installed builds (development
   builds stay opt-in). `Settings → Startup` toggles it. The MyGo runtime writes
@@ -226,7 +224,7 @@ pre-1.0: breaking changes bump the minor). One version is shared by the app,
 CLI, sidecar, and Nix packages — `scripts/check-versions.sh` enforces this in
 CI.
 
-To cut a release (inside the devenv shell, so `git-cliff`, `cargo` and `gh` are
+To cut a release (inside the devenv shell, so `git-cliff` and `gh` are
 available):
 
 ```sh
@@ -250,9 +248,9 @@ conventional commits, and opens a `release/vX.Y.Z` PR titled
 ## Testing
 
 ```sh
-devenv test                     # Rust workspace + sidecar typecheck/tests + MyGo shell
-devenv shell -- cargo test --workspace   # Rust only, inside the env
-cd mygo-shell && go test ./...           # MyGo shell unit tests
+devenv test                     # Go engine tests + sidecar typecheck/tests
+(cd engine-go && go vet ./... && go test ./... -short)   # Go engine only
+(cd mygo-shell && go test ./...)                          # MyGo shell unit tests (needs Go >= 1.27.3)
 ```
 
 Notes for VM development (OrbStack et al.): inotify over shared folders is unreliable — run the engine tests on VM-native disk. See [AGENT.md](AGENT.md) for details.
