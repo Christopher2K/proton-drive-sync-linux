@@ -47,14 +47,10 @@ MYGO_AUTO_START=1 ./mygo-shell/build/linux-amd64/mygo-shell
 
 ## Screenshot proof
 
-Idle shell before starting the engine:
-
-![MyGo shell idle](../screenshots/mygo-shell-idle.png)
+Idle shell before starting the engine.
 
 Shell after auto-starting the engine and authenticating from the existing
 session:
-
-![MyGo shell running](../screenshots/mygo-shell-running.png)
 
 The status line reads **"Signed in as chris.katoyi@proton.me"** and the
 account label is visible, confirming that the MyGo UI received `AuthOk` and

@@ -6,7 +6,7 @@
 
 A **Linux** desktop app that syncs a folder with [Proton Drive](https://proton.me/drive).
 
-![Sign in screen](docs/screenshots/login.png)
+![Sign in screen](docs/screenshots/mygo-shell-login-runtime.png)
 
 - Your whole Drive appears in `~/ProtonDrive` at ~0 bytes.
 - Files hydrate when opened.
@@ -15,8 +15,8 @@ A **Linux** desktop app that syncs a folder with [Proton Drive](https://proton.m
 
 | | |
 |---|---|
-| ![Overview](docs/screenshots/overview.png) | ![Settings](docs/screenshots/settings.png) |
-| ![Activity](docs/screenshots/activity.png) | ![Conflicts](docs/screenshots/conflicts.png) |
+| ![Overview](docs/screenshots/mygo-shell-overview-runtime.png) | ![Settings](docs/screenshots/mygo-shell-settings-runtime.png) |
+| ![Activity](docs/screenshots/mygo-shell-activity-runtime.png) | ![Conflicts](docs/screenshots/mygo-shell-conflicts-runtime.png) |
 
 - **Product spec:** [SPEC.md](SPEC.md) — source of truth
 - **Agent notes:** [AGENT.md](AGENT.md)
@@ -133,7 +133,7 @@ and `npm` at runtime).
 4. The app starts syncing in the background. Close the window to keep it in the
    tray.
 
-![Sign in screen](docs/screenshots/login.png)
+![Sign in screen](docs/screenshots/mygo-shell-login-runtime.png)
 
 ## Development environment (devenv)
 
