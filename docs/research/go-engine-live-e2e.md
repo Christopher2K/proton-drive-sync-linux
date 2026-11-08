@@ -33,9 +33,9 @@ never as "delete everything" — no tombstones created.
 1. **One node stuck Downloading** after the session was killed — matches
    the Rust crash-recovery shape (rows stuck Downloading reset and resume
    on restart). Worth a restart-convergence check in the E2E harness.
-2. **`event_cursor` empty** — check the cursor scope key the Go engine uses
-   vs `pds_core` (Rust stores under the root scope id). Confirm F6 resume
-   works across restarts before the default flip.
+2. ~~`event_cursor` empty~~ — **not a bug**: both engines write the cursor
+   only when a remote event is applied (Rust `engine.rs:2864`, Go
+   `sync.go:1865`). A fresh sync with no events correctly leaves it empty.
 3. **Upload not yet exercised live** — the `go-engine-e2e.txt` probe file
    was written but the engine was killed before its upload result was
    observed; watcher upload of a new local file remains to be proven
