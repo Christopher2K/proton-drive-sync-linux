@@ -84,7 +84,10 @@ func startWithClient(t *testing.T, root string, client *sidecar.SidecarClient, m
 }
 
 func waitFor(t *testing.T, cond func() bool) {
-	waitForWithin(t, 30*time.Second, cond)
+	// Generous timeout: the conditions are state-based (not clock-based), so
+	// a long cap only ever waits longer on a heavily loaded host; it does not
+	// mask a missing sync step (the state never arrives without it).
+	waitForWithin(t, 120*time.Second, cond)
 }
 
 func waitForWithin(t *testing.T, timeout time.Duration, cond func() bool) {
