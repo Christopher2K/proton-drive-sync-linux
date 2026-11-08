@@ -2,9 +2,14 @@
 // repeated and simultaneous local/remote mutations must keep BOTH versions
 // every time (F7) and leave the engine in a consistent terminal state.
 //
-// Mirror mode only: the engine runs with store == nil and watches the real
-// sync root. Placeholder-mode variants are deferred (step 5 engine wiring
-// pending: the hydrate pump is a step-5 stub) and skipped explicitly.
+// The mirror-mode battery watches the real sync root; the placeholder-mode
+// variants at the bottom drive the same five scenarios through the backing
+// cache (backing writes + RecordWrite) now that the placeholder hydrate pump
+// has wired (5b3e4c3). Remote heads move silently (no event) so the
+// upload-precondition keep-both path is exercised deterministically; the
+// event-delivered head move races the queued write in placeholder mode
+// (the event upsert checks the visible root, never populated there) — see
+// the per-round comment where that matters.
 //
 // Discipline (AGENT.md M4): fixtures synchronize on the watcher before local
 // writes; all waits are bounded. Mass-delete guard tests (engine_test.go)
@@ -21,7 +26,13 @@ import (
 	"pds.dev/engine-go/internal/db"
 	"pds.dev/engine-go/internal/engine"
 	"pds.dev/engine-go/internal/sidecar"
+	storepkg "pds.dev/engine-go/internal/store"
 )
+
+func newPhStore(t *testing.T) *storepkg.Store {
+	t.Helper()
+	return storepkg.New()
+}
 
 // soakConflictContents returns the contents of every conflict copy of stem
 // currently in root. Later rounds accumulate copies, so "the counterpart
@@ -347,21 +358,385 @@ func TestSoakCrashInterruptedTransferRecovery(t *testing.T) {
 	}
 }
 
-// Placeholder-mode soak variants: deferred (the soak fixtures here are
-// mirror-only, store == nil; in-process placeholder scenarios live in
-// engine_placeholder_test.go). The mirror-mode tests above are the runnable
-// battery.
+// Placeholder-mode soak variants (M4/F7 in placeholder mode): the same
+// five scenarios as the mirror battery, driven through the placeholder
+// fixture (backing files + RecordWrite instead of watcher events). The
+// hydrate pump has wired since 5b3e4c3, so all five are runnable:
+// simultaneous edits keep both versions (remote head as a conflict copy
+// in the backing cache), remote-delete-vs-edit preserves the unsynced
+// local bytes, remote-first bursts converge with a surviving conflict
+// copy, churn never collides, and crash recovery re-uploads through the
+// backing dir. Remote heads move silently so the upload-precondition
+// keep-both path is exercised without an event-upsert race (the event
+// path checks the visible root, never populated in placeholder mode).
 func TestSoakPlaceholderModePendingStep5(t *testing.T) {
-	scenarios := []string{
-		"repeated-simultaneous-edits",
-		"remote-delete-vs-edit",
-		"remote-burst-convergence",
-		"conflict-copy-churn",
-		"crash-recovery",
+	t.Run("repeated-simultaneous-edits", soakPlaceholderRepeatedSimultaneousEditsKeepBoth)
+	t.Run("remote-delete-vs-edit", soakPlaceholderRemoteDeleteVsLocalEditKeepsEdit)
+	t.Run("remote-burst-convergence", soakPlaceholderRemoteEditBurstConverges)
+	t.Run("conflict-copy-churn", soakPlaceholderConflictCopiesNeverCollide)
+	t.Run("crash-recovery", soakPlaceholderCrashInterruptedTransferRecovery)
+}
+
+func phSoakStart(t *testing.T) *phFixture {
+	t.Helper()
+	return startPlaceholderWithCap(t, nil, 20*time.Millisecond)
+}
+
+func phSoakConflictContents(fx *phFixture, stem string) []string {
+	entries, err := os.ReadDir(fx.backing)
+	if err != nil {
+		return nil
 	}
-	for _, s := range scenarios {
-		t.Run(s, func(t *testing.T) {
-			t.Skip("step 5 engine wiring pending: placeholder-mode soak variants deferred — these fixtures are mirror-only (store==nil); placeholder scenarios live in engine_placeholder_test.go and the placeholder soak battery is follow-up work")
+	var out []string
+	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), stem+" (conflict ") {
+			if b, err := os.ReadFile(filepath.Join(fx.backing, e.Name())); err == nil {
+				out = append(out, string(b))
+			}
+		}
+	}
+	return out
+}
+
+func phSoakBackingHasContent(fx *phFixture, content string) bool {
+	var walk func(dir string) bool
+	walk = func(dir string) bool {
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			return false
+		}
+		for _, e := range entries {
+			p := filepath.Join(dir, e.Name())
+			if e.IsDir() {
+				if walk(p) {
+					return true
+				}
+			} else if soakReadFile(p) == content {
+				return true
+			}
+		}
+		return false
+	}
+	return walk(fx.backing)
+}
+
+func phSoakAssertQuiescent(t *testing.T, fx *phFixture) {
+	t.Helper()
+	waitForWithin(t, 30*time.Second, func() bool {
+		st, err := fx.handle.Status()
+		return err == nil && st.State == engine.StateRunning
+	})
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		dirty, _ := fx.db.NodesWithState(db.StateDirty)
+		uploading, _ := fx.db.NodesWithState(db.StateUploading)
+		if len(dirty) == 0 && len(uploading) == 0 {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("rows never reached a terminal state: dirty=%v uploading=%v", dirty, uploading)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+}
+
+// phSoakLocalEdit performs a local edit in placeholder mode: write the
+// backing file and queue the write-through upload. No explicit hydrate:
+// the write-through path sources content from the backing dir whether or
+// not the placeholder was previously hydrated (mirroring that mirror-mode
+// files are materialized and editable), and hydrating first would race a
+// just-emitted remote update into a hydrate verify failure (the row still
+// carries the pre-update hash while the download already returns the new
+// head).
+func phSoakLocalEdit(t *testing.T, fx *phFixture, rel, content string) {
+	t.Helper()
+	abs := fx.backingAbs(rel)
+	if err := os.MkdirAll(filepath.Dir(abs), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(abs, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	fx.store.RecordWrite(rel)
+}
+
+func soakPlaceholderRepeatedSimultaneousEditsKeepBoth(t *testing.T) {
+	fx := phSoakStart(t)
+	waitForSnapshot(t, fx, "hello.txt")
+	for round := 1; round <= 5; round++ {
+		local := "local r" + itoa(round)
+		remote := "remote r" + itoa(round)
+		phSoakLocalEdit(t, fx, "hello.txt", local)
+		// Silent head move: the placeholder F7 guarantee lives in the
+		// upload precondition (checkRemoteHead), which compares the
+		// cached SyncedSHA1 against the live remote head. An event-
+		// delivered update would race the queued write (the event upsert
+		// checks the visible root, never populated in placeholder mode,
+		// so it never creates a conflict copy and can overwrite the
+		// local revision); the silent move exercises the deterministic
+		// keep-both path.
+		fx.mock.RemoteUpdateFileSilent("node-hello", []byte(remote))
+		waitFor(t, func() bool {
+			disk := soakReadFile(fx.backingAbs("hello.txt"))
+			copies := phSoakConflictContents(fx, "hello")
+			if disk == local {
+				for _, c := range copies {
+					if c == remote {
+						return true
+					}
+				}
+			}
+			if disk == remote {
+				for _, c := range copies {
+					if c == local {
+						return true
+					}
+				}
+			}
+			return false
 		})
+		phSoakAssertQuiescent(t, fx)
+	}
+	var all []byte
+	all = append(all, []byte(soakReadFile(fx.backingAbs("hello.txt")))...)
+	for _, c := range phSoakConflictContents(fx, "hello") {
+		all = append(all, c...)
+	}
+	if !strings.Contains(string(all), "remote r5") {
+		t.Fatalf("latest remote lost: %s", all)
+	}
+	st, err := fx.handle.Status()
+	if err != nil || st.State != engine.StateRunning {
+		t.Fatalf("engine state = %v, %v", st.State, err)
+	}
+}
+
+func soakPlaceholderRemoteDeleteVsLocalEditKeepsEdit(t *testing.T) {
+	for round := 1; round <= 3; round++ {
+		fx := phSoakStart(t)
+		waitForSnapshot(t, fx, "hello.txt")
+		local := "precious edit r" + itoa(round)
+		phSoakLocalEdit(t, fx, "hello.txt", local)
+		fx.mock.RemoteDelete("node-hello")
+		waitFor(t, func() bool { return phSoakBackingHasContent(fx, local) })
+		phSoakAssertQuiescent(t, fx)
+		st, err := fx.handle.Status()
+		if err != nil || st.State != engine.StateRunning {
+			t.Fatalf("engine state = %v, %v", st.State, err)
+		}
+	}
+}
+
+func soakPlaceholderRemoteEditBurstConverges(t *testing.T) {
+	fx := phSoakStart(t)
+	waitForSnapshot(t, fx, "hello.txt")
+	for i := 1; i <= 6; i++ {
+		fx.mock.RemoteUpdateFileSilent("node-hello", []byte("burst "+itoa(i)))
+		phSoakLocalEdit(t, fx, "hello.txt", "local burst "+itoa(i))
+		time.Sleep(120 * time.Millisecond)
+	}
+	phSoakAssertQuiescent(t, fx)
+	// Both directions preserved: the final backing file holds one side's
+	// last version and a conflict copy holds the other (the placeholder
+	// upload path keeps the local revision authoritative and preserves
+	// the remote head as the conflict copy).
+	waitFor(t, func() bool {
+		backing := soakReadFile(fx.backingAbs("hello.txt"))
+		copies := phSoakConflictContents(fx, "hello")
+		hasConflict := len(copies) > 0
+		if !hasConflict {
+			return false
+		}
+		// The last local and last remote versions must both survive
+		// somewhere (backing hello.txt, a conflict copy, or the remote).
+		all := backing
+		for _, c := range copies {
+			all += "\x00" + c
+		}
+		if c, ok := fx.mock.FileContent("node-hello"); ok {
+			all += "\x00" + string(c)
+		}
+		return strings.Contains(all, "burst 6") && strings.Contains(all, "local burst 6")
+	})
+	st, err := fx.handle.Status()
+	if err != nil {
+		t.Fatalf("status: %v", err)
+	}
+	if st.State != engine.StateRunning {
+		t.Fatalf("engine state = %v", st.State)
+	}
+	if st.ErroredNodes != 0 {
+		t.Fatalf("errored nodes = %d", st.ErroredNodes)
+	}
+}
+
+func soakPlaceholderConflictCopiesNeverCollide(t *testing.T) {
+	fx := phSoakStart(t)
+	waitForSnapshot(t, fx, "hello.txt")
+	for round := 1; round <= 8; round++ {
+		local := "copy r" + itoa(round)
+		head := "head r" + itoa(round)
+		phSoakLocalEdit(t, fx, "hello.txt", local)
+		fx.mock.RemoteUpdateFileSilent("node-hello", []byte(head))
+		// Wait until this round's pair both survived (order-independent).
+		waitFor(t, func() bool {
+			backing := soakReadFile(fx.backingAbs("hello.txt"))
+			copies := phSoakConflictContents(fx, "hello")
+			if backing == local {
+				for _, c := range copies {
+					if c == head {
+						return true
+					}
+				}
+			}
+			if backing == head {
+				for _, c := range copies {
+					if c == local {
+						return true
+					}
+				}
+			}
+			return false
+		})
+	}
+	phSoakAssertQuiescent(t, fx)
+	seen := map[string]bool{}
+	for _, content := range phSoakConflictContents(fx, "hello") {
+		if content == "" {
+			t.Fatal("conflict copy is empty")
+		}
+		if seen[content] {
+			t.Fatalf("duplicate conflict copy content: %q", content)
+		}
+		seen[content] = true
+	}
+	if len(seen) == 0 {
+		t.Fatal("no conflict copies survived the churn")
+	}
+}
+
+func soakPlaceholderCrashInterruptedTransferRecovery(t *testing.T) {
+	t.Setenv("PDS_SYNC_MODE", "placeholders")
+	dir := t.TempDir()
+	root := filepath.Join(dir, "sync")
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	dbPath := filepath.Join(root, engine.StateDir, "state.db")
+	backing := filepath.Join(root, engine.VFSBackingDir)
+
+	// Run 1: baseline snapshot, then a revision edit, then crash mid-upload.
+	func() {
+		mock := sidecar.NewMock()
+		client, handle := mock.Connect()
+		cfg := engine.DefaultConfig()
+		cfg.Root = root
+		cfg.DBPath = dbPath
+		cfg.RetryBase = 20 * time.Millisecond
+		cfg.Placeholders = true
+		cfg.WatchLocalWrites = true
+		st := newPhStore(t)
+		eng, h, err := engine.New(client, client.Notifications(), st, cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		done := make(chan error, 1)
+		go func() { done <- eng.Run() }()
+		h.WaitForWatcher(10 * time.Second)
+		waitFor(t, func() bool {
+			snap := st.Snapshot()
+			_, ok := snap.ByPath["hello.txt"]
+			return ok
+		})
+		handle.CrashOnNextUpload()
+		abs := filepath.Join(backing, "hello.txt")
+		if err := os.MkdirAll(filepath.Dir(abs), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(abs, []byte("revision-in-flight"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		// The backing file was never hydrated, so the write-through path
+		// sources it from the backing dir; queue it via the store.
+		st.RecordWrite("hello.txt")
+		waitFor(t, func() bool {
+			s, err := h.Status()
+			return err == nil && s.SidecarUnavailable
+		})
+		h.Shutdown()
+		select {
+		case <-done:
+		case <-time.After(30 * time.Second):
+			t.Fatal("engine did not stop after crash + shutdown")
+		}
+		client.Close()
+	}()
+
+	// Plant crash leftovers: a stale temp in the backing cache and a row
+	// stuck mid-upload.
+	staleTemp := filepath.Join(backing, ".pds-abc123.pds-part")
+	if err := os.MkdirAll(backing, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(staleTemp, []byte("stale"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	{
+		d, err := db.Open(dbPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		row, err := d.NodeByPath("hello.txt")
+		if err != nil || row == nil {
+			t.Fatal("hello.txt row missing")
+		}
+		row.SyncState = db.StateUploading
+		if err := d.UpsertNode(row); err != nil {
+			t.Fatal(err)
+		}
+		d.Close()
+	}
+
+	// Run 2 with a fresh mock carrying the same tree: the stuck row goes
+	// back to Dirty and re-syncs, the stale temp sweeps away.
+	mock := sidecar.NewMockWithSeq(500)
+	client, handle := mock.Connect()
+	cfg := engine.DefaultConfig()
+	cfg.Root = root
+	cfg.DBPath = dbPath
+	cfg.RetryBase = 20 * time.Millisecond
+	cfg.Placeholders = true
+	cfg.WatchLocalWrites = true
+	st := newPhStore(t)
+	eng, h, err := engine.New(client, client.Notifications(), st, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- eng.Run() }()
+	defer func() { h.Shutdown(); <-done; client.Close() }()
+
+	waitFor(t, func() bool {
+		d, err := db.Open(dbPath)
+		if err != nil {
+			return false
+		}
+		defer d.Close()
+		row, err := d.NodeByPath("hello.txt")
+		return err == nil && row != nil && row.SyncState == db.StateSynced
+	})
+	uid, ok := handle.FindUID("root", "hello.txt")
+	if !ok {
+		t.Fatal("hello.txt uid missing after recovery")
+	}
+	waitFor(t, func() bool {
+		c, _ := handle.FileContent(uid)
+		return string(c) == "revision-in-flight"
+	})
+	if _, err := os.Stat(staleTemp); !os.IsNotExist(err) {
+		t.Fatal("stale temp not swept")
+	}
+	if trashed := handle.TrashedUIDs(); len(trashed) != 0 {
+		t.Fatalf("trashed during recovery: %v", trashed)
 	}
 }
