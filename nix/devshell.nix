@@ -9,7 +9,7 @@ pkgs.mkShell {
   packages =
     [
       # Same compiler as devenv and CI (engine-go declares go 1.26).
-      pkgs.go_1_26
+      pkgs.go_1_27
 
       pkgs.git
       pkgs.nodejs_22

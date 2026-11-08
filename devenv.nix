@@ -39,7 +39,7 @@ in
       git
       # Go toolchain for engine-go (module declares go 1.26). Pinned minor
       # so devenv and CI use the same compiler with no GOTOOLCHAIN download.
-      go_1_26
+      go_1_27
       # Release/CI tooling: git-cliff generates CHANGELOG.md from conventional
       # commits (scripts/release.sh); actionlint + shellcheck validate the
       # workflows and release scripts; gh opens the release PR.
