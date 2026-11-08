@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 
@@ -658,7 +659,14 @@ func (e *Engine) detectDirRenames() []renamePair {
 	if len(vanished) == 0 {
 		return nil
 	}
-	// Parents before children: re-keying a parent moves the whole subtree.
+	// Parents before children: re-keying a parent moves the whole subtree,
+	// so pairs must be applied in depth order (shallowest first). Without
+	// this, a child pair applied first leaves the parent path un-rekeyed,
+	// and the leftover create event for the parent gets swept into a
+	// duplicate remote folder that then blocks the parent's move with
+	// "name already exists" and the folder gets trashed. Root-caused
+	// 2026-11-08 via the flaking rename test: vanished order was
+	// map-iteration random.
 	sortByDepth(vanished)
 
 	appeared := e.scanUntrackedDirs()
@@ -714,8 +722,23 @@ func (e *Engine) detectDirRenames() []renamePair {
 	return pairs
 }
 
-func sortByDepth[T any](items []T) []T {
-	return items // stable enough: iteration order is deterministic enough for tests
+func sortByDepth(items []struct {
+	rel string
+	id  devIno
+}) {
+	// Shallowest first, by number of '/'-separated path segments. For
+	// directory rels this orders a folder before its own subtree so a
+	// parent pair is always applied (and rekeyed) before any child pair.
+	// Equal depths keep their order (SliceStable), so the outcome does
+	// not depend on map iteration order.
+	slices.SortStableFunc(items, func(a, b struct {
+		rel string
+		id  devIno
+	}) int {
+		return strings.Compare(
+			strings.Repeat("x", strings.Count(a.rel, "/")),
+			strings.Repeat("x", strings.Count(b.rel, "/")))
+	})
 }
 
 // scanUntrackedDirs lists every existing directory not already tracked at
