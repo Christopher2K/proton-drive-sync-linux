@@ -36,10 +36,16 @@ never as "delete everything" — no tombstones created.
 2. ~~`event_cursor` empty~~ — **not a bug**: both engines write the cursor
    only when a remote event is applied (Rust `engine.rs:2864`, Go
    `sync.go:1865`). A fresh sync with no events correctly leaves it empty.
-3. **Upload not yet exercised live** — the `go-engine-e2e.txt` probe file
-   was written but the engine was killed before its upload result was
-   observed; watcher upload of a new local file remains to be proven
-   against the live account (mock-covered in tests).
+3. ~~**Upload not yet exercised live**~~ — **proven live (2026-11-08
+   "patient run")**: after a clean enumeration on the same synced root,
+   a 15-byte probe file written locally was picked up by the watcher and
+   reached `Synced` with a Drive node UID on the first poll, and deleting
+   it produced the engine log line
+   `trashed remotely: go-engine-live-probe.txt`, with the node row and
+   tombstone drained ~10 s later. Watcher, upload, trash, and session
+   restore are all live-proven. Mass-delete guard and keep-both remain
+   mock-covered only (deliberately never exercised against this real
+   account).
 
 ## What the production default flip still needs
 
