@@ -40,6 +40,9 @@ in
     [
       cmake
       git
+      # Go toolchain for engine-go (module declares go 1.26). Pinned minor
+      # so devenv and CI use the same compiler with no GOTOOLCHAIN download.
+      go_1_26
       # Release/CI tooling: git-cliff generates CHANGELOG.md from conventional
       # commits (scripts/release.sh); actionlint + shellcheck validate the
       # workflows and release scripts; gh opens the release PR.
@@ -78,12 +81,18 @@ in
       done
     fi
 
-    echo "proton-drive-sync devenv (rust $(rustc --version | cut -d' ' -f2), node $(node --version))"
+    echo "proton-drive-sync devenv (rust $(rustc --version | cut -d' ' -f2), node $(node --version), go $(go version | cut -d' ' -f3))"
   '';
 
   scripts = {
     pds-test.exec = ''
       cargo test --locked --workspace --all-targets --no-fail-fast
+    '';
+
+    # Go engine leg: same command `devenv test` runs via enterTest below.
+    # -short skips the kernel-FUSE e2e and live-backend tests (~90s battery).
+    engine-go-test.exec = ''
+      (cd "$DEVENV_ROOT/engine-go" && go vet ./... && go test ./... -short)
     '';
 
     sidecar-install.exec = ''
@@ -95,9 +104,12 @@ in
     '';
   };
 
-  # `devenv test` — used locally and by CI.
+  # `devenv test` — used locally and by CI. Runs the Rust leg and the Go
+  # engine leg side by side until the default flip soaks; then the Rust
+  # leg is removed (see docs/research/go-engine-migration.md §3).
   enterTest = ''
     cargo test --locked --workspace --all-targets --no-fail-fast
+    (cd engine-go && go vet ./... && go test ./... -short)
     (cd sidecar && npm ci --no-audit --no-fund && npm run typecheck && npm test)
   '';
 }

@@ -36,8 +36,9 @@ jobs:
     name: devenv tests
     runs-on: ubuntu-24.04
     # A from-scratch build is ~3 min on the 4-core runner; the FUSE e2e test
-    # self-bounds at ~3 min worst case. 15 min leaves ample headroom.
-    timeout-minutes: 15
+    # self-bounds at ~3 min worst case. The Go engine battery adds ~90s
+    # (cold module/build longer). 20 min leaves ample headroom.
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v5
 
@@ -88,7 +89,31 @@ jobs:
             target
           key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock', 'devenv.lock', 'rust-toolchain.toml') }}
 
-      # Runs the same enterTest as `devenv test` locally: cargo tests plus
-      # sidecar typecheck/tests.
+      # Go module + build cache for the engine-go leg (default GOPROXY,
+      # online runners fetch on first run; warm cache thereafter).
+      - name: Restore Go cache
+        id: go-cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/go/pkg/mod
+            ~/.cache/go-build
+          key: ${{ runner.os }}-go-${{ hashFiles('engine-go/go.mod', 'engine-go/go.sum', 'devenv.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-go-
+
+      # Runs the same enterTest as `devenv test` locally: cargo tests, the
+      # Go engine leg (go vet + go test -short in engine-go/), sidecar
+      # typecheck/tests.
       - name: Run tests
         run: devenv test
+
+      # Save even on failure so a failing leg still warms the cache.
+      - name: Save Go cache
+        if: '!cancelled()'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ~/go/pkg/mod
+            ~/.cache/go-build
+          key: ${{ runner.os }}-go-${{ hashFiles('engine-go/go.mod', 'engine-go/go.sum', 'devenv.lock') }}
