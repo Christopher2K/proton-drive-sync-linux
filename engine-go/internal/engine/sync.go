@@ -1466,7 +1466,17 @@ func (e *Engine) applyLocalRename(oldRel, newRel string) error {
 		if dest, derr := e.db.NodeByPath(newRel); derr == nil && dest != nil && dest.IsFile() {
 			sourceIsRemote := !strings.HasPrefix(row.NodeUID, "pending:")
 			if sourceIsRemote {
-				// Mirror mode: no backing download seam (store == nil).
+				// A placeholder source (never hydrated locally) has no
+				// backing content for the destination write to upload.
+				// Pull its remote content to the destination path first.
+				if e.store != nil {
+					destAbs := toAbs(e.backingDir, newRel)
+					if !isRegularFile(destAbs) {
+						if err := e.downloadToBacking(row.NodeUID, newRel, row.Mtime, row.Mode); err != nil {
+							return err
+						}
+					}
+				}
 				ctx, cancel := ctxBG()
 				results, terr := e.sidecar.Trash(ctx, []string{row.NodeUID})
 				cancel()
@@ -1490,6 +1500,9 @@ func (e *Engine) applyLocalRename(oldRel, newRel string) error {
 			dest.SyncState = db.StateDirty
 			if err := e.db.UpsertNode(dest); err != nil {
 				return err
+			}
+			if e.store != nil {
+				e.store.RecordWrite(newRel)
 			}
 			e.log.Printf("%s -> %s: overwrite rename merged into the existing node %s", oldRel, newRel, dest.NodeUID)
 			return nil
@@ -1602,6 +1615,22 @@ func (e *Engine) applyLocalRename(oldRel, newRel string) error {
 		}
 		if err := os.Rename(from, to); err != nil {
 			return err
+		}
+	}
+	if e.store != nil {
+		e.store.ForgetTree(oldRel)
+		children, _ := e.db.NodesUnder(likeUnder(newRel))
+		for _, child := range children {
+			if abs := e.contentPath(child.LocalPath); isRegularFile(abs) {
+				if _, ok := e.store.BackingPath(child.LocalPath); !ok {
+					e.store.SetBacking(child.LocalPath, abs)
+				}
+			}
+		}
+		if own := e.contentPath(newRel); isRegularFile(own) {
+			if _, ok := e.store.BackingPath(newRel); !ok {
+				e.store.SetBacking(newRel, own)
+			}
 		}
 	}
 	// Filesystem identities follow the rows.
@@ -1833,7 +1862,16 @@ func (e *Engine) applyEvent(ev sidecar.DriveEvent) error {
 		}
 	}
 	// Persist the resume token after applying (protocol.md F6).
-	return e.db.SetEventCursor(ev.ScopeID, ev.EventID)
+	if err := e.db.SetEventCursor(ev.ScopeID, ev.EventID); err != nil {
+		return err
+	}
+	// Keep the VFS tree in step with applied events (M3).
+	if e.store != nil {
+		if err := e.publishVfsSnapshot(); err != nil {
+			e.log.Printf("post-event VFS snapshot failed: %v", err)
+		}
+	}
+	return nil
 }
 
 // resolveUnknownAncestors ensures every ancestor of node has a DB row
@@ -2553,8 +2591,8 @@ loop:
 	return result, failure
 }
 
-// maybeEvict is the placeholder-mode eviction seam; a no-op in mirror mode.
-func (e *Engine) maybeEvict(protect string) {}
+// maybeEvict lives in placeholder.go (no-op in mirror mode: callers and
+// the SetEvictionCap handler only invoke it when e.store != nil).
 
 // ---- work pump ----
 
@@ -2598,6 +2636,12 @@ func (e *Engine) pumpWork() (bool, error) {
 			}
 			return false, err
 		}
+		// Write-through: the VFS tree must drop the path right away.
+		if e.store != nil {
+			if err := e.publishVfsSnapshot(); err != nil {
+				e.log.Printf("post-trash VFS snapshot failed: %v", err)
+			}
+		}
 		return true, nil
 	}
 	if len(e.bufferedEvents) > 0 {
@@ -2615,7 +2659,9 @@ func (e *Engine) pumpWork() (bool, error) {
 		e.bufferedEvents = e.bufferedEvents[1:]
 		return true, nil
 	}
-	// Failed downloads: retry once their backoff matures.
+	// Failed downloads/hydrations: retry once their backoff matures.
+	// Mirror downloads go to the visible root; placeholder mode hydrates
+	// into the backing cache (the just-hydrated file is eviction-safe).
 	now := time.Now()
 	downloading, err := e.db.NodesWithState(db.StateDownloading)
 	if err != nil {
@@ -2627,7 +2673,12 @@ func (e *Engine) pumpWork() (bool, error) {
 			continue
 		}
 		if e.store != nil {
-			// Placeholder-mode hydration seam (step 5 workstream).
+			e.hydrateOne(row.LocalPath)
+			e.maybeEvict(row.LocalPath)
+			if e.evictionRecheck {
+				e.evictionRecheck = false
+				e.maybeEvict("")
+			}
 		} else if err := e.downloadFile(row.NodeUID, row.LocalPath); err != nil {
 			return false, err
 		}

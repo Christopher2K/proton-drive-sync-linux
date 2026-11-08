@@ -32,6 +32,7 @@ import (
 	"pds.dev/engine-go/internal/guard"
 	"pds.dev/engine-go/internal/mode"
 	"pds.dev/engine-go/internal/sidecar"
+	storepkg "pds.dev/engine-go/internal/store"
 	"syscall"
 )
 
@@ -102,24 +103,32 @@ type ActivityItem struct {
 
 // Status is a point-in-time status snapshot.
 type Status struct {
-	State              EngineState
-	SyncedNodes        int
-	DirtyNodes         int
-	QueuedTombstones   int
-	ErroredNodes       int
-	ConflictedNodes    int
-	Mode               mode.SyncMode
+	State            EngineState
+	SyncedNodes      int
+	DirtyNodes       int
+	QueuedTombstones int
+	ErroredNodes     int
+	ConflictedNodes  int
+	Mode             mode.SyncMode
+	// CacheCap is the placeholder backing-cache cap (nil = unlimited).
+	CacheCap *uint64
+	// CacheUsed is the backing-cache usage in bytes (0 in mirror mode).
+	CacheUsed uint64
+	// CachePath is the backing-cache directory ("" in mirror mode).
+	CachePath          string
 	NeedsSignIn        bool
 	SidecarUnavailable bool
 }
 
 // Command is a control command (CLI socket / UI).
 type Command struct {
-	Kind string // "pause" | "resume" | "shutdown" | "status" | "set-eviction-cap"
+	Kind string // "pause" | "resume" | "shutdown" | "status" | "set-eviction-cap" | "pin" | "unpin" | "store"
 	Cap  *uint64
+	// Rel is the root-relative path for "pin"/"unpin".
+	Rel string
 	// StatusReply receives the status snapshot (Kind == "status").
 	StatusReply chan<- Status
-	// Reply receives an error (or nil) for set-eviction-cap.
+	// Reply receives an error (or nil) for set-eviction-cap/pin/unpin.
 	Reply chan<- error
 }
 
@@ -164,8 +173,11 @@ type Engine struct {
 	// cache cap (placeholder mode); nil disables eviction
 	evictionCap     *uint64
 	evictionRecheck bool
-	syncMode        mode.SyncMode
-	watchLocal      bool
+	// pendingPins queues pin commands awaiting their (synchronous)
+	// hydration; drained in the main loop before other store work.
+	pendingPins []pinRequest
+	syncMode    mode.SyncMode
+	watchLocal  bool
 
 	notifications <-chan sidecar.Notification
 	backlog       []sidecar.Notification
@@ -204,29 +216,32 @@ type devIno struct {
 	ino uint64
 }
 
-// StoreAPI is the seam to the placeholder VFS store (internal/store),
-// which lands in a parallel workstream. The mirror-mode engine runs with
-// a nil store; placeholder integration (step 5) plugs in here.
+// StoreAPI is the seam to the placeholder VFS store (internal/store).
+// The mirror-mode engine runs with a nil store; the placeholder engine
+// runs with a non-nil store (created in New when the caller passes nil).
+// Method signatures match *store.Store exactly so the concrete store
+// satisfies this interface.
 type StoreAPI interface {
-	NextHydrateRequest() string
-	NextMkdirRequest() string
-	NextWorkRequest() (kind string, old, new string)
-	FinishRename(old, new string, ok, permanent bool) bool
-	RecordWrite(rel string)
-	FinishWrite(rel string, ok bool)
-	Forget(rel string)
-	ForgetTree(rel string)
-	BackingPath(rel string) (string, bool)
+	NextHydrateRequest() (string, bool)
+	FinishHydrate(rel string, ok bool)
+	PublishSnapshot(byPath map[string]storepkg.VNode)
 	SetBacking(rel, abs string)
 	ClearBacking(rel string)
-	RenameInbound(rel string) bool
-	HydratedByAge() []struct {
-		Rel string
-		Age time.Time
-	}
+	HydratedByAge() []storepkg.HydratedAge
 	IsOpen(rel string) bool
 	IsUploading(rel string) bool
 	HydratingCount() int
+	NextMkdirRequest() (string, bool)
+	RequeueMkdir(rel string)
+	NextWorkRequest() (storepkg.WorkRequest, bool)
+	NextMetadataRequest() (rel string, mtime *int64, mode *uint32, ok bool)
+	FinishRename(oldRel, newRel string, ok, permanent bool) bool
+	RecordWrite(rel string)
+	FinishWrite(rel string, ok bool)
+	BackingPath(rel string) (string, bool)
+	Forget(rel string)
+	ForgetTree(rel string)
+	RenameInbound(rel string) bool
 }
 
 // Handle is a handle to a running engine.
@@ -314,7 +329,14 @@ func New(api sidecar.API, notifications <-chan sidecar.Notification, store Store
 	}
 	var st StoreAPI
 	if placeholders {
-		st = store
+		// Placeholder mode must run with a non-nil store: use the caller's
+		// store (its VFS serves snap-hydrated content from the same
+		// instance), or create one when the caller passed nil.
+		if store != nil {
+			st = store
+		} else {
+			st = storepkg.New()
+		}
 	}
 	cmdCh := make(chan Command, 64)
 	activityCh := make(chan ActivityItem, 256)
@@ -346,6 +368,15 @@ func New(api sidecar.API, notifications <-chan sidecar.Notification, store Store
 		log:                log.New(os.Stderr, "pds-engine: ", log.LstdFlags|log.Ltime|log.Lmsgprefix),
 	}
 	h := &Handle{cmdCh: cmdCh, activityCh: activityCh, watcherReady: &e.watcherReady}
+	// One-time local layout conversion, only with an external backing
+	// cache (desktop layout: the mount goes up after this, so the engine
+	// must see the real folder first). Idempotent via marker; failures
+	// log and continue (normal sync reconciles leftovers).
+	if cfg.BackingDir != "" {
+		if err := mode.ConvertLayout(d, cfg.Root, backingDir, syncMode); err != nil {
+			e.log.Printf("local layout conversion failed; continuing: %v", err)
+		}
+	}
 	return e, h, nil
 }
 
@@ -389,6 +420,20 @@ func (e *Engine) Run() error {
 		fsCh = ch
 	}
 	e.watcherReady.Store(true)
+	// 4b. Placeholder mode: publish the tree snapshot the VFS serves, then
+	// keep it fresh from the main loop (M3).
+	if e.store != nil {
+		if err := e.publishVfsSnapshot(); err != nil {
+			e.log.Printf("initial VFS snapshot failed: %v", err)
+		}
+	}
+	// 4c. Placeholder mode: forward store wake-ups to the command channel
+	// so hydrate/mkdir/write queues drain without polling.
+	if e.store != nil {
+		done := make(chan struct{})
+		defer close(done)
+		e.startStoreForwarder(done)
+	}
 	// 5. Main loop.
 	err := e.mainLoop(fsCh)
 	if e.scopeID != "" {
@@ -597,6 +642,25 @@ func (e *Engine) mainLoop(fsCh <-chan []fsEvent) error {
 			}
 			continue
 		}
+		// Placeholder mode: drain VFS queues (M3). Runs even while paused:
+		// hydration serves open() and write-through deletes must queue
+		// tombstones for the guard to see. Mirror mode has no store.
+		if e.store != nil {
+			worked, err := e.drainStoreWork()
+			if err != nil {
+				if e.needsSignIn || sidecar.IsConnectionLost(err) {
+					if !e.needsSignIn {
+						e.noteSidecarFailure(err.Error())
+					}
+					e.log.Printf("store work parked after a session/sidecar failure: %v", err)
+				} else {
+					return err
+				}
+			}
+			if worked {
+				continue
+			}
+		}
 		// F4: when running, pump queued work (tombstones → events → uploads).
 		if e.state == StateRunning {
 			worked, err := e.pumpWork()
@@ -731,6 +795,12 @@ func (e *Engine) handleCommand(cmd Command) error {
 		tombs, _ := e.db.Tombstones()
 		errored, _ := e.db.CountErrored()
 		conflicted, _ := e.db.CountRemoteConflicted()
+		var cacheUsed uint64
+		var cachePath string
+		if e.store != nil {
+			cacheUsed = dirSize(e.backingDir)
+			cachePath = e.backingDir
+		}
 		st := Status{
 			State:              e.state,
 			SyncedNodes:        synced,
@@ -739,6 +809,9 @@ func (e *Engine) handleCommand(cmd Command) error {
 			ErroredNodes:       errored,
 			ConflictedNodes:    conflicted,
 			Mode:               e.syncMode,
+			CacheCap:           e.evictionCap,
+			CacheUsed:          cacheUsed,
+			CachePath:          cachePath,
 			NeedsSignIn:        e.needsSignIn,
 			SidecarUnavailable: e.sidecarDown || e.notificationsClosed,
 		}
@@ -749,7 +822,11 @@ func (e *Engine) handleCommand(cmd Command) error {
 		e.evictionCap = cmd.Cap
 		if e.store != nil {
 			e.maybeEvict("")
-			// Re-check after in-flight hydrations land.
+			if e.store.HydratingCount() > 0 {
+				// The in-flight download was not part of this pass;
+				// re-check when it completes (TG-32).
+				e.evictionRecheck = true
+			}
 		}
 		capStr := "unlimited"
 		if cmd.Cap != nil {
@@ -759,6 +836,19 @@ func (e *Engine) handleCommand(cmd Command) error {
 		if cmd.Reply != nil {
 			cmd.Reply <- nil
 		}
+	case "pin":
+		// pin_file downloads, so it cannot run inline alongside the
+		// transfer pump: queue it and complete the reply when drained.
+		e.pendingPins = append(e.pendingPins, pinRequest{rel: cmd.Rel, reply: cmd.Reply, pin: true})
+	case "unpin":
+		err := e.unpinFile(cmd.Rel)
+		if cmd.Reply != nil {
+			cmd.Reply <- err
+		}
+	case "store":
+		// Store wake-up (see startStoreForwarder): no state change by
+		// itself; the main loop drains the store queues on the next
+		// iteration. Do not return an error (it would abort a transfer).
 	}
 	return nil
 }
