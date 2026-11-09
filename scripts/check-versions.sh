@@ -11,6 +11,8 @@
 #   sidecar/src/config.ts      APP_VERSION (x-pm-appversion: external-drive-
 #                              proton_drive_sync@<semver>-<channel>, Proton
 #                              compliance format — see AGENT.md hard rule 2)
+#   mygo-shell/mygo.json       "version" (shown in the desktop app)
+#   mygo-shell/version.go      fallback shown when MyGo metadata is unavailable
 #   nix/package.nix            version
 #   nix/sidecar.nix            version
 
@@ -40,6 +42,8 @@ esac
 [ "$appversion" = "$version-alpha" ] \
   || fail "APP_VERSION is '$appversion', want '$version-alpha' (bump the channel only when distribution changes)"
 
+check "mygo-shell/mygo.json version" mygo-shell/mygo.json '"version": "'"$version"'",'
+check "mygo-shell/version.go fallback" mygo-shell/version.go 'return "'"$version"'"'
 check "nix/package.nix version" nix/package.nix 'version = "'"$version"'";'
 check "nix/sidecar.nix version" nix/sidecar.nix 'version = "'"$version"'";'
 

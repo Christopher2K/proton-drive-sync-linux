@@ -9,8 +9,8 @@
 #   1. Verifies a clean tree on `main`, in sync with `origin/main`.
 #   2. Computes the next version and rewrites every version site
 #      (sidecar package.json — the source of truth — plus the Proton
-#      compliance APP_VERSION string in sidecar/src/config.ts, and the
-#      Nix derivations).
+#      compliance APP_VERSION string in sidecar/src/config.ts, the MyGo
+#      shell version and fallback, and the Nix derivations).
 #   3. Regenerates CHANGELOG.md with git-cliff from conventional commits.
 #   4. Commits `chore(release: vX.Y.Z)` on `release/vX.Y.Z`, pushes the branch
 #      and opens the PR (squash-merge it like any other change).
@@ -76,11 +76,15 @@ rewrite sidecar/package.json "s/\"version\": \"$version\"/\"version\": \"$next\"
 rewrite sidecar/src/config.ts \
   "s|external-drive-proton_drive_sync@$version-alpha|external-drive-proton_drive_sync@$next-alpha|"
 
-# 3. Nix derivations.
+# 3. MyGo shell metadata and the fallback shown when metadata is unavailable.
+rewrite mygo-shell/mygo.json "s/\"version\": \"$version\"/\"version\": \"$next\"/"
+rewrite mygo-shell/version.go "s/return \"$version\"/return \"$next\"/"
+
+# 4. Nix derivations.
 rewrite nix/package.nix "s/^  version = \"$version\"/  version = \"$next\"/"
 rewrite nix/sidecar.nix "s/^  version = \"$version\"/  version = \"$next\"/"
 
-# 4. Verify nothing drifted, then generate the changelog. The release commit
+# 5. Verify nothing drifted, then generate the changelog. The release commit
 #    is not tagged yet, so label the unreleased section with the new tag.
 #    --prepend (not -o) is required: `-o` truncates the file and `--unreleased`
 #    only renders commits since the last tag, so every earlier release section
@@ -99,6 +103,7 @@ fi
 # --- commit on a release branch ----------------------------------------------
 git switch -c "$release_branch"
 git add sidecar/package.json sidecar/src/config.ts \
+  mygo-shell/mygo.json mygo-shell/version.go \
   nix/package.nix nix/sidecar.nix CHANGELOG.md
 git commit -m "chore(release: v$next): bump version and changelog" --quiet
 
