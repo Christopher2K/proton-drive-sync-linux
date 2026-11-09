@@ -242,7 +242,7 @@ func decodeInto(raw json.RawMessage, v any) *Error {
 
 // LoginFork runs auth.loginFork and returns the email.
 func (c *SidecarClient) LoginFork(ctx context.Context) (string, error) {
-	raw, err := c.rpc.Call("auth.loginFork", map[string]any{})
+	raw, err := c.rpc.CallContext(ctx, "auth.loginFork", map[string]any{})
 	if err != nil {
 		return "", err
 	}
@@ -259,7 +259,7 @@ func (c *SidecarClient) LoginFork(ctx context.Context) (string, error) {
 
 // AuthStatus runs auth.status.
 func (c *SidecarClient) AuthStatus(ctx context.Context) (AuthStatus, error) {
-	raw, err := c.rpc.Call("auth.status", map[string]any{})
+	raw, err := c.rpc.CallContext(ctx, "auth.status", map[string]any{})
 	if err != nil {
 		return AuthStatus{}, err
 	}
@@ -275,7 +275,7 @@ func (c *SidecarClient) AuthStatus(ctx context.Context) (AuthStatus, error) {
 
 // Logout runs auth.logout.
 func (c *SidecarClient) Logout(ctx context.Context) error {
-	_, err := c.rpc.Call("auth.logout", map[string]any{})
+	_, err := c.rpc.CallContext(ctx, "auth.logout", map[string]any{})
 	return err
 }
 

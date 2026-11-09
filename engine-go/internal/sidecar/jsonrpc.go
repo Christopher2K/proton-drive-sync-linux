@@ -2,6 +2,7 @@ package sidecar
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -239,6 +240,13 @@ func (c *JsonRpcClient) Notifications() <-chan Notification { return c.shared.no
 
 // Call sends a request and awaits the correlated response.
 func (c *JsonRpcClient) Call(method string, params any) (json.RawMessage, error) {
+	return c.CallContext(context.Background(), method, params)
+}
+
+// CallContext sends a request and awaits its response or ctx cancellation.
+// Cancelling stops the local wait and forgets the correlation ID; the peer may
+// still complete the operation, but its late response is ignored safely.
+func (c *JsonRpcClient) CallContext(ctx context.Context, method string, params any) (json.RawMessage, error) {
 	c.shared.mu.Lock()
 	// The read loop is gone: nobody will ever answer this request.
 	// Registering it after the EOF drain would hang forever.
@@ -252,28 +260,43 @@ func (c *JsonRpcClient) Call(method string, params any) (json.RawMessage, error)
 	c.shared.pending[id] = ch
 	c.shared.mu.Unlock()
 
+	forget := func() {
+		c.shared.mu.Lock()
+		if c.shared.pending[id] == ch {
+			delete(c.shared.pending, id)
+		}
+		c.shared.mu.Unlock()
+	}
+
 	line, err := encodeRequest(id, method, params)
 	if err != nil {
-		c.shared.mu.Lock()
-		delete(c.shared.pending, id)
-		c.shared.mu.Unlock()
+		forget()
 		return nil, malformed("%v", err)
 	}
 
 	select {
 	case c.writeCh <- line:
 	case <-c.writeDone:
+		forget()
 		return nil, ErrClosed
+	case <-ctx.Done():
+		forget()
+		return nil, ctx.Err()
 	}
 
-	res, ok := <-ch
-	if !ok {
-		return nil, ErrClosed
+	select {
+	case res, ok := <-ch:
+		if !ok {
+			return nil, ErrClosed
+		}
+		if res.err != nil {
+			return nil, &Error{Kind: ErrKindRpc, RPC: res.err}
+		}
+		return res.result, nil
+	case <-ctx.Done():
+		forget()
+		return nil, ctx.Err()
 	}
-	if res.err != nil {
-		return nil, &Error{Kind: ErrKindRpc, RPC: res.err}
-	}
-	return res.result, nil
 }
 
 func (c *JsonRpcClient) writeLoop(w io.WriteCloser) {

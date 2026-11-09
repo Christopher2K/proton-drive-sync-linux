@@ -10,8 +10,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"time"
-
-	"github.com/egoist/mygo"
 )
 
 // Engine lifecycle: process supervision, command socket, update stream.
@@ -311,6 +309,8 @@ func (a *app) readUpdates(conn net.Conn) {
 }
 
 func (a *app) applyUpdate(up engineUpdate) {
+	var loginURL string
+
 	a.mu.Lock()
 
 	switch up.Update {
@@ -323,9 +323,7 @@ func (a *app) applyUpdate(up engineUpdate) {
 		a.login = loginState{kind: "waiting"}
 	case "LoginUrl":
 		a.login = loginState{kind: "url", url: up.URL, userCode: up.UserCode}
-		if err := mygo.Shell.OpenExternal(up.URL); err != nil {
-			log.Printf("open external failed: %v", err)
-		}
+		loginURL = up.URL
 	case "LoginFailed":
 		a.login = loginState{kind: "failed", err: up.Error}
 	case "EngineStarted":
@@ -405,6 +403,11 @@ func (a *app) applyUpdate(up engineUpdate) {
 		tooltip = fmt.Sprintf("%s — %s", appTitle, a.badge())
 	}
 	a.mu.Unlock()
+	if loginURL != "" {
+		if err := openURL(loginURL); err != nil {
+			log.Printf("open sign-in page failed: %v", err)
+		}
+	}
 	if a.tray != nil {
 		a.tray.SetToolTip(tooltip)
 	}
