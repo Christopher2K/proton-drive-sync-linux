@@ -53,6 +53,8 @@ devenv shell                                      # same env as CI (devenv.nix/l
 
 Note: the MyGo shell module needs Go ≥ 1.27.3 (its `go.mod` declares it, via the `mygo` dependency), while devenv ships Go 1.26.10 — so `go build/test` in `mygo-shell/` currently pulls the 1.27.3 toolchain via GOTOOLCHAIN (needs network on first run). engine-go declares go 1.26.0 and builds with the local toolchain (`GOTOOLCHAIN=local`). Bump `devenv.nix` to `go_1_27` (1.27.3 is in the pinned nixpkgs) to drop the download entirely.
 
+The MyGo shell dlopens `libglib-2.0.so.0` directly, so `glib` must be listed explicitly in the Nix package's `runtimeLibs` and in the development environments. GTK's transitive dependency on GLib does not put it on `LD_LIBRARY_PATH`; omitting it makes the installed app exit before creating a window.
+
 `devenv test` runs the Go engine tests + sidecar typecheck/tests in the pinned environment; install Nix/devenv in the VM once, then it matches
 CI exactly. (MyGo shell tests are run separately, as above — the shell is not part of `devenv test`.)
 

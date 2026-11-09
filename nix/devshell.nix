@@ -22,6 +22,7 @@ pkgs.mkShell {
       pkgs.fontconfig
       pkgs.freetype
       pkgs.fuse3
+      pkgs.glib
       pkgs.gtk3
       pkgs.libx11
       pkgs.libxcb

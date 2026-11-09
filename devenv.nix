@@ -16,6 +16,7 @@ let
     fontconfig
     freetype
     fuse3
+    glib
     gtk3
     libx11
     libxcb
