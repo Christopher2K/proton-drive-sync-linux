@@ -161,5 +161,6 @@ proton-drive-sync/
   (tarball + deb + rpm); tags pushed by CI do not fire `push: tags`, hence the
   explicit dispatch. `scripts/check-versions.sh` runs in CI to catch drift.
   `actionlint` + `shellcheck` are in the devenv — run them after touching
-  workflows or release scripts.
+  workflows or release scripts. Release smoke checks must test each binary with
+  its own `test -x`; passing both paths to one `test -x` is invalid.
 - When a milestone is completed, check it off above and note any spec deviations in `SPEC.md` §9.

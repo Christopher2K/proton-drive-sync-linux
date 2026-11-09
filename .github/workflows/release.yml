@@ -83,7 +83,7 @@ jobs:
           # must answer --help (Go exits 0 for -help). The UI binary is
           # not run (it opens a window); version consistency is enforced
           # separately by scripts/check-versions.sh.
-          test -x build/proton-drive-sync build/pds-engine-go
+          test -x build/proton-drive-sync && test -x build/pds-engine-go
           build/pds-engine-go --help >/dev/null
           echo "smoke ok: $(file build/proton-drive-sync build/pds-engine-go)"
 
