@@ -59,7 +59,9 @@ overrides:
     depends:
       - nodejs (>= 20)
       - npm
+      - libayatana-appindicator3-1
   rpm:
     depends:
       - nodejs >= 20
       - npm
+      - libayatana-appindicator-gtk3

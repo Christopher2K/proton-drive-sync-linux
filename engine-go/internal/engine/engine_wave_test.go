@@ -385,7 +385,8 @@ func TestConflictCopiesFromSkewedClocksAllSurvive(t *testing.T) {
 	fx.handle.Resume()
 
 	waitFor(t, func() bool {
-		if string(fx.read("hello.txt")) != "remote one" {
+		content, err := os.ReadFile(filepath.Join(fx.root, "hello.txt"))
+		if err != nil || string(content) != "remote one" {
 			return false
 		}
 		entries, err := os.ReadDir(fx.root)
@@ -507,7 +508,8 @@ func TestErroredNodeRecoversOnNextRemoteEvent(t *testing.T) {
 	// The remote side moves on; its event reconciles the errored node.
 	fx.mock.RemoteUpdateFile("node-hello", []byte("remote fix"))
 	waitFor(t, func() bool {
-		if string(fx.read("hello.txt")) != "remote fix" {
+		content, err := os.ReadFile(filepath.Join(fx.root, "hello.txt"))
+		if err != nil || string(content) != "remote fix" {
 			return false
 		}
 		name, ok := conflictEntry(fx.root, "hello")
