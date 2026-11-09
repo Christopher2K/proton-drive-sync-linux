@@ -2,9 +2,9 @@ package main
 
 import (
 	"fmt"
+	"log"
 	"strconv"
 
-	"github.com/egoist/mygo"
 	"github.com/egoist/mygo/ui"
 )
 
@@ -131,7 +131,9 @@ func (a *app) renderLogin(c *ui.Context) {
 					ui.Text(c, login.url).FontSize(t.FontSize * 0.85).TextColor(faint).SingleLine()
 					ui.Row(c).Gap(t.Space(3)).AlignItems(ui.Center).Children(func() {
 						if ui.Button(c, "Open sign-in page again").Background(t.SurfaceHover).TextColor(t.Text).Clicked() {
-							_ = mygo.Shell.OpenExternal(login.url)
+							if err := openURL(login.url); err != nil {
+								log.Printf("open sign-in page failed: %v", err)
+							}
 						}
 						statusDot(c, "Waiting for sign-in…", accent)
 					})

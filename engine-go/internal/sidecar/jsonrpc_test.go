@@ -444,6 +444,48 @@ func TestClosedConnectionFailsCalls(t *testing.T) {
 	}
 }
 
+func TestCallContextCancellationForgetsPendingRequest(t *testing.T) {
+	clientConn, serverConn := net.Pipe()
+	rpc, _ := NewJsonRpcClient(clientConn, clientConn)
+	defer rpc.Close()
+	defer serverConn.Close()
+
+	requestRead := make(chan struct{})
+	go func() {
+		var request map[string]any
+		if err := json.NewDecoder(serverConn).Decode(&request); err == nil {
+			close(requestRead)
+		}
+	}()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		_, err := rpc.CallContext(ctx, "auth.logout", map[string]any{})
+		done <- err
+	}()
+	select {
+	case <-requestRead:
+	case <-time.After(2 * time.Second):
+		t.Fatal("server never received request")
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if err != context.Canceled {
+			t.Fatalf("CallContext error = %v, want context.Canceled", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("CallContext ignored cancellation")
+	}
+	rpc.shared.mu.Lock()
+	pending := len(rpc.shared.pending)
+	rpc.shared.mu.Unlock()
+	if pending != 0 {
+		t.Fatalf("pending requests after cancellation = %d, want 0", pending)
+	}
+}
+
 // --- framing unit tests (new, Go-specific: the pure decode helpers) ---
 
 func TestEncodeRequestFraming(t *testing.T) {

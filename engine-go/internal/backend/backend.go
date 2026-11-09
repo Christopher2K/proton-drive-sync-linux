@@ -83,6 +83,13 @@ type Backend struct {
 	startOnce sync.Once
 	done      chan struct{}
 	doneOnce  sync.Once
+
+	loginResults     chan string
+	ctx              context.Context
+	cancel           context.CancelFunc
+	authWaiting      bool // guarded by mu
+	loginRunning     bool // guarded by mu
+	signOutRequested bool // guarded by mu
 }
 
 // New creates the backend. api is the sidecar connection (SidecarClient or
@@ -93,14 +100,18 @@ func New(cfg Config, api sidecar.API, closeAPI func(), updates func(protocol.Upd
 	if cfg.Hooks != nil {
 		hooks = *cfg.Hooks
 	}
+	ctx, cancel := context.WithCancel(context.Background())
 	return &Backend{
-		cfg:      cfg,
-		api:      api,
-		closeAPI: closeAPI,
-		log:      log.New(os.Stderr, "pds-engine-go: ", log.LstdFlags|log.Ltime),
-		updating: updates,
-		hooks:    hooks,
-		done:     make(chan struct{}),
+		cfg:          cfg,
+		api:          api,
+		closeAPI:     closeAPI,
+		log:          log.New(os.Stderr, "pds-engine-go: ", log.LstdFlags|log.Ltime),
+		updating:     updates,
+		hooks:        hooks,
+		done:         make(chan struct{}),
+		loginResults: make(chan string, 1),
+		ctx:          ctx,
+		cancel:       cancel,
 	}
 }
 
@@ -115,20 +126,113 @@ func (b *Backend) closeDone() {
 
 func (b *Backend) runLoop() {
 	defer b.closeDone()
+	defer func() {
+		if b.closeAPI != nil {
+			b.closeAPI()
+		}
+	}()
 	for {
-		switch b.runSession() {
-		case exitModeSwitch, exitSignOut:
-			// Restart into the new mode (or still-logged-out state).
-			// The sidecar channel is reused: the previous engine
-			// stopped consuming it (EventsStop) and the next engine
-			// resumes from the persisted cursor.
+		if b.takeSignOutRequest() {
+			b.logout()
 			continue
-		default:
-			if b.closeAPI != nil {
-				b.closeAPI()
-			}
+		}
+		if !b.authenticate() || b.ctx.Err() != nil {
 			return
 		}
+		// SignOut can arrive while auth.status is in flight, before an
+		// engine handle exists. Honor it before starting a new session.
+		if b.takeSignOutRequest() {
+			b.logout()
+			continue
+		}
+		switch b.runSession() {
+		case exitModeSwitch:
+			// The previous engine stopped consuming the sidecar channel;
+			// the next engine resumes from the persisted cursor.
+			continue
+		case exitSignOut:
+			b.logout()
+		default:
+			return
+		}
+	}
+}
+
+func (b *Backend) takeSignOutRequest() bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	requested := b.signOutRequested
+	b.signOutRequested = false
+	return requested
+}
+
+// logout runs only between engine sessions. This ordering prevents a new
+// engine from restoring the old account while auth.logout is still in flight.
+func (b *Backend) logout() {
+	b.takeSignOutRequest() // coalesce duplicate SignOut commands
+	ctx, cancel := context.WithTimeout(b.ctx, 30*time.Second)
+	err := b.api.Logout(ctx)
+	cancel()
+	if err != nil {
+		// The sidecar clears its in-memory session even when server-side
+		// logout fails, so it is safe to return to the login screen.
+		b.log.Printf("sign out: %v", err)
+	}
+	b.updating(protocol.Update{Update: protocol.UpdSignedOut})
+}
+
+// authenticate gates every engine session on a saved or newly completed
+// login. While logged out no engine exists, so StartLogin exclusively owns
+// the sidecar notification stream and can forward auth.signInUrl immediately.
+func (b *Backend) authenticate() bool {
+	if b.ctx.Err() != nil {
+		return false
+	}
+
+	ctx, cancel := context.WithTimeout(b.ctx, 10*time.Second)
+	st, err := b.api.AuthStatus(ctx)
+	cancel()
+	if err != nil {
+		if b.ctx.Err() != nil {
+			return false
+		}
+		b.log.Printf("auth.status: %v", err)
+		b.updating(protocol.Update{Update: protocol.UpdFailed, Error: fmt.Sprintf("auth.status: %v", err)})
+		return false
+	}
+	if b.ctx.Err() != nil {
+		return false
+	}
+	if st.LoggedIn {
+		email := "unknown account"
+		if st.Email != nil && *st.Email != "" {
+			email = *st.Email
+		}
+		b.updating(protocol.Update{Update: protocol.UpdAuthOk, Email: email})
+		return true
+	}
+
+	b.mu.Lock()
+	b.authWaiting = true
+	b.mu.Unlock()
+	defer func() {
+		b.mu.Lock()
+		b.authWaiting = false
+		b.mu.Unlock()
+	}()
+	b.updating(protocol.Update{Update: protocol.UpdAuthRequired})
+	select {
+	case email := <-b.loginResults:
+		if b.ctx.Err() != nil {
+			return false
+		}
+		if email == "" {
+			email = "unknown account"
+		}
+		b.updating(protocol.Update{Update: protocol.UpdAuthOk, Email: email})
+		return true
+	case <-b.ctx.Done():
+		return false
 	}
 }
 
@@ -136,6 +240,9 @@ func (b *Backend) runLoop() {
 // construct + run the engine, mount after the watcher, then unmount.
 // It returns the exit reason the session loop should act on.
 func (b *Backend) runSession() loopExit {
+	if b.ctx.Err() != nil {
+		return exitQuit
+	}
 	layout, err := mode.ResolveSessionLayout(b.cfg.Root)
 	if err != nil {
 		b.log.Printf("layout: %v", err)
@@ -210,7 +317,18 @@ func (b *Backend) runSession() loopExit {
 	b.store = st
 	b.dbPath = layout.DBPath
 	b.exitReason = exitNone
+	if b.signOutRequested {
+		b.signOutRequested = false
+		b.exitReason = exitSignOut
+	}
+	stop := b.exitReason == exitSignOut
 	b.mu.Unlock()
+	// Shutdown/SignOut may have arrived after authenticate returned but
+	// before the handle was published. Do not leave that race running a
+	// new engine.
+	if stop || b.ctx.Err() != nil {
+		handle.Shutdown()
+	}
 
 	engineErr := make(chan error, 1)
 	go func() { engineErr <- eng.Run() }()
@@ -309,15 +427,26 @@ func (b *Backend) pumpActivity(handle *engine.Handle, done <-chan struct{}) {
 	}
 }
 
-func (b *Backend) pumpStatus(handle *engine.Handle, done <-chan struct{}) {
-	ticker := time.NewTicker(2 * time.Second)
+type statusHandle interface {
+	Status() (engine.Status, error)
+}
+
+func (b *Backend) pumpStatus(handle statusHandle, done <-chan struct{}) {
+	b.pumpStatusEvery(handle, done, 2*time.Second)
+}
+
+func (b *Backend) pumpStatusEvery(handle statusHandle, done <-chan struct{}, interval time.Duration) {
+	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for {
 		select {
 		case <-ticker.C:
 			st, err := handle.Status()
 			if err != nil {
-				return
+				// Initial sync and large transfers can occupy the engine loop
+				// longer than Status's timeout. Keep polling: a busy engine is
+				// still running and later snapshots must reach the UI.
+				continue
 			}
 			b.updating(protocol.Update{
 				Update:             protocol.UpdStatus,
@@ -360,49 +489,91 @@ func (b *Backend) currentHandle() (*engine.Handle, error) {
 	return b.handle, nil
 }
 
-// StartLogin begins the fork-login flow.
+// StartLogin begins the fork-login flow. The RPC resolves only after the
+// browser flow completes; auth.signInUrl arrives separately and must be
+// forwarded while that RPC is still pending.
 func (b *Backend) StartLogin(ctx context.Context, updates chan<- protocol.Update) {
-	updates <- protocol.Update{Update: protocol.UpdLoginStarted}
-	url, err := b.api.LoginFork(ctx)
-	if err != nil {
-		updates <- protocol.Update{Update: protocol.UpdLoginFailed, Error: err.Error()}
+	b.mu.Lock()
+	if !b.authWaiting || b.loginRunning {
+		b.mu.Unlock()
 		return
 	}
-	updates <- protocol.Update{Update: protocol.UpdLoginUrl, URL: url}
-	// Completion arrives as an auth.signInUrl notification consumed by the
-	// engine; poll auth status until it flips.
+	b.loginRunning = true
+	b.mu.Unlock()
+	defer func() {
+		b.mu.Lock()
+		b.loginRunning = false
+		b.mu.Unlock()
+	}()
+
+	updates <- protocol.Update{Update: protocol.UpdLoginStarted}
+	type loginResult struct {
+		email string
+		err   error
+	}
+	result := make(chan loginResult, 1)
 	go func() {
-		deadline := time.Now().Add(5 * time.Minute)
-		for time.Now().Before(deadline) {
-			sctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-			st, err := b.api.AuthStatus(sctx)
-			cancel()
-			if err == nil && st.LoggedIn {
-				updates <- protocol.Update{Update: protocol.UpdAuthOk}
+		email, err := b.api.LoginFork(ctx)
+		result <- loginResult{email: email, err: err}
+	}()
+
+	notifications := b.notifications()
+	for {
+		select {
+		case res := <-result:
+			if res.err != nil {
+				updates <- protocol.Update{Update: protocol.UpdLoginFailed, Error: res.err.Error()}
 				return
 			}
-			time.Sleep(1 * time.Second)
+			// Close the login window before waking runSession. A second
+			// StartLogin must never overlap the new engine and compete for
+			// its single notification stream.
+			b.mu.Lock()
+			if !b.authWaiting {
+				b.mu.Unlock()
+				return
+			}
+			b.authWaiting = false
+			b.mu.Unlock()
+			select {
+			case b.loginResults <- res.email:
+			case <-b.ctx.Done():
+			}
+			return
+		case n, ok := <-notifications:
+			if !ok {
+				updates <- protocol.Update{Update: protocol.UpdLoginFailed, Error: "sidecar connection lost during sign-in"}
+				return
+			}
+			if signIn, ok := n.(*sidecar.AuthSignInUrlNotification); ok {
+				updates <- protocol.Update{
+					Update:   protocol.UpdLoginUrl,
+					URL:      signIn.URL,
+					UserCode: signIn.UserCode,
+				}
+			}
+		case <-b.ctx.Done():
+			return
 		}
-	}()
+	}
 }
 
-// SignOut stops the engine (unmounting via the session loop), logs out,
-// and reports SignedOut. The session loop restarts into the (now logged-
-// out) state, so the socket stays alive for the next StartLogin.
-func (b *Backend) SignOut(ctx context.Context) error {
+// SignOut stops the engine. runLoop performs Logout after the session has
+// fully stopped, then reports SignedOut and waits for the next StartLogin.
+func (b *Backend) SignOut(_ context.Context) error {
 	b.mu.Lock()
 	h := b.handle
-	if h != nil && b.exitReason == exitNone {
+	if h == nil {
+		// Mode switches and auth checks have a handle-less interval. Queue
+		// the request so runLoop performs it at the next safe boundary.
+		b.signOutRequested = true
+	} else if b.exitReason == exitNone {
 		b.exitReason = exitSignOut
 	}
 	b.mu.Unlock()
 	if h != nil {
 		h.Shutdown()
 	}
-	if err := b.api.Logout(ctx); err != nil {
-		return err
-	}
-	b.updating(protocol.Update{Update: protocol.UpdSignedOut})
 	return nil
 }
 
@@ -477,6 +648,7 @@ func (b *Backend) SetMode(m string) error {
 }
 
 func (b *Backend) Shutdown() {
+	b.cancel()
 	b.mu.Lock()
 	h := b.handle
 	if h != nil && b.exitReason == exitNone {
@@ -485,10 +657,7 @@ func (b *Backend) Shutdown() {
 	b.mu.Unlock()
 	if h != nil {
 		h.Shutdown()
-		return
 	}
-	// Not started (or between sessions): close done so the session can exit.
-	b.closeDone()
 }
 
 func (b *Backend) Done() <-chan struct{} { return b.done }

@@ -57,6 +57,12 @@ func (a *app) openSyncFolder() {
 	}
 }
 
+// openURL uses the desktop's URL handler without involving MyGo's main-thread
+// callback, so it works from both engine updates and UI button handlers.
+func openURL(url string) error {
+	return spawnDetached("xdg-open", url)
+}
+
 // openFolder opens a directory in the user's file manager, mirroring the
 // Rust app's platform::open_folder (crates/app/src/platform.rs).
 //
