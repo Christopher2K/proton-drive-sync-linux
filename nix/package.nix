@@ -12,6 +12,7 @@
   dbus,
   fontconfig,
   freetype,
+  glib,
   gtk3,
   libx11,
   libxcb,
@@ -66,6 +67,7 @@ let
     dbus
     fontconfig
     freetype
+    glib
     gtk3
     libx11
     libxcb
