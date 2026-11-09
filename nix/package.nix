@@ -27,7 +27,7 @@
 }:
 
 let
-  # Single product version (mirrored to sidecar/package.json,
+  # Single product version (mirrored to sidecar/package.json, the MyGo shell,
   # nix/sidecar.nix and the sidecar APP_VERSION by scripts/release.sh;
   # scripts/check-versions.sh enforces it).
   version = "0.6.2";
