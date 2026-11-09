@@ -1,6 +1,6 @@
 {
   "name": "proton-drive-sync",
   "identifier": "com.example.protondrivesync",
-  "version": "0.6.2",
+  "version": "0.6.3",
   "out": "build"
 }
