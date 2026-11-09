@@ -24,6 +24,7 @@ pkgs.mkShell {
       pkgs.fuse3
       pkgs.glib
       pkgs.gtk3
+      pkgs.libayatana-appindicator
       pkgs.libx11
       pkgs.libxcb
       pkgs.libXcursor

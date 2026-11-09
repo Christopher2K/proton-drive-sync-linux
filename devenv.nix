@@ -18,6 +18,7 @@ let
     fuse3
     glib
     gtk3
+    libayatana-appindicator
     libx11
     libxcb
     libXcursor

@@ -14,6 +14,7 @@
   freetype,
   glib,
   gtk3,
+  libayatana-appindicator,
   libx11,
   libxcb,
   libXcursor,
@@ -69,6 +70,7 @@ let
     freetype
     glib
     gtk3
+    libayatana-appindicator
     libx11
     libxcb
     libXcursor
