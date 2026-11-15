@@ -382,7 +382,13 @@ func TestLocalFolderRenameAndMoveFullCyclePreservesUIDs(t *testing.T) {
 		old, _ := fx.db.NodeByPath("Renamed")
 		return row != nil && frow != nil && old == nil
 	})
-	waitFor(t, func() bool { return contains(fx.mock.ChildNames(archiveUID), "Renamed") })
+	waitFor(t, func() bool {
+		// The remote move completes before the local row's parent is updated.
+		// Wait for both sides instead of reading the row in between.
+		frow, _ := fx.db.NodeByPath("Archive/Renamed")
+		return contains(fx.mock.ChildNames(archiveUID), "Renamed") &&
+			frow != nil && frow.ParentUID != nil && *frow.ParentUID == archiveUID
+	})
 	frow, _ := fx.db.NodeByPath("Archive/Renamed")
 	if frow == nil || frow.ParentUID == nil || *frow.ParentUID != archiveUID {
 		t.Fatalf("Archive/Renamed parent = %+v", frow)
