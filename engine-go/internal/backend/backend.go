@@ -411,14 +411,47 @@ func (b *Backend) currentExit() loopExit {
 	return b.exitReason
 }
 
+// shellActivityKind maps the engine's kebab-case ActivityKind values onto
+// the PascalCase kind vocabulary the shell's filters, labels, and colors
+// match against (mygo-shell state.go / theme.go). Unknown kinds pass
+// through unchanged.
+func shellActivityKind(k engine.ActivityKind) string {
+	switch k {
+	case engine.ActivityUploaded:
+		return "Uploaded"
+	case engine.ActivityDownloaded:
+		return "Downloaded"
+	case engine.ActivityTrashed:
+		return "Trashed"
+	case engine.ActivityConflict:
+		return "Conflict"
+	case engine.ActivityGuardPaused:
+		return "GuardPaused"
+	case engine.ActivityUploadErrored:
+		return "UploadErrored"
+	case engine.ActivityDownloadErrored:
+		return "DownloadErrored"
+	case engine.ActivitySignInRequired:
+		return "SignInRequired"
+	case engine.ActivityConnectionError:
+		return "ConnectionError"
+	case engine.ActivitySidecarUnavailable:
+		return "SidecarUnavailable"
+	case engine.ActivitySkipped:
+		return "Skipped"
+	}
+	return string(k)
+}
+
 func (b *Backend) pumpActivity(handle *engine.Handle, done <-chan struct{}) {
 	for {
 		select {
 		case item := <-handle.Activity():
 			b.updating(protocol.Update{
 				Update: protocol.UpdActivity,
+				Kind:   shellActivityKind(item.Kind),
 				Path:   item.Path,
-				Detail: fmt.Sprintf("%s: %s", item.Kind, item.Detail),
+				Detail: item.Detail,
 				AtUnix: item.AtUnix,
 			})
 		case <-done:
