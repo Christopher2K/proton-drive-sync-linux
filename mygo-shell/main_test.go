@@ -3,6 +3,7 @@ package main
 import (
 	"testing"
 
+	"github.com/egoist/mygo"
 	"github.com/egoist/mygo/ui"
 )
 
@@ -20,5 +21,21 @@ func TestView(t *testing.T) {
 		if !tt.HasText(label) {
 			t.Errorf("view missing text %q; texts = %q", label, tt.Texts())
 		}
+	}
+}
+
+func TestWindowCloseHidesUnlessQuitting(t *testing.T) {
+	a := newApp()
+	e := &mygo.CloseEvent{}
+	a.handleWindowClose(e)
+	if !e.DefaultPrevented() {
+		t.Fatal("ordinary window close must be prevented so the app hides to the tray")
+	}
+
+	a.quitting = true
+	e = &mygo.CloseEvent{}
+	a.handleWindowClose(e)
+	if e.DefaultPrevented() {
+		t.Fatal("window close during application quit must not be prevented")
 	}
 }

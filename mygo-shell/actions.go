@@ -254,3 +254,14 @@ func (a *app) hideWindow() {
 		a.win.Hide()
 	}
 }
+
+func (a *app) handleWindowClose(e *mygo.CloseEvent) {
+	a.mu.Lock()
+	quitting := a.quitting
+	a.mu.Unlock()
+	if quitting {
+		return
+	}
+	e.PreventDefault()
+	a.hideWindow()
+}
