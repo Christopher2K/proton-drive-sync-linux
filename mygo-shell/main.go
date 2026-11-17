@@ -60,10 +60,7 @@ func main() {
 		})
 		a.win = win
 
-		win.OnClose(func(e *mygo.CloseEvent) {
-			e.PreventDefault()
-			a.hideWindow()
-		})
+		win.OnClose(a.handleWindowClose)
 
 		tray, err := mygo.NewTray(mygo.TrayOptions{
 			Icon:    iconBytes,
