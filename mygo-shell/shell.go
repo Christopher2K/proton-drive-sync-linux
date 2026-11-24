@@ -61,6 +61,11 @@ func (a *app) renderFailure(c *ui.Context) {
 	t := c.Theme()
 	a.mu.Lock()
 	fatal := a.fatal
+	retryPending := a.engineRetryPending
+	retryAttempt := a.engineRetryAttempt
+	retryIn := a.engineRetryIn
+	retrying := a.engineRunning && retryAttempt > 0
+	retriesExhausted := a.engineRetriesExhausted
 	a.mu.Unlock()
 	if fatal == "" {
 		fatal = "The sync engine stopped unexpectedly."
@@ -77,6 +82,13 @@ func (a *app) renderFailure(c *ui.Context) {
 				ui.Box(c).Background(inset).Padding(t.Space(3)).Radius(t.Radius).Children(func() {
 					ui.Text(c, fatal).FontSize(t.FontSize).TextColor(t.TextMuted)
 				})
+				if retryPending {
+					ui.Text(c, fmt.Sprintf("Retrying automatically in %s (attempt %d of %d)…", retryIn, retryAttempt, engineMaxAutoRestarts)).FontSize(t.FontSize * 0.85).TextColor(t.TextMuted)
+				} else if retrying {
+					ui.Text(c, fmt.Sprintf("Retrying now (attempt %d of %d)…", retryAttempt, engineMaxAutoRestarts)).FontSize(t.FontSize * 0.85).TextColor(t.TextMuted)
+				} else if retriesExhausted {
+					ui.Text(c, fmt.Sprintf("Automatic retries exhausted after %d attempts. Use Try again to restart manually.", engineMaxAutoRestarts)).FontSize(t.FontSize * 0.85).TextColor(t.TextMuted)
+				}
 				ui.Row(c).Gap(t.Space(3)).AlignItems(ui.Center).Children(func() {
 					if ui.PrimaryButton(c, "Try again").AlignSelf(ui.Start).Clicked() {
 						go a.startEngine()

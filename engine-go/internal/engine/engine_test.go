@@ -701,18 +701,15 @@ func TestCrashedUploadRecoversOnRestart(t *testing.T) {
 		if err := os.WriteFile(filepath.Join(root, "post-crash.txt"), []byte("x"), 0o644); err != nil {
 			t.Fatal(err)
 		}
-		// The crash kills the stream; the engine stays alive in a visible
-		// degraded state (no respawn) until commanded to stop.
-		waitFor(t, func() bool {
-			st, err := h.Status()
-			return err == nil && st.SidecarUnavailable
-		})
-		h.Shutdown()
+		// A dead JSON-RPC stream terminates this session so the outer
+		// supervisor can restart it from the persisted dirty state.
 		select {
 		case err := <-done:
-			_ = err
+			if err == nil {
+				t.Fatal("sidecar crash must return a terminal session error")
+			}
 		case <-time.After(30 * time.Second):
-			t.Fatal("engine did not stop after crash + shutdown")
+			t.Fatal("engine did not stop after sidecar crash")
 		}
 		client.Close()
 	}()

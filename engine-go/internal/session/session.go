@@ -61,6 +61,9 @@ type Session struct {
 
 	updates chan protocol.Update
 	joined  chan struct{} // closed when broadcast loop exits
+	// lastFailure is replayed to a client that connects after an early
+	// backend failure (for example, stale-mount preflight) but before exit.
+	lastFailure *protocol.Update
 
 	log *log.Logger
 }
@@ -172,6 +175,13 @@ func (s *Session) Run(ctx context.Context) error {
 func (s *Session) broadcast(u protocol.Update) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	switch u.Update {
+	case protocol.UpdFailed:
+		copy := u
+		s.lastFailure = &copy
+	case protocol.UpdEngineStarted, protocol.UpdAuthRequired:
+		s.lastFailure = nil
+	}
 	for conn, ch := range s.clients {
 		select {
 		case ch <- u:
@@ -185,6 +195,9 @@ func (s *Session) addClient(conn net.Conn) chan protocol.Update {
 	ch := make(chan protocol.Update, 64)
 	s.mu.Lock()
 	s.clients[conn] = ch
+	if s.lastFailure != nil {
+		ch <- *s.lastFailure
+	}
 	s.mu.Unlock()
 	return ch
 }

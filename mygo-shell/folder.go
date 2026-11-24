@@ -138,8 +138,8 @@ func (a *app) confirmFolderChange() {
 		return
 	}
 
-	// Restart the engine on the new folder: stop clears the phase back to
-	// starting via the Exited update, then startEngine reads a.root.
+	// Restart the engine on the new folder. stopEngine invalidates the old
+	// generation so its exit cannot trigger an automatic retry.
 	a.mu.Lock()
 	a.root = root
 	a.mu.Unlock()

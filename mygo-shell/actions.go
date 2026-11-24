@@ -194,6 +194,9 @@ func (a *app) confirmSignOut() {
 	a.mu.Lock()
 	if a.signOut == signOutConfirming {
 		a.signOut = signOutInProgress
+		if a.engine != nil {
+			a.engine.intentional = true
+		}
 	}
 	a.mu.Unlock()
 	a.invalidate()
@@ -225,6 +228,9 @@ func (a *app) confirmModeSwitch() {
 	}
 	to := a.modeSwitchTo
 	a.modeSwitch = modeSwitchInProgress
+	if a.engine != nil {
+		a.engine.intentional = true
+	}
 	a.mu.Unlock()
 	a.invalidate()
 	a.sendCommand(uiCommand{Cmd: "SetMode", Mode: string(to)})

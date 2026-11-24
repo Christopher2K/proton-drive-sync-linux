@@ -48,6 +48,11 @@ type Store interface {
 
 	// BeginHydrate asks the engine to download the backing file for rel.
 	BeginHydrate(rel string)
+	// HydrationFailed reports a terminal attempt so opens fail promptly.
+	HydrationFailed(rel string) bool
+	// BeginLocalMutation excludes hydration installation while local backing
+	// content is changed. The returned function releases the mutation guard.
+	BeginLocalMutation(rels ...string) func()
 	// BackingPath returns the local backing file path once hydrated.
 	BackingPath(rel string) (string, bool)
 	// HasPendingDelete: a delete is queued but the snapshot still serves

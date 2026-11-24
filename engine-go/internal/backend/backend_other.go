@@ -15,8 +15,11 @@ func defaultHooks() Hooks {
 	return Hooks{
 		Preflight: func(_ string, _ time.Duration) error { return nil },
 		Probe:     func() bool { return false },
-		Mount: func(_ *storepkg.Store, _, _, _ string) (func(), error) {
+		Mount: func(_ *storepkg.Store, _, _, _ string) (func() error, error) {
 			return nil, fmt.Errorf("placeholder mounts require Linux FUSE")
+		},
+		LazyUnmount: func(_ string, _ time.Duration) error {
+			return fmt.Errorf("lazy unmount requires Linux FUSE")
 		},
 	}
 }

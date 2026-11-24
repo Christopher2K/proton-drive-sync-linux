@@ -283,15 +283,10 @@ func TestSoakCrashInterruptedTransferRecovery(t *testing.T) {
 		if err := os.WriteFile(filepath.Join(root, "hello.txt"), []byte("revision-in-flight"), 0o644); err != nil {
 			t.Fatal(err)
 		}
-		waitFor(t, func() bool {
-			st, err := h.Status()
-			return err == nil && st.SidecarUnavailable
-		})
-		h.Shutdown()
 		select {
 		case <-done:
 		case <-time.After(30 * time.Second):
-			t.Fatal("engine did not stop after crash + shutdown")
+			t.Fatal("engine did not stop after sidecar crash")
 		}
 		client.Close()
 	}()
@@ -659,15 +654,10 @@ func soakPlaceholderCrashInterruptedTransferRecovery(t *testing.T) {
 		// The backing file was never hydrated, so the write-through path
 		// sources it from the backing dir; queue it via the store.
 		st.RecordWrite("hello.txt")
-		waitFor(t, func() bool {
-			s, err := h.Status()
-			return err == nil && s.SidecarUnavailable
-		})
-		h.Shutdown()
 		select {
 		case <-done:
 		case <-time.After(30 * time.Second):
-			t.Fatal("engine did not stop after crash + shutdown")
+			t.Fatal("engine did not stop after sidecar crash")
 		}
 		client.Close()
 	}()

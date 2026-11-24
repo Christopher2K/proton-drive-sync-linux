@@ -246,9 +246,9 @@ func TestFuseMmapReadsHydratedAndPlaceholderFiles(t *testing.T) {
 	em := mountE2E(t, e2eSnapshot(1, hNode, pNode))
 	em.st.hydrate(t, "mmap.bin", string(hydrated))
 	em.autoHydrate(map[string][]byte{"mmap-ph.bin": placeholder})
-	origWait := hydrateWaitOverride
-	hydrateWaitOverride = 30 * time.Second
-	defer func() { hydrateWaitOverride = origWait }()
+	origWait := hydrateWaitOverride.Load()
+	hydrateWaitOverride.Store(int64(30 * time.Second))
+	defer func() { hydrateWaitOverride.Store(origWait) }()
 
 	// Ordinary read first: the file is hydrated before mmap.
 	got, err := os.ReadFile(filepath.Join(em.mnt, "mmap.bin"))
@@ -849,6 +849,15 @@ func TestFuseMountOverNonemptyRootShadowsAndPreservesLeftovers(t *testing.T) {
 	if err != nil || string(junk) != "junk" {
 		t.Fatalf("junk content = %q, err=%v", junk, err)
 	}
+}
+
+func TestFuseLazyUnmountDetachesOwnedMount(t *testing.T) {
+	em := mountE2E(t, e2eSnapshot(1, e2eFile("hello.txt", 11)))
+	e2eWaitMountState(t, em.mnt, func(s MountState) bool { return s.Kind == MountLive }, 10*time.Second)
+	if err := LazyUnmount(em.mnt, 5*time.Second); err != nil {
+		t.Fatalf("lazy unmount: %v", err)
+	}
+	e2eWaitMountState(t, em.mnt, func(s MountState) bool { return s.Kind == MountFree }, 10*time.Second)
 }
 
 // TG-30.1: a second session on a busy/live mountpoint is refused — both by

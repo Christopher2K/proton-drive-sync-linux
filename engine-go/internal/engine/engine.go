@@ -65,6 +65,9 @@ const SidecarProbeDelay = 1 * time.Second
 // before being dropped.
 const WriteVanishGrace = 5 * time.Second
 
+// WriteVanishRetry prevents a vanished write from monopolizing the main loop.
+const WriteVanishRetry = 100 * time.Millisecond
+
 // EngineState is the run-state (F4).
 type EngineState string
 
@@ -222,14 +225,20 @@ type devIno struct {
 // Method signatures match *store.Store exactly so the concrete store
 // satisfies this interface.
 type StoreAPI interface {
-	NextHydrateRequest() (string, bool)
+	NextHydrateRequest() (rel string, generation uint64, ok bool)
 	FinishHydrate(rel string, ok bool)
+	BeginDirectHydration(rel string) uint64
+	HydrationGeneration(rel string) uint64
+	InstallHydration(rel string, generation uint64, backing string, install func() error) (bool, error)
+	AdoptExistingBacking(rel, backing string, exists func() bool) bool
 	PublishSnapshot(byPath map[string]storepkg.VNode)
 	SetBacking(rel, abs string)
 	ClearBacking(rel string)
 	HydratedByAge() []storepkg.HydratedAge
 	IsOpen(rel string) bool
 	IsUploading(rel string) bool
+	IsWritePending(rel string) bool
+	BeginLocalMutation(rels ...string) func()
 	HydratingCount() int
 	NextMkdirRequest() (string, bool)
 	RequeueMkdir(rel string)
@@ -238,6 +247,7 @@ type StoreAPI interface {
 	FinishRename(oldRel, newRel string, ok, permanent bool) bool
 	RecordWrite(rel string)
 	FinishWrite(rel string, ok bool)
+	FinishWriteDelayed(rel string, delay time.Duration)
 	BackingPath(rel string) (string, bool)
 	Forget(rel string)
 	ForgetTree(rel string)
@@ -694,11 +704,13 @@ func (e *Engine) mainLoop(fsCh <-chan []fsEvent) error {
 			}
 		case n, ok := <-e.notifications:
 			if !ok {
+				// A real sidecar process cannot recover on the same JSON-RPC
+				// stream. Return a terminal error so the shell's supervisor can
+				// start a fresh engine/session from persisted SQLite state.
 				e.noteSidecarFailure("sidecar notification stream closed")
 				e.notificationsClosed = true
-				// Stop selecting on the closed channel.
 				e.notifications = nil
-				continue
+				return errors.New("sidecar notification stream closed")
 			}
 			if err := e.handleNotification(n); err != nil {
 				return err

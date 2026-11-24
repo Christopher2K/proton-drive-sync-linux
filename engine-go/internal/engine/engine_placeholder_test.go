@@ -419,6 +419,36 @@ func TestStatusReportsBackingCacheUsage(t *testing.T) {
 	})
 }
 
+func TestHydrationSupersededByLocalWritePreservesAndUploadsLocalBytes(t *testing.T) {
+	fx := startPlaceholderWithCap(t, nil, engine.RetryBaseDefault)
+	waitForSnapshot(t, fx, "hello.txt")
+	fx.mock.SetDownloadDelay(200 * time.Millisecond)
+	if !fx.store.BeginHydrate("hello.txt") {
+		t.Fatal("BeginHydrate must queue")
+	}
+	waitFor(t, func() bool { return contains(fx.mock.DownloadedUIDs(), "node-hello") })
+
+	mutationDone := fx.store.BeginLocalMutation("hello.txt")
+	abs := filepath.Join(fx.backing, "hello.txt")
+	if err := os.WriteFile(abs, []byte("new local save"), 0o644); err != nil {
+		mutationDone()
+		t.Fatal(err)
+	}
+	fx.store.RecordWrite("hello.txt")
+	mutationDone()
+
+	waitFor(t, func() bool {
+		return fx.backingPath("hello.txt") != "" && string(fx.backingBytes("hello.txt")) == "new local save"
+	})
+	if got := string(fx.backingBytes("hello.txt")); got != "new local save" {
+		t.Fatalf("stale hydration replaced local save with %q", got)
+	}
+	waitFor(t, func() bool {
+		content, ok := fx.mock.FileContent("node-hello")
+		return ok && string(content) == "new local save"
+	})
+}
+
 // A cache-cap change mid-hydration applies on the next pass (the in-flight
 // hydration is not re-issued) and leaves the placeholder intact.
 func TestCacheCapChangeDuringHydrationEvictsNextPassWithoutLoss(t *testing.T) {

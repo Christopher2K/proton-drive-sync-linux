@@ -73,6 +73,23 @@ func waitCh[T any](t *testing.T, ch chan T, what string) T {
 	}
 }
 
+func TestLateClientReceivesEarlyFailure(t *testing.T) {
+	s := New(Config{}, newStubBackend())
+	s.broadcast(protocol.Update{Update: protocol.UpdFailed, Error: "stale mount"})
+	left, right := net.Pipe()
+	defer left.Close()
+	defer right.Close()
+	out := s.addClient(left)
+	select {
+	case got := <-out:
+		if got.Update != protocol.UpdFailed || got.Error != "stale mount" {
+			t.Fatalf("replayed update = %+v", got)
+		}
+	default:
+		t.Fatal("early failure was not replayed to the late client")
+	}
+}
+
 // Full lifecycle over a real Unix socket: connect, command, receive updates,
 // shutdown — the same exchange mygo-shell performs.
 func TestSessionLifecycle(t *testing.T) {

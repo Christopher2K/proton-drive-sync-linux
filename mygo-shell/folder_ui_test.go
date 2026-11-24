@@ -67,7 +67,7 @@ func TestFolderChangeCancel(t *testing.T) {
 }
 
 // Editing the path and confirming saves settings.json and moves a.root.
-// The engine restart is stubbed out (no engineCmd); the modal should show
+// The engine restart is stubbed out (no engine session); the modal should show
 // the restarting state.
 func TestFolderChangeConfirm(t *testing.T) {
 	dir := t.TempDir()
