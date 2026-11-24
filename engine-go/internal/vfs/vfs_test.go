@@ -245,6 +245,64 @@ func TestServedProbeIsLiveAndProbeErrorsAreClassified(t *testing.T) {
 	_ = busy
 }
 
+func TestLazyUnmountUsesDirectBoundedFusermount3Command(t *testing.T) {
+	t.Run("arguments", func(t *testing.T) {
+		dir := t.TempDir()
+		bin := filepath.Join(dir, "bin")
+		if err := os.MkdirAll(bin, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		argsPath := filepath.Join(dir, "args")
+		helper := "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$PDS_TEST_ARGS\"\n"
+		if err := os.WriteFile(filepath.Join(bin, "fusermount3"), []byte(helper), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		t.Setenv("PATH", bin)
+		t.Setenv("PDS_TEST_ARGS", argsPath)
+		root := filepath.Join(dir, "root with spaces;not-a-command")
+		if err := LazyUnmount(root, time.Second); err != nil {
+			t.Fatalf("LazyUnmount: %v", err)
+		}
+		args, err := os.ReadFile(argsPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if want := "-uz\n" + root + "\n"; string(args) != want {
+			t.Fatalf("fusermount3 arguments = %q, want %q", args, want)
+		}
+	})
+
+	t.Run("helper error includes output", func(t *testing.T) {
+		bin := t.TempDir()
+		helper := "#!/bin/sh\necho 'kernel still busy' >&2\nexit 23\n"
+		if err := os.WriteFile(filepath.Join(bin, "fusermount3"), []byte(helper), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		t.Setenv("PATH", bin)
+		err := LazyUnmount("/mnt/pds", time.Second)
+		if err == nil || !strings.Contains(err.Error(), "kernel still busy") {
+			t.Fatalf("LazyUnmount error = %v, want helper output", err)
+		}
+	})
+
+	t.Run("timeout", func(t *testing.T) {
+		bin := t.TempDir()
+		helper := "#!/bin/sh\nwhile :; do :; done\n"
+		if err := os.WriteFile(filepath.Join(bin, "fusermount3"), []byte(helper), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		t.Setenv("PATH", bin)
+		start := time.Now()
+		err := LazyUnmount("/mnt/pds", 25*time.Millisecond)
+		if err == nil || !strings.Contains(err.Error(), "timed out") {
+			t.Fatalf("LazyUnmount error = %v, want timeout", err)
+		}
+		if elapsed := time.Since(start); elapsed > time.Second {
+			t.Fatalf("LazyUnmount was not bounded: %v", elapsed)
+		}
+	})
+}
+
 // --- snapshot-driven view + write-through (fs-level, no kernel mount) ---
 
 // memStore is the test Store: records callbacks and serves backing files
@@ -253,8 +311,9 @@ type memStore struct {
 	mu  sync.Mutex
 	cur *memSnapshot
 
-	backingRoot string
-	hydrated    map[string]bool
+	backingRoot   string
+	hydrated      map[string]bool
+	hydrateFailed map[string]bool
 
 	beginHydrate []string
 	writes       []string
@@ -278,16 +337,28 @@ func newMemStore(t *testing.T, s *memSnapshot) *memStore {
 	if err := os.MkdirAll(filepath.Join(root, "backing"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	return &memStore{cur: s, backingRoot: filepath.Join(root, "backing"), hydrated: map[string]bool{}, pendingDeletes: map[string]bool{}}
+	return &memStore{cur: s, backingRoot: filepath.Join(root, "backing"), hydrated: map[string]bool{}, hydrateFailed: map[string]bool{}, pendingDeletes: map[string]bool{}}
 }
 
-func (m *memStore) Snapshot() Snapshot { return m.cur }
+func (m *memStore) Snapshot() Snapshot {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.cur
+}
 
 func (m *memStore) BeginHydrate(rel string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.beginHydrate = append(m.beginHydrate, rel)
 }
+
+func (m *memStore) HydrationFailed(rel string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.hydrateFailed[rel]
+}
+
+func (m *memStore) BeginLocalMutation(rels ...string) func() { return func() {} }
 
 func (m *memStore) BackingPath(rel string) (string, bool) {
 	m.mu.Lock()
@@ -513,6 +584,20 @@ func TestReadPlaceholderHydratesViaCallback(t *testing.T) {
 	}
 }
 
+func TestOpenReturnsPromptlyWhenHydrationFails(t *testing.T) {
+	s := snap(1, "a.txt")
+	s.byPath["a.txt"] = VNode{Rel: "a.txt", Parent: "", Name: "a.txt", Size: 5, Mode: 0o644}
+	f, st, _, _ := newTestFs(t, s)
+	st.hydrateFailed["a.txt"] = true
+	started := time.Now()
+	if _, status := f.Open("a.txt", syscall.O_RDONLY, ctx); status != fuseStatus(syscall.EIO) {
+		t.Fatalf("open status = %v, want EIO", status)
+	}
+	if elapsed := time.Since(started); elapsed > 500*time.Millisecond {
+		t.Fatalf("open waited for the safety deadline instead of the failure: %v", elapsed)
+	}
+}
+
 func TestCreateWriteThroughQueuesUploadOnRelease(t *testing.T) {
 	s := snap(1, "other.txt")
 	s.byPath["other.txt"] = VNode{Rel: "other.txt", Parent: "", Name: "other.txt", Size: 1, Mode: 0o644}
@@ -535,10 +620,10 @@ func TestCreateWriteThroughQueuesUploadOnRelease(t *testing.T) {
 	}
 	file.Release()
 	st.mu.Lock()
-	defer st.mu.Unlock()
 	if len(st.writes) != 1 || st.writes[0] != "new.txt" {
 		t.Errorf("release must queue the upload: %v", st.writes)
 	}
+	st.mu.Unlock()
 	// The backing file carried the content.
 	got, err := os.ReadFile(filepath.Join(backing, "new.txt"))
 	if err != nil || string(got) != "body" {
@@ -566,10 +651,10 @@ func TestMkdirQueuesRemoteFolder(t *testing.T) {
 		t.Fatalf("mkdir = %v", status)
 	}
 	st.mu.Lock()
-	defer st.mu.Unlock()
 	if len(st.mkdirs) != 1 || st.mkdirs[0] != "folder" {
 		t.Errorf("mkdir queue = %v", st.mkdirs)
 	}
+	st.mu.Unlock()
 	if status := f.Mkdir("folder", 0o755, ctx); status != fuseStatus(syscall.EEXIST) {
 		t.Errorf("second mkdir = %v, want EEXIST", status)
 	}
@@ -649,10 +734,10 @@ func TestRenameFile(t *testing.T) {
 		t.Fatalf("rename = %v", status)
 	}
 	st.mu.Lock()
-	defer st.mu.Unlock()
 	if len(st.renames) != 1 || st.renames[0] != [2]string{"a.txt", "c.txt"} {
 		t.Errorf("rename queue = %v", st.renames)
 	}
+	st.mu.Unlock()
 	// Backing content moved.
 	got, err := os.ReadFile(filepath.Join(backing, "c.txt"))
 	if err != nil || string(got) != "abc" {
@@ -746,9 +831,9 @@ func TestSnapshotWriteROEnforcement(t *testing.T) {
 	s := snap(1, "a.txt")
 	s.byPath["a.txt"] = VNode{Rel: "a.txt", Parent: "", Name: "a.txt", Size: 4, Mode: 0o644}
 	f, _, _, _ := newTestFs(t, s)
-	origWait := hydrateWaitOverride
-	hydrateWaitOverride = 150 * time.Millisecond
-	defer func() { hydrateWaitOverride = origWait }()
+	origWait := hydrateWaitOverride.Load()
+	hydrateWaitOverride.Store(int64(150 * time.Millisecond))
+	defer func() { hydrateWaitOverride.Store(origWait) }()
 	if _, status := f.Open("a.txt", syscall.O_WRONLY, ctx); status != fuseStatus(syscall.EIO) {
 		t.Errorf("unhydrated RW open = %v, want bounded-wait EIO", status)
 	}

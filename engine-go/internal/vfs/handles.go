@@ -58,6 +58,20 @@ func (h *writeHandle) relSnapshot() string {
 	return h.rel
 }
 
+// lockHandleMutation pins the handle's current path for one backing write.
+// A rename may have re-keyed the handle between the first path read and lock
+// acquisition, so retry until the locked path and handle path agree.
+func (f *PdsFs) lockHandleMutation(h *writeHandle) (string, func()) {
+	for {
+		rel := h.relSnapshot()
+		done := f.st.BeginLocalMutation(rel)
+		if h.relSnapshot() == rel {
+			return rel, done
+		}
+		done()
+	}
+}
+
 // rekeyHandles: re-key open handles after a rename/move — an fd stays
 // valid across rename(2) and its writes belong to the new path on
 // release.
@@ -142,11 +156,12 @@ func (w *writeFile) Read(dest []byte, off int64) (fuse.ReadResult, fuse.Status) 
 }
 
 func (w *writeFile) Write(data []byte, off int64) (uint32, fuse.Status) {
+	rel, mutationDone := w.fs.lockHandleMutation(w.h)
+	defer mutationDone()
 	n, err := w.h.file.WriteAt(data, off)
 	if err != nil && n == 0 {
 		return 0, fuse.ToStatus(err)
 	}
-	rel := w.h.relSnapshot()
 	w.fs.handleMu.Lock()
 	w.h.dirty = true
 	w.fs.handleMu.Unlock()

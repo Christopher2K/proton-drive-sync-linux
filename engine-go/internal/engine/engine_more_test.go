@@ -340,30 +340,27 @@ func TestPauseFreezesActiveDownloadAndResumeCompletesIt(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Sidecar death mid-upload: degraded, no stuck loop, no lost file
+// Sidecar death mid-upload: terminal session, durable dirty work, no stuck loop
 // ---------------------------------------------------------------------------
 
-func TestSidecarDeathMidUploadDegradesWithoutStuckOrLoop(t *testing.T) {
+func TestSidecarDeathMidUploadLeavesDirtyWorkForRestart(t *testing.T) {
 	fx := start(t)
 	fx.mock.CrashOnNextUpload()
 	fx.write("dying.txt", []byte("never lands"))
-	// The engine must surface the outage and keep answering commands.
-	waitFor(t, func() bool {
-		st, err := fx.handle.Status()
-		return err == nil && st.SidecarUnavailable
-	})
+	select {
+	case err := <-fx.done:
+		if err == nil {
+			t.Fatal("dead sidecar stream must terminate the supervised session")
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("engine remained stuck after sidecar death")
+	}
 	// The dirty row survives for the next session.
-	waitFor(t, func() bool {
-		row, _ := fx.db.NodeByPath("dying.txt")
-		return row != nil
-	})
-	st, err := fx.handle.Status()
-	if err != nil {
-		t.Fatal(err)
+	row, _ := fx.db.NodeByPath("dying.txt")
+	if row == nil || row.SyncState != db.StateDirty {
+		t.Fatalf("dirty row did not survive sidecar death: %+v", row)
 	}
-	if st.State == "" {
-		t.Fatal("engine state gone")
-	}
+	fx.stopOnce.Do(func() { _ = fx.db.Close() })
 }
 
 // ---------------------------------------------------------------------------

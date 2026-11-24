@@ -2,8 +2,10 @@ package backend_test
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -15,11 +17,14 @@ import (
 )
 
 type fakeMount struct {
-	mu        sync.Mutex
-	events    []string
-	probeOK   bool
-	mounted   int
-	unmounted int
+	mu             sync.Mutex
+	events         []string
+	probeOK        bool
+	mounted        int
+	unmounted      int
+	lazyUnmounted  int
+	unmountErr     error
+	lazyUnmountErr error
 }
 
 func (f *fakeMount) record(ev string) {
@@ -38,17 +43,25 @@ func (f *fakeMount) hooks() backend.Hooks {
 			f.record("probe")
 			return f.probeOK
 		},
-		Mount: func(_ *storepkg.Store, _, _, _ string) (func(), error) {
+		Mount: func(_ *storepkg.Store, _, _, _ string) (func() error, error) {
 			f.record("mount")
 			f.mu.Lock()
 			f.mounted++
 			f.mu.Unlock()
-			return func() {
+			return func() error {
 				f.record("unmount")
 				f.mu.Lock()
+				defer f.mu.Unlock()
 				f.unmounted++
-				f.mu.Unlock()
+				return f.unmountErr
 			}, nil
+		},
+		LazyUnmount: func(_ string, _ time.Duration) error {
+			f.record("lazy-unmount")
+			f.mu.Lock()
+			defer f.mu.Unlock()
+			f.lazyUnmounted++
+			return f.lazyUnmountErr
 		},
 	}
 }
@@ -675,5 +688,119 @@ func TestBackendModeSwitchRestartsIntoNewMode(t *testing.T) {
 	fake.mu.Unlock()
 	if unmounted == 0 {
 		t.Fatal("placeholder view never unmounted on Shutdown")
+	}
+}
+
+func TestBackendPreflightFailureEmitsActionableFailure(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("XDG_DATA_HOME", filepath.Join(dir, "data"))
+	t.Setenv("PDS_SYNC_MODE", "placeholders")
+
+	mock := sidecar.NewMock()
+	client, _ := mock.Connect()
+	defer client.Close()
+
+	preflightErr := errors.New("the sync root is covered by a stale mount; unmount with fusermount3 -uz and retry")
+	fake := &fakeMount{probeOK: true}
+	h := fake.hooks()
+	h.Preflight = func(_ string, _ time.Duration) error {
+		fake.record("preflight")
+		return preflightErr
+	}
+	collect, snapshot := updatesCollector()
+	be := backend.New(backend.Config{Root: filepath.Join(dir, "root"), Hooks: &h}, client, func() {}, collect)
+	be.Start(context.Background())
+	select {
+	case <-be.Done():
+	case <-time.After(10 * time.Second):
+		be.Shutdown()
+		t.Fatal("backend did not exit after mountpoint preflight failed")
+	}
+
+	var unavailable, failed bool
+	for _, update := range snapshot() {
+		switch update.Update {
+		case protocol.UpdMountUnavailable:
+			unavailable = update.Error == preflightErr.Error()
+		case protocol.UpdFailed:
+			failed = update.Error == preflightErr.Error()
+		}
+	}
+	if !unavailable || !failed {
+		t.Fatalf("preflight updates = %+v, want MountUnavailable and Failed with %q", snapshot(), preflightErr)
+	}
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	if fake.lazyUnmounted != 0 {
+		t.Fatal("startup preflight must not lazy-unmount an existing mount")
+	}
+}
+
+func TestBackendUnmountFailureRecoversAndStopsSessionLoop(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		lazyErr  error
+		wantText string
+	}{
+		{name: "lazy fallback succeeds"},
+		{name: "lazy fallback fails", lazyErr: errors.New("lazy helper denied"), wantText: "lazy helper denied"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			dir := t.TempDir()
+			t.Setenv("XDG_DATA_HOME", filepath.Join(dir, "data"))
+			t.Setenv("PDS_SYNC_MODE", "placeholders")
+
+			mock := sidecar.NewMock()
+			client, _ := mock.Connect()
+			defer client.Close()
+
+			fake := &fakeMount{
+				probeOK:        true,
+				unmountErr:     errors.New("normal unmount busy"),
+				lazyUnmountErr: test.lazyErr,
+			}
+			h := fake.hooks()
+			collect, snapshot := updatesCollector()
+			be := backend.New(backend.Config{Root: filepath.Join(dir, "root"), Hooks: &h}, client, func() {}, collect)
+			be.Start(context.Background())
+			defer be.Shutdown()
+
+			waitFor(t, 10*time.Second, func() bool {
+				return updateCount(snapshot(), protocol.UpdEngineStarted) == 1
+			}, "initial placeholder EngineStarted")
+			if err := os.Unsetenv("PDS_SYNC_MODE"); err != nil {
+				t.Fatal(err)
+			}
+			if err := be.SetMode(protocol.ModeMirror); err != nil {
+				t.Fatal(err)
+			}
+			select {
+			case <-be.Done():
+			case <-time.After(10 * time.Second):
+				t.Fatal("backend continued after unmount failure")
+			}
+
+			fake.mu.Lock()
+			mounted, unmounted, lazyUnmounted := fake.mounted, fake.unmounted, fake.lazyUnmounted
+			fake.mu.Unlock()
+			if mounted != 1 || unmounted != 1 || lazyUnmounted != 1 {
+				t.Fatalf("mount calls = (%d, %d, %d), want (1, 1, 1)", mounted, unmounted, lazyUnmounted)
+			}
+			if got := updateCount(snapshot(), protocol.UpdEngineStarted); got != 1 {
+				t.Fatalf("EngineStarted count = %d, want no follow-on startup", got)
+			}
+			var failure string
+			for _, update := range snapshot() {
+				if update.Update == protocol.UpdFailed {
+					failure = update.Error
+				}
+			}
+			if !strings.Contains(failure, "normal unmount busy") {
+				t.Fatalf("Failed error = %q, want normal unmount error", failure)
+			}
+			if test.wantText != "" && !strings.Contains(failure, test.wantText) {
+				t.Fatalf("Failed error = %q, want fallback error %q", failure, test.wantText)
+			}
+		})
 	}
 }

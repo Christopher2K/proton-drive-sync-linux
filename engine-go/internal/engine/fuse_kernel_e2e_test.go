@@ -80,6 +80,12 @@ func (a *kernelVfsStore) Snapshot() vfs.Snapshot {
 	return &kernelVfsSnapshot{snap: a.inner.Snapshot()}
 }
 func (a *kernelVfsStore) BeginHydrate(rel string) { a.inner.BeginHydrate(rel) }
+func (a *kernelVfsStore) HydrationFailed(rel string) bool {
+	return a.inner.HydrationFailed(rel)
+}
+func (a *kernelVfsStore) BeginLocalMutation(rels ...string) func() {
+	return a.inner.BeginLocalMutation(rels...)
+}
 func (a *kernelVfsStore) BackingPath(rel string) (string, bool) {
 	return a.inner.BackingPath(rel)
 }
@@ -742,6 +748,55 @@ func TestFuseKernelTruncateGrowIsSparseAndUploadsNewSize(t *testing.T) {
 
 func TestFuseKernelCopyFileRangeServerSideProof(t *testing.T) {
 	t.Skip("production seam missing: the Go placeholder filesystem is built on go-fuse pathfs, whose rawBridge answers CopyFileRange with ENOSYS, so the kernel substitutes a splice copy through userspace — a correct destination file alone cannot prove the server-side path, and no server-side log line exists to assert; needs a nodefs tree lifecycle in internal/vfs")
+}
+
+func TestFuseKernelAtomicSaveDuringHydrationKeepsLocalRevision(t *testing.T) {
+	kernelRequireFuse(t)
+	fx := startKernel(t, map[string][]byte{"atomic.txt": []byte("old remote")})
+	uid, ok := fx.mock.FindUID("root", "atomic.txt")
+	if !ok {
+		t.Fatal("atomic uid missing")
+	}
+	fx.mock.SetDownloadDelay(300 * time.Millisecond)
+	type readOutcome struct {
+		content string
+		err     error
+	}
+	readDone := make(chan readOutcome, 1)
+	go func() {
+		file, err := os.Open(fx.mntPath("atomic.txt"))
+		if err != nil {
+			readDone <- readOutcome{err: err}
+			return
+		}
+		defer file.Close()
+		content, err := io.ReadAll(file)
+		readDone <- readOutcome{content: string(content), err: err}
+	}()
+	waitFor(t, func() bool { return contains(fx.mock.DownloadedUIDs(), uid) })
+
+	local := "new atomic local save"
+	tmp := fx.mntPath(".atomic.txt.tmp")
+	if err := os.WriteFile(tmp, []byte(local), 0o644); err != nil {
+		t.Fatalf("write atomic temp: %v", err)
+	}
+	if err := os.Rename(tmp, fx.mntPath("atomic.txt")); err != nil {
+		t.Fatalf("atomic overwrite rename: %v", err)
+	}
+	fx.mock.SetDownloadDelay(0)
+	select {
+	case got := <-readDone:
+		if got.err != nil || got.content != local {
+			t.Fatalf("open during atomic save = %q, %v; want local revision", got.content, got.err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("read remained blocked after superseded hydration")
+	}
+	fx.waitRemote(t, "atomic.txt", []byte(local))
+	backingContent, err := os.ReadFile(filepath.Join(fx.backing, "atomic.txt"))
+	if err != nil || string(backingContent) != local {
+		t.Fatalf("backing content = %q, %v; want local revision", backingContent, err)
+	}
 }
 
 // TG-26.3 engine half: rename() over an open destination — the fd keeps

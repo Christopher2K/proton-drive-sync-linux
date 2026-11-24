@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -22,8 +23,9 @@ func defaultHooks() Hooks {
 		Preflight: func(root string, timeout time.Duration) error {
 			return vfs.EnsurePlaceholderMountpoint(root, timeout)
 		},
-		Probe: probeFuseAvailable,
-		Mount: mountPlaceholderView,
+		Probe:       probeFuseAvailable,
+		Mount:       mountPlaceholderView,
+		LazyUnmount: vfs.LazyUnmount,
 	}
 }
 
@@ -63,7 +65,7 @@ func probeFuseAvailable() bool {
 	}
 }
 
-func mountPlaceholderView(st *storepkg.Store, stateDir, backingDir, root string) (func(), error) {
+func mountPlaceholderView(st *storepkg.Store, stateDir, backingDir, root string) (func() error, error) {
 	if st == nil {
 		return nil, fmt.Errorf("engine has no VFS store (not in placeholder mode)")
 	}
@@ -95,13 +97,13 @@ func mountPlaceholderView(st *storepkg.Store, stateDir, backingDir, root string)
 		_ = server.Unmount()
 		return nil, fmt.Errorf("the placeholder view mounted at %s but does not answer requests", root)
 	}
-	unmounted := false
-	return func() {
-		if unmounted {
-			return
-		}
-		unmounted = true
-		_ = server.Unmount()
+	var (
+		unmountOnce sync.Once
+		unmountErr  error
+	)
+	return func() error {
+		unmountOnce.Do(func() { unmountErr = server.Unmount() })
+		return unmountErr
 	}, nil
 }
 
@@ -113,6 +115,12 @@ func (a *vfsStoreAdapter) Snapshot() vfs.Snapshot {
 	return &vfsSnapshotAdapter{snap: a.inner.Snapshot()}
 }
 func (a *vfsStoreAdapter) BeginHydrate(rel string) { a.inner.BeginHydrate(rel) }
+func (a *vfsStoreAdapter) HydrationFailed(rel string) bool {
+	return a.inner.HydrationFailed(rel)
+}
+func (a *vfsStoreAdapter) BeginLocalMutation(rels ...string) func() {
+	return a.inner.BeginLocalMutation(rels...)
+}
 func (a *vfsStoreAdapter) BackingPath(rel string) (string, bool) {
 	return a.inner.BackingPath(rel)
 }

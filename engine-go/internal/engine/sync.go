@@ -2696,7 +2696,7 @@ func (e *Engine) pumpWork() (bool, error) {
 			continue
 		}
 		if e.store != nil {
-			e.hydrateOne(row.LocalPath)
+			e.hydrateOne(row.LocalPath, e.store.BeginDirectHydration(row.LocalPath))
 			e.maybeEvict(row.LocalPath)
 			if e.evictionRecheck {
 				e.evictionRecheck = false

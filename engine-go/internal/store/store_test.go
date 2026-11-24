@@ -3,6 +3,7 @@ package store
 import (
 	"slices"
 	"testing"
+	"time"
 )
 
 // node mirrors the Rust test helper: split rel into (parent, name).
@@ -103,13 +104,13 @@ func TestHydrateQueueDedupsAndTracks(t *testing.T) {
 	if s.BeginHydrate("a.txt") {
 		t.Fatal("second open is not first")
 	}
-	if rel, ok := s.NextHydrateRequest(); !ok || rel != "a.txt" {
+	if rel, _, ok := s.NextHydrateRequest(); !ok || rel != "a.txt" {
 		t.Fatalf("next_hydrate_request = %q,%v; want a.txt", rel, ok)
 	}
 	if n := s.HydratingCount(); n != 1 {
 		t.Fatalf("hydrating_count = %d, want 1", n)
 	}
-	if _, ok := s.NextHydrateRequest(); ok {
+	if _, _, ok := s.NextHydrateRequest(); ok {
 		t.Fatal("queue should be empty")
 	}
 
@@ -129,11 +130,94 @@ func TestBackingRegistrationUnblocks(t *testing.T) {
 	s.BeginHydrate("a.txt")
 	s.SetBacking("a.txt", "/tmp/x")
 	// engine drops the queued request because content is already there
-	if _, ok := s.NextHydrateRequest(); ok {
+	if _, _, ok := s.NextHydrateRequest(); ok {
 		t.Fatal("queued request should be dropped; content already there")
 	}
 	if p, ok := s.BackingPath("a.txt"); !ok || p != "/tmp/x" {
 		t.Fatalf("backing_path = %q,%v; want /tmp/x", p, ok)
+	}
+}
+
+func TestHydrationFailureIsPromptAndRetryable(t *testing.T) {
+	s := New()
+	s.BeginHydrate("a.txt")
+	_, _, _ = s.NextHydrateRequest()
+	s.FinishHydrate("a.txt", false)
+	if !s.HydrationFailed("a.txt") {
+		t.Fatal("terminal hydration failure must be visible to waiting opens")
+	}
+	if !s.BeginHydrate("a.txt") {
+		t.Fatal("later open must start a fresh attempt")
+	}
+	if s.HydrationFailed("a.txt") {
+		t.Fatal("queued retry must not report the previous attempt as terminal")
+	}
+}
+
+func TestHydrationInstallPreservesSupersedingLocalMutation(t *testing.T) {
+	s := New()
+	s.BeginHydrate("a.txt")
+	_, generation, _ := s.NextHydrateRequest()
+	mutationDone := s.BeginLocalMutation("a.txt")
+	mutationDone()
+
+	called := false
+	installed, err := s.InstallHydration("a.txt", generation, "/tmp/local", func() error {
+		called = true
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if installed || called {
+		t.Fatal("stale remote bytes must not replace a newer local mutation")
+	}
+}
+
+func TestHydrationInstallWaitsForInFlightLocalMutation(t *testing.T) {
+	s := New()
+	s.BeginHydrate("a.txt")
+	_, generation, _ := s.NextHydrateRequest()
+	mutationDone := s.BeginLocalMutation("a.txt")
+	result := make(chan bool, 1)
+	go func() {
+		installed, _ := s.InstallHydration("a.txt", generation, "/tmp/local", func() error { return nil })
+		result <- installed
+	}()
+	select {
+	case <-result:
+		t.Fatal("installation crossed an in-flight local mutation")
+	case <-time.After(20 * time.Millisecond):
+	}
+	mutationDone()
+	if installed := <-result; installed {
+		t.Fatal("mutation must supersede the blocked installation")
+	}
+}
+
+func TestDelayedWriteDoesNotSpinAndFollowsRename(t *testing.T) {
+	s := New()
+	s.RecordWrite("old.txt")
+	rel, ok := s.NextWriteRequest()
+	if !ok || rel != "old.txt" {
+		t.Fatalf("first write = %q, %v", rel, ok)
+	}
+	s.FinishWriteDelayed("old.txt", 40*time.Millisecond)
+	for i := 0; i < 100; i++ {
+		if _, ok := s.NextWriteRequest(); ok {
+			t.Fatal("delayed write became immediately eligible")
+		}
+	}
+	s.RecordRename("old.txt", "new.txt")
+	time.Sleep(50 * time.Millisecond)
+	req, ok := s.NextWorkRequest()
+	if !ok || req.Kind != WorkRename || req.Rel != "old.txt" || req.NewRel != "new.txt" {
+		t.Fatalf("rename must drain before delayed write: %+v, %v", req, ok)
+	}
+	s.FinishRename("old.txt", "new.txt", true, false)
+	rel, ok = s.NextWriteRequest()
+	if !ok || rel != "new.txt" {
+		t.Fatalf("delayed retry did not follow rename: %q, %v", rel, ok)
 	}
 }
 

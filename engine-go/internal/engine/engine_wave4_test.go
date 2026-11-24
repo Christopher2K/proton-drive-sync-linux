@@ -704,6 +704,21 @@ func TestSignOutKeepsPendingWorkAndDrainsAfterReauthentication(t *testing.T) {
 	stopEngine(t, h, done, client)
 }
 
+func TestSidecarEOFStopsSessionForSupervisedRestart(t *testing.T) {
+	fx := start(t)
+	fx.client.Close()
+	select {
+	case err := <-fx.done:
+		if err == nil || !strings.Contains(err.Error(), "sidecar notification stream closed") {
+			t.Fatalf("engine exit = %v, want terminal sidecar EOF", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("engine remained parked on a dead JSON-RPC stream")
+	}
+	// Mark fixture cleanup consumed; the done channel was deliberately read.
+	fx.stopOnce.Do(func() { _ = fx.db.Close() })
+}
+
 // A sidecar outage while calls are being made is visible in status/activity;
 // pending tombstone + upload work stays intact, and the engine probes again
 // and drains the queues once calls succeed (mock "restarted").

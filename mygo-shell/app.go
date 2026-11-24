@@ -2,7 +2,6 @@ package main
 
 import (
 	"net"
-	"os/exec"
 	"sync"
 
 	"github.com/egoist/mygo"
@@ -56,9 +55,15 @@ type app struct {
 	conflictsScroll ui.ScrollState
 	settingsScroll  ui.ScrollState
 
-	engineCmd     *exec.Cmd
-	conn          net.Conn
-	engineRunning bool
+	engine           *engineSession
+	conn             net.Conn
+	engineRunning    bool
+	engineGeneration uint64
+
+	engineRetryAttempt     int
+	engineRetryPending     bool
+	engineRetryIn          string
+	engineRetriesExhausted bool
 }
 
 func newApp() *app {

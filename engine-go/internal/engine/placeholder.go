@@ -15,6 +15,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -167,13 +168,23 @@ func (e *Engine) applyMetadataUpdate(rel string, mtime *int64, mode *uint32) {
 
 // ---- hydration (M3.1) ----------------------------------------------------
 
-// hydrateOne downloads one requested placeholder to the backing dir,
-// registers the backing file, and refreshes the snapshot. Failures just
-// unblock the waiting reader (it retries with EIO on the next open).
-func (e *Engine) hydrateOne(rel string) {
+// hydrateOne downloads one requested placeholder to a private temporary
+// file, verifies it there, and installs it only if no VFS mutation has
+// superseded the request. Newer local content always wins.
+func (e *Engine) hydrateOne(rel string, generation uint64) {
 	row, err := e.db.NodeByPath(rel)
 	if err != nil || row == nil {
 		e.store.FinishHydrate(rel, false)
+		return
+	}
+	abs := toAbs(e.backingDir, rel)
+	if e.store.AdoptExistingBacking(rel, abs, func() bool { return isRegularFile(abs) }) {
+		// A local mutation may have completed before the request was popped,
+		// or backing content may survive from a previous process. Route it
+		// through the write path: unchanged content hash-dedups without an
+		// upload, while changed content becomes a guarded local revision.
+		e.store.RecordWrite(rel)
+		e.store.FinishHydrate(rel, true)
 		return
 	}
 	if row.SyncState == db.StateSynced || row.SyncState == db.StateDownloading {
@@ -181,43 +192,84 @@ func (e *Engine) hydrateOne(rel string) {
 			e.log.Printf("%s: failed to mark hydration in progress: %v", rel, err)
 		}
 	}
-	// Hydration only owns the download direction here: verify the bytes
-	// before marking synced (M4 soak lesson — never trust a state flag
-	// alone). Only Synced/Downloading rows carry a remote hash contract;
-	// Dirty rows keep their local content.
+	// Only Synced/Downloading rows carry a remote hash contract; Dirty rows
+	// keep their local content.
 	verify := row.SyncState == db.StateSynced || row.SyncState == db.StateDownloading
-	if err := e.downloadToBacking(row.NodeUID, rel, row.Mtime, row.Mode); err != nil {
+	tmp, err := e.downloadToBackingTemp(row.NodeUID, rel)
+	if err != nil {
 		e.log.Printf("%s: hydration failed: %v", rel, err)
 		if !e.shuttingDown {
 			e.recordDownloadFailure(rel, err)
 		}
-		e.store.FinishHydrate(rel, true)
+		e.store.FinishHydrate(rel, false)
+		return
+	}
+	finishSuperseded := func() {
+		_ = os.Remove(tmp)
+		if e.store.AdoptExistingBacking(rel, abs, func() bool { return isRegularFile(abs) }) {
+			// The VFS installed new local content while the download was in
+			// flight. Make it readable and ensure a later remote event cannot
+			// mistake it for an untouched synced copy.
+			if current, cerr := e.db.NodeByPath(rel); cerr == nil && current != nil && current.IsFile() {
+				_ = e.db.SetSyncState(rel, db.StateDirty)
+			}
+			e.store.FinishHydrate(rel, true)
+			if perr := e.publishVfsSnapshot(); perr != nil {
+				e.log.Printf("%s: post-superseded-hydration snapshot failed: %v", rel, perr)
+			}
+			e.log.Printf("%s: hydration superseded; keeping newer local content", rel)
+			return
+		}
+		e.store.FinishHydrate(rel, false)
+	}
+	if e.store.HydrationGeneration(rel) != generation {
+		finishSuperseded()
 		return
 	}
 	if verify && row.SHA1 != nil {
-		abs := toAbs(e.backingDir, rel)
-		sha, _, herr := sha1File(abs)
+		sha, _, herr := sha1File(tmp)
 		if herr != nil {
 			e.log.Printf("%s: hydration failed: %v", rel, herr)
-			_ = os.Remove(abs)
+			_ = os.Remove(tmp)
 			if !e.shuttingDown {
 				e.recordDownloadFailure(rel, herr)
 			}
-			e.store.FinishHydrate(rel, true)
+			e.store.FinishHydrate(rel, false)
 			return
 		}
 		if sha != *row.SHA1 {
 			merr := fmt.Errorf("hydrated %s: sha1 %s != remote %s", rel, sha, *row.SHA1)
 			e.log.Printf("%s: %v", rel, merr)
-			_ = os.Remove(abs)
+			// Only the private download is rejected. The destination may
+			// already contain a newer atomic-save revision.
+			_ = os.Remove(tmp)
 			if !e.shuttingDown {
 				e.recordDownloadFailure(rel, merr)
 			}
-			e.store.FinishHydrate(rel, true)
+			e.store.FinishHydrate(rel, false)
 			return
 		}
 	}
-	e.store.SetBacking(rel, toAbs(e.backingDir, rel))
+	installed, ierr := e.store.InstallHydration(rel, generation, abs, func() error {
+		if err := os.Rename(tmp, abs); err != nil {
+			return fmt.Errorf("install hydrated file %s: %w", abs, err)
+		}
+		applyFileMetadata(abs, row.Mtime, row.Mode)
+		return nil
+	})
+	if ierr != nil {
+		e.log.Printf("%s: hydration failed: %v", rel, ierr)
+		_ = os.Remove(tmp)
+		if !e.shuttingDown {
+			e.recordDownloadFailure(rel, ierr)
+		}
+		e.store.FinishHydrate(rel, false)
+		return
+	}
+	if !installed {
+		finishSuperseded()
+		return
+	}
 	// Never rewrite a row with pending local changes (Dirty/Uploading).
 	if current, cerr := e.db.NodeByPath(rel); cerr == nil && current != nil &&
 		(current.SyncState == db.StateDownloading || current.SyncState == db.StateSynced) {
@@ -236,28 +288,20 @@ func (e *Engine) hydrateOne(rel string) {
 	e.store.FinishHydrate(rel, true)
 }
 
-// downloadToBacking downloads a node into the backing dir (placeholder
-// mode). Same atomic tmp+rename pattern as tryDownloadFile, different
-// target. Never the mount root.
-func (e *Engine) downloadToBacking(uid, rel string, mtime *int64, mode *uint32) error {
+// downloadToBackingTemp downloads into a private backing-dir temporary and
+// leaves installation/verification to the caller. It never replaces a path
+// that a VFS writer may concurrently be changing.
+func (e *Engine) downloadToBackingTemp(uid, rel string) (string, error) {
 	if reason, bad := pathLimitReason(e.backingDir, rel); bad {
 		e.reportUnmaterializable(rel, reason)
-		return fmt.Errorf("%s", reason)
-	}
-	abs := toAbs(e.backingDir, rel)
-	if isRegularFile(abs) {
-		return nil // already hydrated (lost wake-up)
-	}
-	if i := strings.LastIndex(abs, "/"); i >= 0 {
-		if err := os.MkdirAll(abs[:i], 0o755); err != nil {
-			return err
-		}
+		return "", errors.New(reason)
 	}
 	tmp := toAbs(e.backingDir, transferTempRel(rel))
-	// Surface an unwritable backing dir before the transfer; this is
-	// also the temp the transfer writes.
+	if err := os.MkdirAll(filepath.Dir(tmp), 0o755); err != nil {
+		return "", err
+	}
 	if f, err := os.Create(tmp); err != nil {
-		return fmt.Errorf("prepare hydration target %s: %w", abs, err)
+		return "", fmt.Errorf("prepare hydration target %s: %w", toAbs(e.backingDir, rel), err)
 	} else {
 		f.Close()
 	}
@@ -272,13 +316,27 @@ func (e *Engine) downloadToBacking(uid, rel string, mtime *int64, mode *uint32) 
 			if !e.shuttingDown && sidecar.IsConnectionLost(failure.err) {
 				e.noteSidecarFailure(failure.err.Error())
 			}
-			return failure.err
+			return "", failure.err
 		}
 		if sidecar.IsAuthCode(failure.code) {
 			e.noteAuthRequired(rel, failure.code, failure.message)
-			return fmt.Errorf("sign-in required while downloading `%s`: %s", rel, failure.message)
+			return "", fmt.Errorf("sign-in required while downloading `%s`: %s", rel, failure.message)
 		}
-		return fmt.Errorf("hydrate `%s`: %s", rel, failure.message)
+		return "", fmt.Errorf("hydrate `%s`: %s", rel, failure.message)
+	}
+	return tmp, nil
+}
+
+// downloadToBacking is the non-VFS install path used after an engine-side
+// rename. VFS-originated opens use hydrateOne's generation-checked install.
+func (e *Engine) downloadToBacking(uid, rel string, mtime *int64, mode *uint32) error {
+	abs := toAbs(e.backingDir, rel)
+	if isRegularFile(abs) {
+		return nil // already hydrated (lost wake-up)
+	}
+	tmp, err := e.downloadToBackingTemp(uid, rel)
+	if err != nil {
+		return err
 	}
 	if err := os.Rename(tmp, abs); err != nil {
 		_ = os.Remove(tmp)
@@ -325,13 +383,20 @@ func (e *Engine) maybeEvict(protect string) {
 		}
 		row, ok := byPath[rel]
 		if !ok {
-			// No row (stale backing entry after a delete): drop the file.
+			// No row (stale backing entry after a delete): drop the file only
+			// if a new local write has not claimed the path meanwhile.
+			mutationDone := e.store.BeginLocalMutation(rel)
+			if e.store.IsWritePending(rel) {
+				mutationDone()
+				continue
+			}
 			_ = os.Remove(toAbs(e.backingDir, rel))
 			e.store.ClearBacking(rel)
+			mutationDone()
 			continue
 		}
 		if row.Pinned || row.SyncState != db.StateSynced ||
-			e.store.IsOpen(rel) || e.store.IsUploading(rel) {
+			e.store.IsOpen(rel) || e.store.IsWritePending(rel) {
 			continue
 		}
 		var size uint64
@@ -339,8 +404,17 @@ func (e *Engine) maybeEvict(protect string) {
 			size = uint64(*row.Size)
 		}
 		abs := toAbs(e.backingDir, rel)
-		if err := os.Remove(abs); err == nil {
+		mutationDone := e.store.BeginLocalMutation(rel)
+		if e.store.IsWritePending(rel) {
+			mutationDone()
+			continue
+		}
+		err := os.Remove(abs)
+		if err == nil {
 			e.store.ClearBacking(rel)
+		}
+		mutationDone()
+		if err == nil {
 			if total >= size {
 				total -= size
 			} else {
@@ -397,7 +471,7 @@ func (e *Engine) pinFile(rel string) error {
 			continue
 		}
 		if _, ok := e.store.BackingPath(t); !ok {
-			e.hydrateOne(t)
+			e.hydrateOne(t, e.store.BeginDirectHydration(t))
 		}
 	}
 	e.log.Printf("pinned: %s (%d files)", rel, len(targets))
@@ -447,21 +521,22 @@ func (e *Engine) uploadWriteOne(rel string) {
 		}
 	}
 	result := e.writeUploadRow(rel)
-	if result != nil {
-		e.log.Printf("%s: write upload failed: %v", rel, result)
-	}
 	vanished := result != nil && isVanishedError(result)
 	if vanished {
-		first, ok := e.vanishedWrites[rel]
-		if !ok {
-			e.vanishedWrites[rel] = time.Now()
-			first = e.vanishedWrites[rel]
+		first, seen := e.vanishedWrites[rel]
+		if !seen {
+			first = time.Now()
+			e.vanishedWrites[rel] = first
+			e.log.Printf("%s: backing file vanished; allowing in-flight rename/write to settle", rel)
 		}
 		if time.Since(first) < WriteVanishGrace {
-			e.store.FinishWrite(rel, false)
+			e.store.FinishWriteDelayed(rel, WriteVanishRetry)
 			return
 		}
 		delete(e.vanishedWrites, rel)
+		e.log.Printf("%s: dropping vanished write after %v", rel, WriteVanishGrace)
+	} else if result != nil {
+		e.log.Printf("%s: write upload failed: %v", rel, result)
 	}
 	e.store.FinishWrite(rel, result == nil || vanished)
 	if err := e.publishVfsSnapshot(); err != nil {
@@ -704,8 +779,8 @@ func (e *Engine) drainStoreWork() (bool, error) {
 	}
 	// Hydration: download on demand, then the idle-path eviction pass.
 	// The fresh file itself is protected from eviction.
-	if rel, ok := e.store.NextHydrateRequest(); ok {
-		e.hydrateOne(rel)
+	if rel, generation, ok := e.store.NextHydrateRequest(); ok {
+		e.hydrateOne(rel, generation)
 		e.maybeEvict(rel)
 		// A cap change landed mid-hydration; apply it now, without the
 		// just-hydrated-file protection.

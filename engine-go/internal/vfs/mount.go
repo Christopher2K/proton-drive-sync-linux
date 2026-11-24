@@ -17,8 +17,10 @@
 package vfs
 
 import (
+	"context"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"syscall"
@@ -94,6 +96,26 @@ func (e *MountpointError) Error() string {
 // wedged.
 func EnsurePlaceholderMountpoint(root string, timeout time.Duration) error {
 	return refusal(MountpointState(root, timeout))
+}
+
+// LazyUnmount detaches root with fusermount3 after the normal unmount of an
+// app-owned mount fails. Startup preflight must only inspect mountpoints: it
+// must never call this on a live mount owned by another session.
+func LazyUnmount(root string, timeout time.Duration) error {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "fusermount3", "-uz", root)
+	output, err := cmd.CombinedOutput()
+	if ctx.Err() != nil {
+		return fmt.Errorf("fusermount3 -uz %s timed out after %s: %w", root, timeout, ctx.Err())
+	}
+	if err != nil {
+		if detail := strings.TrimSpace(string(output)); detail != "" {
+			return fmt.Errorf("fusermount3 -uz %s: %w: %s", root, err, detail)
+		}
+		return fmt.Errorf("fusermount3 -uz %s: %w", root, err)
+	}
+	return nil
 }
 
 func refusal(state MountState) error {

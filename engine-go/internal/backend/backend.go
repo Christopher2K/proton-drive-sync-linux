@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"path/filepath"
 	"sync"
 	"time"
 
@@ -52,7 +53,10 @@ type Hooks struct {
 	Probe func() bool
 	// Mount mounts the placeholder view at the sync root (after the engine
 	// initial sync / watcher attach) and returns an idempotent unmount.
-	Mount func(st *storepkg.Store, stateDir, backingDir, root string) (unmount func(), err error)
+	Mount func(st *storepkg.Store, stateDir, backingDir, root string) (unmount func() error, err error)
+	// LazyUnmount is the bounded recovery path after a normal unmount fails.
+	// It is never used by startup preflight.
+	LazyUnmount func(root string, timeout time.Duration) error
 }
 
 type loopExit int
@@ -76,7 +80,7 @@ type Backend struct {
 	mu         sync.Mutex
 	handle     *engine.Handle
 	store      *storepkg.Store
-	unmount    func()
+	unmount    func() error
 	dbPath     string
 	exitReason loopExit
 
@@ -243,6 +247,23 @@ func (b *Backend) runSession() loopExit {
 	if b.ctx.Err() != nil {
 		return exitQuit
 	}
+	// Inspect a possible stale mount before layout preparation calls
+	// MkdirAll/Stat through it. Canonicalize only when the path already
+	// resolves; first-launch roots are created by ResolveSessionLayout.
+	preflightRoot := b.cfg.Root
+	if resolved, err := filepath.EvalSymlinks(preflightRoot); err == nil {
+		preflightRoot = resolved
+	} else if abs, err := filepath.Abs(preflightRoot); err == nil {
+		preflightRoot = abs
+	}
+	if mode.ResolveSessionMode(preflightRoot) == mode.ModePlaceholders {
+		if err := b.hooks.Preflight(preflightRoot, 2*time.Second); err != nil {
+			b.log.Printf("placeholder mountpoint unusable: %v", err)
+			b.updating(protocol.Update{Update: protocol.UpdMountUnavailable, Error: err.Error()})
+			b.updating(protocol.Update{Update: protocol.UpdFailed, Error: err.Error()})
+			return exitQuit
+		}
+	}
 	layout, err := mode.ResolveSessionLayout(b.cfg.Root)
 	if err != nil {
 		b.log.Printf("layout: %v", err)
@@ -253,15 +274,8 @@ func (b *Backend) runSession() loopExit {
 		b.updating(protocol.Update{Update: protocol.UpdLayoutMigrated})
 	}
 	wantPlaceholders := layout.EffectiveMode == mode.ModePlaceholders
-	// Mountpoint preflight (TG-30): refuse a placeholder session at an
-	// unusable mountpoint instead of syncing into a dead mount.
-	if wantPlaceholders {
-		if err := b.hooks.Preflight(layout.Root, 2*time.Second); err != nil {
-			b.log.Printf("placeholder mountpoint unusable: %v", err)
-			b.updating(protocol.Update{Update: protocol.UpdMountUnavailable, Error: err.Error()})
-			return exitQuit
-		}
-	}
+	// Mountpoint preflight ran before layout preparation above; keep the
+	// post-layout root authoritative for the mount itself.
 	// FUSE probe BEFORE the engine starts: the engine consumes the
 	// sidecar's single notification stream, so a post-hoc mirror fallback
 	// would be deaf to remote events. Probe failure downgrades THIS
@@ -340,9 +354,9 @@ func (b *Backend) runSession() loopExit {
 			b.log.Print("engine readiness timed out; mounting the placeholder view anyway")
 		}
 		select {
-		case err := <-engineErr:
+		case <-engineErr:
 			// Engine already exited (fatal init): do not mount.
-			return b.finishSession(handle, err, true)
+			return b.finishSession(layout.Root)
 		default:
 		}
 		unmount, merr := b.hooks.Mount(st, layout.StateDir, layout.BackingDir, layout.Root)
@@ -354,8 +368,8 @@ func (b *Backend) runSession() loopExit {
 			b.log.Printf("placeholder mount failed after the FUSE probe: %v", merr)
 			b.updating(protocol.Update{Update: protocol.UpdMountUnavailable, Error: failure})
 			handle.Shutdown()
-			err := <-engineErr
-			return b.finishSession(handle, err, true)
+			<-engineErr
+			return b.finishSession(layout.Root)
 		}
 		b.mu.Lock()
 		b.unmount = unmount
@@ -381,12 +395,13 @@ func (b *Backend) runSession() loopExit {
 		b.log.Printf("engine stopped: %v", err)
 		b.updating(protocol.Update{Update: protocol.UpdFailed, Error: err.Error()})
 	}
-	return b.finishSession(handle, err, false)
+	return b.finishSession(layout.Root)
 }
 
 // finishSession unmounts the placeholder view, clears the current handle,
-// and reports the exit reason. alreadyDrained means engineErr was consumed.
-func (b *Backend) finishSession(_ *engine.Handle, _ error, _ bool) loopExit {
+// and reports the exit reason. A failed unmount stops the session loop even
+// when lazy recovery succeeds, so a mode switch cannot start over an old mount.
+func (b *Backend) finishSession(root string) loopExit {
 	b.mu.Lock()
 	unmount := b.unmount
 	reason := b.exitReason
@@ -400,7 +415,20 @@ func (b *Backend) finishSession(_ *engine.Handle, _ error, _ bool) loopExit {
 	b.mu.Unlock()
 	if unmount != nil {
 		b.log.Print("unmounting placeholder view")
-		unmount()
+		if err := unmount(); err != nil {
+			failure := fmt.Sprintf("unmount placeholder view at %s: %v", root, err)
+			b.log.Print(failure)
+			if b.hooks.LazyUnmount != nil {
+				if lazyErr := b.hooks.LazyUnmount(root, 5*time.Second); lazyErr != nil {
+					b.log.Printf("normal unmount failed: %v; lazy unmount failed: %v", err, lazyErr)
+					failure = fmt.Sprintf("%s; lazy unmount failed: %v", failure, lazyErr)
+				} else {
+					b.log.Printf("normal unmount failed: %v; lazy unmount succeeded", err)
+				}
+			}
+			b.updating(protocol.Update{Update: protocol.UpdFailed, Error: failure})
+			return exitQuit
+		}
 	}
 	return reason
 }

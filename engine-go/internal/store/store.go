@@ -21,7 +21,9 @@ package store
 import (
 	"container/list"
 	"path/filepath"
+	"strings"
 	"sync"
+	"time"
 )
 
 // VNode is what the VFS needs to know about one node. Path-keyed; mirrors
@@ -117,6 +119,13 @@ type inner struct {
 	pendingSet map[string]bool
 	// hydrating holds requests the engine is currently downloading.
 	hydrating map[string]bool
+	// hydrateFailed records the latest attempt's terminal failure so VFS
+	// open callers stop waiting immediately instead of polling until their
+	// two-minute safety deadline.
+	hydrateFailed map[string]bool
+	// mutations counts local backing-content changes. Hydration captures a
+	// generation when queued and may install only if it is still current.
+	mutations map[string]uint64
 	// hydrated maps rel → backing file path for hydrated files.
 	hydrated map[string]string
 	// pendingWrites holds write-created or write-modified files awaiting
@@ -125,6 +134,9 @@ type inner struct {
 	// uploading holds files the engine is currently uploading from the
 	// write queue.
 	uploading map[string]bool
+	// writeRetryAt holds failed writes that must not be served until their
+	// retry deadline. A Notify timer wakes the engine when it matures.
+	writeRetryAt map[string]time.Time
 	// pendingMetadata holds metadata-only changes from the VFS
 	// (setattr(mtime/mode)), drained by the engine into the DB/snapshot
 	// WITHOUT queueing a content upload — the hash is unchanged.
@@ -168,7 +180,10 @@ type inner struct {
 // Store is the engine ↔ VFS shared state.
 type Store struct {
 	mu sync.Mutex
-	in inner
+	// backingMu serializes VFS backing-content mutations with the short
+	// install phase of hydration. Network transfers never hold this lock.
+	backingMu sync.Mutex
+	in        inner
 	// Notify is woken when a new hydrate request is queued. Works from the
 	// FUSE goroutine (no lock held while firing).
 	Notify *Notify
@@ -182,9 +197,12 @@ func New() *Store {
 			pending:         list.New(),
 			pendingSet:      map[string]bool{},
 			hydrating:       map[string]bool{},
+			hydrateFailed:   map[string]bool{},
+			mutations:       map[string]uint64{},
 			hydrated:        map[string]string{},
 			pendingWrites:   newOrderedSet(),
 			uploading:       map[string]bool{},
+			writeRetryAt:    map[string]time.Time{},
 			pendingMetadata: list.New(),
 			pendingMkdirs:   newOrderedSet(),
 			pendingDeletes:  newOrderedSet(),
@@ -282,21 +300,24 @@ func (s *Store) SetBacking(rel, backing string) {
 // ClearBacking removes the backing entry (row deleted, or eviction).
 func (s *Store) ClearBacking(rel string) { s.Forget(rel) }
 
-// NextHydrateRequest returns the next queued hydrate request, if any
-// (engine, from the main loop).
-func (s *Store) NextHydrateRequest() (string, bool) {
+// NextHydrateRequest returns the next queued hydrate request and the local
+// mutation generation it must preserve. The generation is captured while the
+// request is popped so a concurrent VFS mutation cannot become an unnoticed
+// baseline for the download.
+func (s *Store) NextHydrateRequest() (string, uint64, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for {
 		rel, ok := s.in.popPendingLocked()
 		if !ok {
-			return "", false
+			return "", 0, false
 		}
 		if _, done := s.in.hydrated[rel]; done {
 			continue // content landed meanwhile
 		}
 		s.in.hydrating[rel] = true
-		return rel, true
+		delete(s.in.hydrateFailed, rel)
+		return rel, s.in.mutations[rel], true
 	}
 }
 
@@ -312,20 +333,111 @@ func (in *inner) popPendingLocked() (string, bool) {
 	return rel, true
 }
 
-// FinishHydrate finishes a hydration: the engine calls this after the
-// backing file is complete (or failed; ok=false just unblocks
-// re-requesting).
+// FinishHydrate finishes a hydration. Failure is sticky until a new request
+// starts so current VFS waiters can fail promptly and a later open can retry.
 func (s *Store) FinishHydrate(rel string, ok bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if !ok {
 		delete(s.in.hydrated, rel)
+		s.in.hydrateFailed[rel] = true
 	} else {
+		delete(s.in.hydrateFailed, rel)
 		// A fresh hydration is by definition the most recent use.
 		s.in.accessCounter++
 		s.in.lastAccess[rel] = s.in.accessCounter
 	}
 	delete(s.in.hydrating, rel)
+	delete(s.in.mutations, rel)
+}
+
+// HydrationFailed reports whether the most recently finished attempt failed.
+func (s *Store) HydrationFailed(rel string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.in.hydrateFailed[rel] && !s.in.hydrating[rel] && !s.in.pendingSet[rel]
+}
+
+// BeginDirectHydration marks an engine-originated hydration (pin/retry) as
+// active and captures the same generation used by queued VFS requests.
+func (s *Store) BeginDirectHydration(rel string) uint64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.in.hydrating[rel] = true
+	delete(s.in.hydrateFailed, rel)
+	return s.in.mutations[rel]
+}
+
+// HydrationGeneration returns the local mutation generation a download must
+// still match before its bytes may replace the destination.
+func (s *Store) HydrationGeneration(rel string) uint64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.in.mutations[rel]
+}
+
+// BeginLocalMutation marks backing content as locally changed and excludes
+// hydration installation until the returned function is called. Callers must
+// not hold Store.mu when invoking it; queue methods remain safe inside it.
+func (s *Store) BeginLocalMutation(rels ...string) func() {
+	s.backingMu.Lock()
+	s.mu.Lock()
+	for _, rel := range rels {
+		prefix := rel + "/"
+		// Paths without an active/queued hydration need no generation
+		// bookkeeping: their existing local backing is preserved before any
+		// future download. This also prevents one-off atomic-save temp names
+		// from growing the generation map indefinitely.
+		if s.in.hydrating[rel] || s.in.pendingSet[rel] {
+			s.in.mutations[rel]++
+		}
+		for path := range s.in.hydrating {
+			if strings.HasPrefix(path, prefix) {
+				s.in.mutations[path]++
+			}
+		}
+		for path := range s.in.pendingSet {
+			if strings.HasPrefix(path, prefix) {
+				s.in.mutations[path]++
+			}
+		}
+	}
+	s.mu.Unlock()
+	var once sync.Once
+	return func() {
+		once.Do(func() { s.backingMu.Unlock() })
+	}
+}
+
+// AdoptExistingBacking registers content already installed by a completed
+// local mutation. The backing lock prevents racing an in-flight rename.
+func (s *Store) AdoptExistingBacking(rel, backing string, exists func() bool) bool {
+	s.backingMu.Lock()
+	defer s.backingMu.Unlock()
+	if !exists() {
+		return false
+	}
+	s.SetBacking(rel, backing)
+	return true
+}
+
+// InstallHydration atomically installs a verified temporary download only if
+// no local mutation has superseded it. installed=false means local content
+// won the race and the caller must retain it and discard only its temp file.
+func (s *Store) InstallHydration(rel string, generation uint64, backing string, install func() error) (installed bool, err error) {
+	s.backingMu.Lock()
+	defer s.backingMu.Unlock()
+	s.mu.Lock()
+	current := s.in.mutations[rel]
+	s.mu.Unlock()
+	if current != generation {
+		return false, nil
+	}
+	if err := install(); err != nil {
+		return true, err
+	}
+	s.SetBacking(rel, backing)
+	return true, nil
 }
 
 // ---- pin / evict (M3.2) --------------------------------------------------
@@ -406,6 +518,8 @@ func (s *Store) RecordWrite(rel string) {
 	// Re-created after a delete: drop the stale snapshot mark (same
 	// reasoning as RecordMkdir).
 	delete(s.in.deleted, rel)
+	// A fresh local write supersedes any scheduled missing-backing retry.
+	delete(s.in.writeRetryAt, rel)
 	first := !s.in.pendingWrites.contains(rel)
 	if first {
 		s.in.pendingWrites.pushBack(rel)
@@ -469,6 +583,7 @@ func (s *Store) NextWriteRequest() (string, bool) {
 
 func (s *Store) nextWriteLocked() (string, bool) {
 	var skipped []string
+	now := time.Now()
 	for {
 		rel, ok := s.in.pendingWrites.popFront()
 		if !ok {
@@ -477,6 +592,13 @@ func (s *Store) nextWriteLocked() (string, bool) {
 		if s.in.uploading[rel] {
 			skipped = append(skipped, rel)
 			continue
+		}
+		if retryAt, delayed := s.in.writeRetryAt[rel]; delayed {
+			if now.Before(retryAt) {
+				skipped = append(skipped, rel)
+				continue
+			}
+			delete(s.in.writeRetryAt, rel)
 		}
 		s.in.uploading[rel] = true
 		// Push skipped entries back to the FRONT, newest-skipped first,
@@ -507,9 +629,22 @@ func (s *Store) FinishWrite(rel string, ok bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	delete(s.in.uploading, rel)
+	delete(s.in.writeRetryAt, rel)
 	if !ok {
 		s.in.pendingWrites.pushBack(rel)
 	}
+}
+
+// FinishWriteDelayed requeues a transiently missing backing file without
+// making it eligible until delay has elapsed. The timer only supplies a wake;
+// NextWorkRequest remains the authority on retry eligibility.
+func (s *Store) FinishWriteDelayed(rel string, delay time.Duration) {
+	s.mu.Lock()
+	delete(s.in.uploading, rel)
+	s.in.pendingWrites.pushBack(rel)
+	s.in.writeRetryAt[rel] = time.Now().Add(delay)
+	s.mu.Unlock()
+	time.AfterFunc(delay, func() { s.Notify.NotifyOne() })
 }
 
 // IsUploading reports true while the engine is uploading rel (VFS: hide
@@ -519,6 +654,14 @@ func (s *Store) IsUploading(rel string) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.in.uploading[rel]
+}
+
+// IsWritePending reports queued or in-flight local content. Eviction uses it
+// to avoid deleting a newly installed atomic-save revision before upload.
+func (s *Store) IsWritePending(rel string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.in.uploading[rel] || s.in.pendingWrites.contains(rel)
 }
 
 // PendingWrites returns the number of queued + in-flight write uploads
@@ -613,6 +756,10 @@ func (s *Store) RecordOverwrite(destRel, oldRel, newRel string) {
 	// never reached the remote.
 	s.in.pendingWrites.retain(func(w string) bool { return w != oldRel && w != newRel })
 	s.in.pendingWrites.pushBack(newRel)
+	if retryAt, ok := s.in.writeRetryAt[oldRel]; ok {
+		delete(s.in.writeRetryAt, oldRel)
+		s.in.writeRetryAt[newRel] = retryAt
+	}
 	if !s.pendingRenamesContainsLocked(oldRel, newRel) {
 		// Already queued; the delete above is the only new work.
 		s.in.pendingRenames.PushBack(&renamePair{oldRel: oldRel, newRel: newRel})
@@ -710,6 +857,10 @@ func (s *Store) RecordRename(oldRel, newRel string) {
 		delete(s.in.uploading, oldRel)
 		s.in.pendingWrites.pushBack(newRel)
 	}
+	if retryAt, ok := s.in.writeRetryAt[oldRel]; ok {
+		delete(s.in.writeRetryAt, oldRel)
+		s.in.writeRetryAt[newRel] = retryAt
+	}
 	notify := false
 	if rekeyed {
 		// The new rename is expressed by the merged pair (or cancelled);
@@ -802,10 +953,12 @@ func (s *Store) Forget(rel string) {
 	defer s.mu.Unlock()
 	delete(s.in.hydrated, rel)
 	delete(s.in.hydrating, rel)
+	delete(s.in.hydrateFailed, rel)
 	s.retainListLocked(s.in.pending, func(p string) bool { return p != rel })
 	delete(s.in.pendingSet, rel)
 	s.in.pendingWrites.retain(func(p string) bool { return p != rel })
 	delete(s.in.uploading, rel)
+	delete(s.in.writeRetryAt, rel)
 	s.in.pendingMkdirs.retain(func(p string) bool { return p != rel })
 	s.in.pendingDeletes.retain(func(p string) bool { return p != rel })
 	delete(s.in.lastAccess, rel)
@@ -827,10 +980,16 @@ func (s *Store) ForgetTree(rel string) {
 	defer s.mu.Unlock()
 	s.retainMapLocked(s.in.hydrated, keep)
 	s.retainBoolMapLocked(s.in.hydrating, keep)
+	s.retainBoolMapLocked(s.in.hydrateFailed, keep)
 	s.retainListLocked(s.in.pending, keep)
 	s.retainBoolMapLocked(s.in.pendingSet, keep)
 	s.in.pendingWrites.retain(keep)
 	s.retainBoolMapLocked(s.in.uploading, keep)
+	for path := range s.in.writeRetryAt {
+		if !keep(path) {
+			delete(s.in.writeRetryAt, path)
+		}
+	}
 	s.in.pendingMkdirs.retain(keep)
 	s.in.pendingDeletes.retain(keep)
 	s.retainU64MapLocked(s.in.lastAccess, keep)
@@ -866,6 +1025,7 @@ func (s *Store) BeginHydrate(rel string) bool {
 	if first {
 		s.in.pending.PushBack(rel)
 		s.in.pendingSet[rel] = true
+		delete(s.in.hydrateFailed, rel)
 	}
 	s.mu.Unlock()
 	if first {

@@ -24,6 +24,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -41,7 +42,15 @@ const hydrateWait = 120 * time.Second
 const hydratePoll = 50 * time.Millisecond
 
 // hydrateWaitOverride lets tests shorten the bounded wait (0 = default).
-var hydrateWaitOverride time.Duration
+// Atomic because real-kernel tests change it while FUSE goroutines read it.
+var hydrateWaitOverride atomic.Int64
+
+func configuredHydrateWait() time.Duration {
+	if override := time.Duration(hydrateWaitOverride.Load()); override > 0 {
+		return override
+	}
+	return hydrateWait
+}
 
 // OverlayInoBase: write-overlay inodes start here (snapshot inos grow
 // from 3; a session would need millions of nodes to collide).
@@ -289,16 +298,17 @@ func (f *PdsFs) waitForBacking(rel string) *os.File {
 		}
 	}
 	f.st.BeginHydrate(rel)
-	wait := hydrateWait
-	if hydrateWaitOverride > 0 {
-		wait = hydrateWaitOverride
-	}
+	wait := configuredHydrateWait()
 	deadline := time.Now().Add(wait)
 	for {
 		if path, ok := f.st.BackingPath(rel); ok {
 			if file, err := os.Open(path); err == nil {
 				return file
 			}
+		}
+		if f.st.HydrationFailed(rel) {
+			f.logger.Printf("hydration failed: %s", rel)
+			return nil
 		}
 		if !time.Now().Before(deadline) {
 			f.logger.Printf("hydration wait expired: %s", rel)
@@ -313,15 +323,16 @@ func (f *PdsFs) waitForBacking(rel string) *os.File {
 // unlinked-then-recreated path still works.
 func (f *PdsFs) openBackingRW(rel string) *os.File {
 	abs := f.toAbs(rel)
-	wait := hydrateWait
-	if hydrateWaitOverride > 0 {
-		wait = hydrateWaitOverride
-	}
+	wait := configuredHydrateWait()
 	deadline := time.Now().Add(wait)
 	for {
 		os.MkdirAll(filepath.Dir(abs), 0o755)
 		if fAbs, err := os.OpenFile(abs, os.O_RDWR, 0o644); err == nil {
 			return fAbs
+		}
+		if f.st.HydrationFailed(rel) {
+			f.logger.Printf("revision open: hydration failed: %s", rel)
+			return nil
 		}
 		if !time.Now().Before(deadline) {
 			f.logger.Printf("revision open: hydration wait expired: %s", rel)
@@ -579,6 +590,8 @@ func (f *PdsFs) Open(name string, flags uint32, context *fuse.Context) (nodefs.F
 		// O_WRONLY|O_TRUNC before the upload landed. Serve a real
 		// write handle on the backing file.
 		truncate := flags&syscall.O_TRUNC != 0
+		mutationDone := f.st.BeginLocalMutation(rel)
+		defer mutationDone()
 		file, err := os.OpenFile(f.toAbs(rel), os.O_RDWR|os.O_CREATE|(truncateFlag(truncate)), 0o644)
 		if err != nil {
 			f.logger.Printf("overlay rewrite open failed: %s: %v", rel, err)
@@ -649,6 +662,8 @@ func (f *PdsFs) Create(name string, flags uint32, mode uint32, context *fuse.Con
 		return nil, fuse.Status(syscall.EEXIST)
 	}
 	abs := f.toAbs(name)
+	mutationDone := f.st.BeginLocalMutation(name)
+	defer mutationDone()
 	if err := os.MkdirAll(filepath.Dir(abs), 0o755); err != nil {
 		f.logger.Printf("backing mkdir failed: %s: %v", name, err)
 		return nil, fuse.EIO
@@ -709,6 +724,8 @@ func (f *PdsFs) Unlink(name string, context *fuse.Context) fuse.Status {
 	if _, _, _, _, ok := f.nodeMeta(name); !ok {
 		return fuse.ENOENT
 	}
+	mutationDone := f.st.BeginLocalMutation(name)
+	defer mutationDone()
 	f.discardWriteHandles(name)
 	f.clearPendingSize(name)
 	f.mu.Lock()
@@ -738,6 +755,8 @@ func (f *PdsFs) Rmdir(name string, context *fuse.Context) fuse.Status {
 	if !f.dirIsEmpty(name) {
 		return fuse.Status(syscall.ENOTEMPTY)
 	}
+	mutationDone := f.st.BeginLocalMutation(name)
+	defer mutationDone()
 	f.mu.Lock()
 	f.overlay.remove(name)
 	f.mu.Unlock()
@@ -764,6 +783,8 @@ func (f *PdsFs) Rename(oldName, newName string, context *fuse.Context) fuse.Stat
 	if srcIsDir && strings.HasPrefix(newName, oldName+"/") {
 		return fuse.EINVAL
 	}
+	mutationDone := f.st.BeginLocalMutation(oldName, newName)
+	defer mutationDone()
 	// Destination handling per rename(2): a file replaces a file, a dir
 	// replaces an EMPTY dir, anything else is an error. The replaced
 	// destination is mirrored as a remote delete — queued together with
@@ -886,6 +907,8 @@ func (f *PdsFs) Truncate(name string, size uint64, context *fuse.Context) fuse.S
 
 func (f *PdsFs) truncateCommon(name string, size uint64, fh *writeHandle) fuse.Status {
 	if fh != nil {
+		_, mutationDone := f.lockHandleMutation(fh)
+		defer mutationDone()
 		// Truncate through an open fd (ftruncate / deferred O_TRUNC):
 		// the fd's inode is authoritative — it stays valid after the path
 		// is unlinked or replaced, where the path lookup would miss.
@@ -922,6 +945,8 @@ func (f *PdsFs) truncateCommon(name string, size uint64, fh *writeHandle) fuse.S
 		}
 	}
 	abs := f.toAbs(name)
+	mutationDone := f.st.BeginLocalMutation(name)
+	defer mutationDone()
 	if err := os.Truncate(abs, int64(size)); err != nil {
 		f.logger.Printf("truncate failed: %s: %v", name, err)
 		return fuse.EIO

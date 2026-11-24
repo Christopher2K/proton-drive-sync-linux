@@ -21,6 +21,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"syscall"
+	"time"
 
 	"pds.dev/engine-go/internal/backend"
 	"pds.dev/engine-go/internal/mode"
@@ -39,9 +40,6 @@ func main() {
 
 	logger := log.New(os.Stderr, "pds-engine-go: ", log.LstdFlags|log.Ltime)
 
-	if err := os.MkdirAll(*root, 0o755); err != nil {
-		logger.Fatalf("create sync root: %v", err)
-	}
 	flagCap, err := parseFlagCap(*cacheCapFlag)
 	if err != nil {
 		logger.Fatalf("--cache-cap: %v", err)
@@ -54,13 +52,40 @@ func main() {
 	if *sidecarCmd != "" {
 		cmdOverride = sidecarCmd
 	}
-	client, _, err := sidecar.SpawnSidecar(cmdOverride)
+	client, child, err := sidecar.SpawnSidecar(cmdOverride)
 	if err != nil {
 		logger.Printf("sidecar unavailable (%v); running as protocol stub", err)
 	}
 
 	var sess *session.Session
 	if client != nil {
+		var sidecarDone chan struct{}
+		if child != nil {
+			sidecarDone = make(chan struct{})
+			// Reap every sidecar and preserve its exit status for diagnostics.
+			// Notification EOF terminates the engine session; the shell then
+			// performs a bounded restart from persisted state.
+			go func() {
+				defer close(sidecarDone)
+				if err := child.Wait(); err != nil {
+					logger.Printf("sidecar exited: %v", err)
+				} else {
+					logger.Print("sidecar exited")
+				}
+			}()
+		}
+		defer func() {
+			client.Close()
+			if child == nil {
+				return
+			}
+			select {
+			case <-sidecarDone:
+			case <-time.After(2 * time.Second):
+				child.Kill()
+				<-sidecarDone
+			}
+		}()
 		// The backend resolves DBPath/BackingDir/EvictionCap per session
 		// (flag > env > persisted > 10GiB default) and restarts into a
 		// new mode on SetMode, so this is the only wiring main owns.
